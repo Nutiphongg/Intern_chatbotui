@@ -12,7 +12,7 @@ Security: JWT & Bcrypt
 ##ขั้นตอนการ run backend 
 1.clone project
 ```bash
-git clone 
+git clone https://github.com/Nutiphongg/Intern_chatbotui.git
 ```
 2.ติดตั้ง library ทั้งหมด
 ```bash
