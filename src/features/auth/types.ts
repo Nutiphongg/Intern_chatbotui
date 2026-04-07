@@ -7,5 +7,11 @@ export const registerSchema = t.Object({
   password: t.String()
 });
 
+export const loginSchema = t.Object({
+  email: t.String(),
+  password: t.String()
+});
+
 // 2. แปลง Schema ด้านบนให้กลายเป็น Interface 
 export type RegisterBody = Static<typeof registerSchema>;
+export type LoginBody = Static<typeof loginSchema>;
