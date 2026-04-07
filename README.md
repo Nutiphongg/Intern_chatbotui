@@ -1,16 +1,18 @@
 # การใช้งาน backend
 
 ## tech stack ที่ใช้
+```text
 Package Manager: Bun
 Web Framework: ElysiaJS
 ORM: Prisma
 Database: Supabase
 Security: JWT & Bcrypt
+```
 
 ##ขั้นตอนการ run backend 
-1.
+1.clone project
 ```bash
-
+git clone 
 ```
 2.ติดตั้ง library ทั้งหมด
 ```bash
