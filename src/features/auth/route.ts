@@ -68,6 +68,10 @@ export const authRoutes = new Elysia({prefix: '/auth'})
       httpOnly: true,
       maxAge: 7 * 86400, // 7 วัน
       path: "/",
+      //ใช้ test ต้องลบออก
+      sameSite: "none",//อนุญาตให้ส่งคุกกี้ข้ามโดเมน
+      secure: true,//ยิงผ่าน api https
+
     });
 
     // 3. ตอบกลับ Frontend (ส่งไปแค่ Access Token ส่วน Refresh อยู่ใน Cookie แล้ว)
