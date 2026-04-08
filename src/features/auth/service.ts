@@ -2,8 +2,10 @@ import bcrypt from 'bcrypt';
 import { db } from '../setup/db';
 import { RegisterBody ,LoginBody} from './types';
 import { signAccessToken,signRefreshToken,verifyRefreshToken } from './jwt';
-
-export const registerUser = async (data: RegisterBody) => {
+import { prisma } from '../setup/prisma'
+import { HttpError } from '../../lib/problem';
+import { Errors} from '../../lib/errors';
+export const Register = async (data: RegisterBody) => {
     // 1. ทำการ hash password
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(data.password, salt);
@@ -30,7 +32,7 @@ export const registerUser = async (data: RegisterBody) => {
     };
 }
 
-export const loginUser = async (body: LoginBody) => {
+export const Login = async (body: LoginBody ,userAgent:string ,ip:string ) => {
     const { email,password } = body;
 
     const result = await db.query(
@@ -41,23 +43,39 @@ export const loginUser = async (body: LoginBody) => {
     const user = result.rows[0]
 
     if(!user){
-        throw new Error('ข้อมูลไม่ถูกต้อง')
+         throw Errors.invalidCredentials()
+    
     }
 
     const ok = await bcrypt.compare(password,user.password_hash)
 
     if(!ok){
-        throw new Error('ข้อมูลไม่ถูกต้อง')
+        throw Errors.invalidCredentials()
     }
+    const sessions = await db.query(
+    `SELECT id FROM sessions 
+     WHERE user_id = $1 
+     AND expires_at > NOW()
+     ORDER BY created_at ASC`,
+    [user.id]
+    )
+    if (sessions.rows.length >= 3) {
+    const oldest = sessions.rows[0]
+
+    await db.query(
+      `DELETE FROM sessions WHERE id = $1`,
+      [oldest.id]
+    )
+  }
     // สร้าง token
     const accessToken = signAccessToken({userId: user.id})
     const refreshToken = signRefreshToken({userId: user.id})
 
     // บันทึก token
     await db.query(
-         `INSERT INTO sessions (user_id, refresh_token, expires_at)
-         VALUES ($1, $2, NOW() + INTERVAL '7 days')`,
-         [user.id, refreshToken]
+         `INSERT INTO sessions (user_id, refresh_token,user_agent, ip_address, expires_at)
+         VALUES ($1, $2, $3, $4, NOW() + INTERVAL '7 days')`,
+         [user.id, refreshToken,userAgent,ip]
     )
 
     return {
@@ -72,9 +90,9 @@ export const loginUser = async (body: LoginBody) => {
 } 
 
 // 1. รับค่าเป็น String ธรรมดา ไม่รับ Object Cookie แล้ว
-export const refreshUser = async (refreshToken: string | undefined) => { 
+export const Refresh = async (refreshToken: string | undefined) => { 
     if(!refreshToken) {
-        throw new Error('ไม่มี Refresh Token ในระบบ');
+         throw Errors.missingToken()
     }
 
     // ตรวจสอบ JWT
@@ -85,7 +103,7 @@ export const refreshUser = async (refreshToken: string | undefined) => {
         // ลบ token ออกจาก db
         await db.query(`DELETE FROM sessions WHERE refresh_token = $1`, [refreshToken]);
         // ลบเสร็จ กลับไปที่ route
-        throw new Error('Refresh Token ไม่ถูกต้องหรือหมดอายุ กรุณาล็อกอินใหม่');
+         throw Errors.invalidToken()
     }
 
     // เช็คใน db
@@ -94,7 +112,8 @@ export const refreshUser = async (refreshToken: string | undefined) => {
     );
 
     if(session.rows.length === 0){
-        throw new Error('ไม่พบ Session หรือ Session ถูกยกเลิกไปแล้ว');
+        throw Errors.sessionNotFound()
+
     }
 
     const userId = payload.userId;
@@ -121,3 +140,38 @@ export const refreshUser = async (refreshToken: string | undefined) => {
         newRefreshToken
     };
 };
+
+export const getActiveDevices = async (userId: string) => {
+  const result = await prisma.sessions.groupBy({
+    by: ['user_agent'],
+    where: {
+      user_id: userId,
+      expires_at: {
+        gt: new Date(),
+      },
+    },
+  });
+
+  return {count: result.length,
+         devices:result
+         }
+};
+
+export const Logout = async(cookie: any) => {
+    const refreshToken = cookie.refresh_token?.value
+
+    if(!refreshToken){
+        throw Errors.missingToken()
+    }
+
+    await db.query(
+        `DELETE FROM sessions WHERE refresh_token = $1`,[refreshToken]
+    )
+
+    cookie.refresh_token.remove()
+
+    return {
+        message: 'logout success'
+    }
+
+}

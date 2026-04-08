@@ -15,3 +15,4 @@ export const verifyAccessToken = (token: string) =>
 export const verifyRefreshToken = (token: string) =>
     jwt.verify(token,REFRESH_SECRET)
 
+export const getUserIdFromToken = (token: string) => (verifyRefreshToken(token)as any).userId;

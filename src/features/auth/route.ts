@@ -1,35 +1,30 @@
 import {Elysia, t} from "elysia";
 import { registerSchema,loginSchema } from "./types";
-import { registerUser,loginUser,refreshUser } from "./service";
+import { Register,Login,Refresh,getActiveDevices,Logout } from "./service";
+import { getUserIdFromToken } from "./jwt";
+import { success } from "../../lib/response";
+import { Errors } from "../../lib/errors";
 
 export const authRoutes = new Elysia({prefix: '/auth'})
 
 .post('/register',async ({body,set}) => {
-  try{
-    const user = await registerUser(body);
+    const user = await Register(body);
     set.status = 201;
-    return{
-        success: true,
-        message: "สมัครสมาชิกสำเร็จ",
-        data: user,
-    };
-  }catch (error: any){
-    set.status = 400;
-    return{
-        success: false,
-        message: "ไม่สามารถสมัครสมาชิกได้",
-        error: error.message
-    };
-  }
+    return success(user,"สมัครสมาชิกสำเร็จ")
 
 },{
    body: registerSchema
 })
 
-.post('/login', async ({ body, cookie: { refresh_token }, set }) => {
-  try {
+.post('/login', async ({ body, cookie: { refresh_token },headers,request, set }) => {
+  
+     //ดึง  user-agent
+    const userAgent = headers['user-agent'] || 'unknown';
+    //ngrok proxy แก้ไขถ้าใช้ตัวอื่น
+    const ip = request.headers.get('x-forwarded-for') || 'unknown'
     // 1. รับค่าที่ Service โยนกลับมา (มี accessToken, refreshToken, user)
-    const { accessToken, refreshToken, user } = await loginUser(body);
+    const { accessToken, refreshToken, user } = await Login(body,userAgent,ip);
+
 
     // 2. ให้ Route เป็นคนฝัง Cookie
     refresh_token.set({
@@ -39,28 +34,15 @@ export const authRoutes = new Elysia({prefix: '/auth'})
       path: "/",
     });
 
-    set.status = 200;
-    return {
-      success: true,
-      message: "เข้าสู่ระบบสำเร็จ",
-      data: { user, accessToken } // ส่งให้ Frontend แค่ Access Token กับข้อมูล User
-    };
-
-  } catch (error: any) {
-    set.status = 401;
-    return {
-      success: false,
-      message: "เข้าสู่ระบบไม่สำเร็จ",
-      error: error.message
-    };
-  }
+    
+    return success({user,accessToken}, "เข้าสู่ระบบสำเร็จ")
 }, {
   body: loginSchema
 })
 .post('/refresh', async ({ cookie: { refresh_token }, set }) => {
-  try {
+  
     // 1. ดึงแค่ String ยาวๆ ส่งไปให้ Service เช็ค
-    const { newAccessToken, newRefreshToken } = await refreshUser(refresh_token.value as string | undefined);
+    const { newAccessToken, newRefreshToken } = await Refresh(refresh_token.value as string | undefined);
 
     // 2. เอา Token ตัวใหม่ที่ Service สร้างให้ มาฝังลง Cookie ทับของเดิม
     refresh_token.set({
@@ -76,20 +58,28 @@ export const authRoutes = new Elysia({prefix: '/auth'})
 
     // 3. ตอบกลับ Frontend (ส่งไปแค่ Access Token ส่วน Refresh อยู่ใน Cookie แล้ว)
     set.status = 200;
-    return {
-      success: true,
-      message: 'refresh สำเร็จ',
-      data: {
-        accessToken: newAccessToken
-      }
-    };
-
-  } catch (error: any) {
-    set.status = 401;
-    return {
-      success: false,
-      message: 'refresh ไม่สำเร็จ กรุณาล็อกอินใหม่',
-      error: error.message
-    };
-  }
+     return success(
+    { accessToken: newAccessToken },
+    "refresh สำเร็จ"
+  )
 })
+
+.get('/sessions/count', async({cookie: {refresh_token} }) => {
+  
+    if (!refresh_token.value) {
+      throw new Error("ไม่พบ Token ");
+    }
+    // 2. ใช้เครื่องมือถอดรหัส เพื่อแกะเอา userId ออกมา
+    const userId = await getUserIdFromToken(refresh_token.value as string);
+    // 3. ส่ง userId ไปให้ Service นับจำนวนจาก Database
+    const devices = await getActiveDevices(userId);
+
+    return success(devices, "ดึงข้อมูลสำเร็จ") 
+})
+.post('/logout',async ({cookie, set}) => {
+  
+    const result = await Logout(cookie)
+
+    return success(null, result.message)
+})
+
