@@ -1,15 +1,33 @@
-# Elysia with Bun runtime
+# การใช้งาน backend
 
-## Getting Started
-To get started with this template, simply paste this command into your terminal:
-```bash
-bun create elysia ./elysia-example
+## tech stack ที่ใช้
+```text
+Package Manager: Bun
+Web Framework: ElysiaJS
+ORM: Prisma
+Database: Supabase
+Security: JWT & Bcrypt
 ```
 
-## Development
-To start the development server run:
+##ขั้นตอนการ run backend 
+1.clone project
 ```bash
-bun run dev
+git clone https://github.com/Nutiphongg/Intern_chatbotui.git
+```
+2.ติดตั้ง library ทั้งหมด
+```bash
+bun install
+```
+3.สร้างไฟล์ .env
+```bash
+DATABASE_URL="postgresql://postgres..."
+ACCESS_SECRET="your_secret_key"
+REFRESH_SECRET="your_refresh_key"
+```
+4.รัน project
+```bash
+bun run --watch src/index.ts
 ```
 
-Open http://localhost:3000/ with your browser to see the result.
+
+Open http://localhost:3000/swagger with your browser to see the result.
