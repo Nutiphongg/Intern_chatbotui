@@ -1,6 +1,14 @@
 import { HttpError } from "./problem";
 
+
+
 export const Errors = {
+  userAlreadyExists: () =>
+    new HttpError(
+      'email หรือ username นี้มีในระบบแล้ว',
+      400,
+      'user-already-exists'
+    ),
   invalidCredentials: () =>
     new HttpError(
       'Email หรือ password ไม่ถูกต้อง',

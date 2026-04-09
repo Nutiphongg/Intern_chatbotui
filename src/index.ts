@@ -13,9 +13,8 @@ const app = new Elysia()
 }))
 .use(swagger())
 .use(cookie())
-.get("/", () => "welcome to auth api")
-.use(authRoutes)
 app.onError(({ error, set, request }) => {
+  set.headers['Content-Type'] = 'application/json'
 
   if (error instanceof HttpError) {
     set.status = error.status
@@ -29,15 +28,18 @@ app.onError(({ error, set, request }) => {
     })
   }
 
-  // 🔥 fallback (แก้ตรงนี้)
+  //  fallback
   set.status = 500
   return problem({
+    type: 'about:blank',
     title: 'Internal Server Error',
     status: 500,
     detail: error instanceof Error ? error.message : String(error),
     instance: request.url
   })
 })
+.get("/", () => "welcome to auth api")
+.use(authRoutes)
 .listen(3000);
 
 

@@ -32,6 +32,9 @@ export const authRoutes = new Elysia({prefix: '/auth'})
       httpOnly: true,       
       maxAge: 7 * 86400,    // 7 วัน
       path: "/",
+       //ใช้ test ต้องลบออก
+      sameSite: "none",//อนุญาตให้ส่งคุกกี้ข้ามโดเมน
+      secure: true,//ยิงผ่าน api https
     });
 
     
@@ -39,10 +42,14 @@ export const authRoutes = new Elysia({prefix: '/auth'})
 }, {
   body: loginSchema
 })
-.post('/refresh', async ({ cookie: { refresh_token }, set }) => {
+.post('/refresh', async ({ cookie: { refresh_token },headers,request, set }) => {
+
+    const userAgent = headers['user-agent'] || 'unknown';
+   //ngrok proxy แก้ไขถ้าใช้ตัวอื่น
+    const ip = request.headers.get('x-forwarded-for') || 'unknown'
   
     // 1. ดึงแค่ String ยาวๆ ส่งไปให้ Service เช็ค
-    const { newAccessToken, newRefreshToken } = await Refresh(refresh_token.value as string | undefined);
+    const { newAccessToken, newRefreshToken } = await Refresh(refresh_token.value as string | undefined,userAgent,ip);
 
     // 2. เอา Token ตัวใหม่ที่ Service สร้างให้ มาฝังลง Cookie ทับของเดิม
     refresh_token.set({
@@ -64,10 +71,10 @@ export const authRoutes = new Elysia({prefix: '/auth'})
   )
 })
 
-.get('/sessions/count', async({cookie: {refresh_token} }) => {
+.get('/sessions/devices', async({cookie: {refresh_token} }) => {
   
     if (!refresh_token.value) {
-      throw new Error("ไม่พบ Token ");
+      throw Errors.missingToken();
     }
     // 2. ใช้เครื่องมือถอดรหัส เพื่อแกะเอา userId ออกมา
     const userId = await getUserIdFromToken(refresh_token.value as string);
@@ -76,10 +83,21 @@ export const authRoutes = new Elysia({prefix: '/auth'})
 
     return success(devices, "ดึงข้อมูลสำเร็จ") 
 })
-.post('/logout',async ({cookie, set}) => {
+.post('/logout', async ({ cookie: { refresh_token }, set }) => {
   
-    const result = await Logout(cookie)
+    // 1. ส่งแค่ string ไปให้ Service ลบข้อมูลใน Database
+    const result = await Logout(refresh_token.value as string | undefined);
 
-    return success(null, result.message)
+    // 2.  สั่งเคลียร์ Cookie ที่ฝั่ง Browser 
+    refresh_token.set({
+        value: "",          
+        httpOnly: true,
+        path: "/",
+        maxAge: 0,          
+        sameSite: "none",   
+        secure: true,       
+    });
+
+    return success(null, result.message);
 })
-
+  

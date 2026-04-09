@@ -2,14 +2,14 @@ import { Pool } from 'pg';
 import { PrismaPg } from '@prisma/adapter-pg'; 
 import { PrismaClient } from '@prisma/client'; 
 
-// ดึง URL จากไฟล์ .env ของคุณ
+// ดึง URL จากไฟล์ .env 
 const connectionString = process.env.DATABASE_URL;
 
-// 1. สร้างท่อเชื่อมต่อ (Connection Pool)
+// 1. เชื่อมต่อ (Connection Pool)
 const pool = new Pool({ connectionString });
 
-// 2. เอาท่อเชื่อมต่อ ไปสวมเข้ากับหัวแปลงของ Prisma (Adapter)
+// 2. เชื่อมต่อเข้าแปลงของ Prisma (Adapter)
 const adapter = new PrismaPg(pool);
 
-// 3. ยัด Adapter เข้าไปใน PrismaClient (นี่แหละครับสิ่งที่ Prisma 7 ร้องขอ!)
+// 3. Adapter เข้าไปใน PrismaClient 
 export const prisma = new PrismaClient({ adapter });

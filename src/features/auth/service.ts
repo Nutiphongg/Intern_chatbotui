@@ -1,83 +1,99 @@
 import bcrypt from 'bcrypt';
-import { db } from '../setup/db';
 import { RegisterBody ,LoginBody} from './types';
 import { signAccessToken,signRefreshToken,verifyRefreshToken } from './jwt';
 import { prisma } from '../setup/prisma'
 import { HttpError } from '../../lib/problem';
 import { Errors} from '../../lib/errors';
+
+//ระบบลงทะเบียนผู้ใช้ใหม่
 export const Register = async (data: RegisterBody) => {
+    //ตรวจสอบ Email หรือ Username ในระบบ
+    const existingUser = await prisma.users.findFirst({
+        where: {
+            OR: [
+                { email: data.email },
+                { username: data.username }
+            ]
+        }
+    });
+
+    //   ถ้าเจอว่ามีข้อมูลซ้ำ โยน Error 
+    if (existingUser) {
+        throw Errors.userAlreadyExists(); 
+    }
     // 1. ทำการ hash password
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(data.password, salt);
 
-    // 2. บันทึกลงใน db (ใช้ pg Pool ต้องเขียน SQL สด)
-    const query = `
-        INSERT INTO users (email, username, password_hash)
-        VALUES ($1, $2, $3)
-        RETURNING id, email, username;
-    `;
-    const values = [data.email, data.username, passwordHash];
-    
-    // สั่งรัน SQL
-    const result = await db.query(query, values);
-    
-    // ข้อมูลที่เรา Return กลับมาจาก SQL จะอยู่ใน result.rows[0]
-    const newUser = result.rows[0];
-
-    // 3. ส่งข้อมูลไป Route
-    return {
-        id: newUser.id,
-        email: newUser.email,
-        username: newUser.username,
-    };
-}
-
+    // 2. ใช้ prisma สร้าง user ใหม่
+        const newUser = await prisma.users.create({
+            // ข้อมูลที่ต้องบันทึก
+            data: {
+                email: data.email,
+                username: data.username,
+                password_hash: passwordHash,
+            },
+            //ส่งข้อมูลกลับ
+            select: {
+                id:true,
+                email:true,
+                username: true,
+            }
+        });
+        return newUser;
+};
+//ระบบเข้าสู่ระบบ (Login)
 export const Login = async (body: LoginBody ,userAgent:string ,ip:string ) => {
     const { email,password } = body;
-
-    const result = await db.query(
-        'SELECT * FROM users WHERE email = $1',
-        [email]
-    )
-
-    const user = result.rows[0]
-
+    // 1. ค้นหา User จาก Email
+    const user = await prisma.users.findFirst({
+        where: {email: email }
+    });
+    // ไม่พบ User ให้โยน Error
     if(!user){
          throw Errors.invalidCredentials()
     
     }
-
+    // 2. ตรวจสอบรหัสผ่าน
     const ok = await bcrypt.compare(password,user.password_hash)
 
     if(!ok){
         throw Errors.invalidCredentials()
     }
-    const sessions = await db.query(
-    `SELECT id FROM sessions 
-     WHERE user_id = $1 
-     AND expires_at > NOW()
-     ORDER BY created_at ASC`,
-    [user.id]
-    )
-    if (sessions.rows.length >= 3) {
-    const oldest = sessions.rows[0]
+    // 3. จัดการจำนวน Session (จำกัดการ Login ไว้ไม่เกิน 3 เครื่อง)
+    const sessions = await prisma.sessions.findMany({
+        where:{
+            user_id: user.id,
+            expires_at:{gt: new Date()}// เอาเฉพาะที่ยังไม่หมดอายุ
+        },
+        orderBy: { created_at:'asc'}
+    });
+    //login เกินให้ลบแบบ(FIFO)
+    if (sessions.length >= 3) {
+        const oldest = sessions[0];
+        await prisma.sessions.delete({
+            where: { id: oldest.id }
+        });
+    }
 
-    await db.query(
-      `DELETE FROM sessions WHERE id = $1`,
-      [oldest.id]
-    )
-  }
-    // สร้าง token
+    //4. สร้าง Access Token และ Refresh Token
     const accessToken = signAccessToken({userId: user.id})
     const refreshToken = signRefreshToken({userId: user.id})
 
-    // บันทึก token
-    await db.query(
-         `INSERT INTO sessions (user_id, refresh_token,user_agent, ip_address, expires_at)
-         VALUES ($1, $2, $3, $4, NOW() + INTERVAL '7 days')`,
-         [user.id, refreshToken,userAgent,ip]
-    )
+    // 5. บันทึก Session ใหม่ลง Database
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 7);
 
+    await prisma.sessions.create({
+        data: {
+            user_id: user.id,
+            refresh_token: refreshToken,
+            user_agent: userAgent,
+            ip_address: ip,
+            expires_at: expiresAt
+        }
+    });
+    // ส่งข้อมูล Token และข้อมูล User
     return {
         accessToken,
         refreshToken,
@@ -89,89 +105,96 @@ export const Login = async (body: LoginBody ,userAgent:string ,ip:string ) => {
     }
 } 
 
-// 1. รับค่าเป็น String ธรรมดา ไม่รับ Object Cookie แล้ว
-export const Refresh = async (refreshToken: string | undefined) => { 
+//ระบบต่ออายุ Token (Refresh Token Rotation)
+
+export const Refresh = async (refreshToken: string | undefined,userAgent:string ,ip:string) => { 
+    // ตรวจสอบว่ามี Token
     if(!refreshToken) {
-         throw Errors.missingToken()
+         throw Errors.missingToken();
     }
 
-    // ตรวจสอบ JWT
+    // ตรวจสอบความถูกต้อง JWT
     let payload: any;
     try {
         payload = verifyRefreshToken(refreshToken);
     } catch (error:any){
         // ลบ token ออกจาก db
-        await db.query(`DELETE FROM sessions WHERE refresh_token = $1`, [refreshToken]);
-        // ลบเสร็จ กลับไปที่ route
+        await prisma.sessions.deleteMany({
+            where: { refresh_token: refreshToken }
+        });
          throw Errors.invalidToken()
     }
 
-    // เช็คใน db
-    const session = await db.query(
-        `SELECT * FROM sessions WHERE refresh_token = $1`, [refreshToken]
-    );
+    // 2. เช็คว่า Session นี้ยังมีอยู่ใน Database
+   const session = await prisma.sessions.findFirst({
+        where: { refresh_token: refreshToken }
+    });
 
-    if(session.rows.length === 0){
-        throw Errors.sessionNotFound()
-
+    if (!session) {
+        throw Errors.sessionNotFound();
     }
 
     const userId = payload.userId;
 
-    // Rotate token (สร้างคู่ใหม่)
+    // 3. ทำการ Token Rotation (สร้างคู่ใหม่)
     const newAccessToken = signAccessToken({ userId });
     const newRefreshToken = signRefreshToken({ userId });
 
-    // ลบ refreshtoken เก่าออก
-    await db.query(
-        `DELETE FROM sessions WHERE refresh_token = $1`, [refreshToken]
-    );
+    // 4. ลบ refreshtoken เก่าออก
+    await prisma.sessions.deleteMany({
+        where: { refresh_token: refreshToken }
+    });
 
-    // เพิ่มเข้ามาใหม่
-    await db.query(
-        `INSERT INTO sessions (user_id, refresh_token, expires_at) 
-         VALUES ($1, $2, NOW() + INTERVAL '7 days')`, 
-         [userId, newRefreshToken]
-    );
+    // 5. บันทึก Refresh Token เพิ่มเข้ามาใหม่
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 7);
 
-    // 2. คืนค่า Token คู่ใหม่กลับไปให้ Route จัดการต่อ
+    await prisma.sessions.create({
+        data: {
+            user_id: userId,
+            refresh_token: newRefreshToken,
+            user_agent: userAgent,
+            ip_address: ip,
+            expires_at: expiresAt
+        }
+    });
+
+    // ส่ง Token คู่ใหม่กลับไปให้ Client
     return {
-        newAccessToken,
-        newRefreshToken
+        newAccessToken:newAccessToken,
+        newRefreshToken: newRefreshToken
     };
 };
 
+//ดึงข้อมูลอุปกรณ์ที่กำลังใช้งานอยู่ (Active Sessions)
 export const getActiveDevices = async (userId: string) => {
   const result = await prisma.sessions.groupBy({
-    by: ['user_agent'],
+    by: ['user_agent'],// จัดกลุ่มตามประเภทอุปกรณ์ (Browser/OS)
     where: {
       user_id: userId,
       expires_at: {
-        gt: new Date(),
+        gt: new Date(),// เอาเฉพาะที่ยังไม่หมดอายุ
       },
     },
   });
 
-  return {count: result.length,
-         devices:result
+  return {user: result.length,// จำนวนอุปกรณ์ที่ออนไลน์อยู่
+         devices:result// รายการอุปกรณ์
          }
 };
 
-export const Logout = async(cookie: any) => {
-    const refreshToken = cookie.refresh_token?.value
-
-    if(!refreshToken){
-        throw Errors.missingToken()
+//ระบบออกจากระบบ (Logout)
+export const Logout = async (refreshToken: string | undefined) => {
+    // ถ้าไม่มี Token ส่งมา ให้แจ้ง Error
+    if (!refreshToken) {
+        throw Errors.missingToken();
     }
 
-    await db.query(
-        `DELETE FROM sessions WHERE refresh_token = $1`,[refreshToken]
-    )
-
-    cookie.refresh_token.remove()
+    await prisma.sessions.deleteMany({
+        where: { refresh_token: refreshToken }
+    });
 
     return {
         message: 'logout success'
-    }
-
-}
+    };
+};
