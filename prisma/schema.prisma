@@ -1,6 +1,5 @@
 generator client {
   provider = "prisma-client-js"
-  
 }
 
 datasource db {
@@ -22,14 +21,46 @@ model sessions {
 }
 
 model users {
-  id            String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  email         String     @unique @db.VarChar(255)
-  username      String     @unique @db.VarChar(100)
+  id            String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  email         String          @unique @db.VarChar(255)
+  username      String          @unique @db.VarChar(100)
   password_hash String
-  created_at    DateTime?  @default(now()) @db.Timestamp(6)
-  updated_at    DateTime?  @default(now()) @db.Timestamp(6)
+  created_at    DateTime?       @default(now()) @db.Timestamp(6)
+  updated_at    DateTime?       @default(now()) @db.Timestamp(6)
+  conversations conversations[]
   sessions      sessions[]
 
   @@index([email], map: "idx_users_email")
   @@index([username], map: "idx_users_username")
+}
+
+model conversations {
+  id              String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id         String     @db.Uuid
+  title           String?
+  created_at      DateTime?  @default(now()) @db.Timestamp(6)
+  updated_at      DateTime?  @default(now()) @db.Timestamp(6)
+  last_message_at DateTime?  @db.Timestamp(6)
+  users           users?      @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_conversation_user")
+  messages        messages[]
+
+  @@index([last_message_at(sort: Desc)], map: "idx_conversations_last_message")
+  @@index([user_id], map: "idx_conversations_user_id")
+}
+
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+model messages {
+  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  conversation_id String        @db.Uuid
+  role            String        @db.VarChar(20)
+  content         String
+  created_at      DateTime?     @default(now()) @db.Timestamp(6)
+  model           String?       @db.VarChar(50)
+  token_usage     Int?
+  response_time   Int?
+  metadata        Json?
+  conversations   conversations @relation(fields: [conversation_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_message_conversation")
+
+  @@index([conversation_id], map: "idx_messages_conversation_id")
+  @@index([created_at(sort: Desc)], map: "idx_messages_created_at")
 }

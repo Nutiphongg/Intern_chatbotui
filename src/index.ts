@@ -1,5 +1,6 @@
 import { Elysia } from "elysia";
 import { authRoutes } from "./features/auth/route";
+import { chatRoutes } from "./features/chatbot/route";
 import { swagger } from "@elysiajs/swagger";
 import { cookie } from "@elysiajs/cookie";
 import { cors } from "@elysiajs/cors";
@@ -40,6 +41,7 @@ app.onError(({ error, set, request }) => {
 })
 .get("/", () => "welcome to auth api")
 .use(authRoutes)
+.use(chatRoutes)
 .listen(3000);
 
 

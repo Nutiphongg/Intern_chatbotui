@@ -35,5 +35,26 @@ export const Errors = {
       'Session หมดอายุหรือถูกยกเลิก',
       401,
       'session-not-found'
+    ),
+
+  badRequest: (message = 'คำขอไม่ถูกต้อง') =>
+    new HttpError(
+      message,
+      400,
+      'bad-request'
+    ),
+
+  forbidden: (message = 'ไม่มีสิทธิ์เข้าถึงข้อมูลนี้') =>
+    new HttpError(
+      message,
+      403,
+      'forbidden'
+    ),
+
+  internalServerError: () =>
+    new HttpError(
+      'เกิดข้อผิดพลาดภายในระบบ',
+      500,
+      'internal-server-error'
     )
 }
