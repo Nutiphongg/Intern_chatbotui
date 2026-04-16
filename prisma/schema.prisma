@@ -7,8 +7,8 @@ datasource db {
 }
 
 model sessions {
-  id            String    @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  user_id       String    @db.Uuid
+  id            String    @id 
+  user_id       String    
   refresh_token String    @unique
   user_agent    String?
   ip_address    String?   @db.VarChar(50)
@@ -21,7 +21,7 @@ model sessions {
 }
 
 model users {
-  id            String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  id            String          @id 
   email         String          @unique @db.VarChar(255)
   username      String          @unique @db.VarChar(100)
   password_hash String
@@ -35,23 +35,23 @@ model users {
 }
 
 model conversations {
-  id              String     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  user_id         String     @db.Uuid
+  id              String     @id 
+  user_id         String?    
   title           String?
+  is_deleted      Boolean    @default(false)
   created_at      DateTime?  @default(now()) @db.Timestamp(6)
   updated_at      DateTime?  @default(now()) @db.Timestamp(6)
   last_message_at DateTime?  @db.Timestamp(6)
-  users           users?      @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_conversation_user")
+  users           users?     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_conversation_user")
   messages        messages[]
 
   @@index([last_message_at(sort: Desc)], map: "idx_conversations_last_message")
   @@index([user_id], map: "idx_conversations_user_id")
 }
 
-/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
 model messages {
-  id              String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  conversation_id String        @db.Uuid
+  id              String        @id 
+  conversation_id String        
   role            String        @db.VarChar(20)
   content         String
   created_at      DateTime?     @default(now()) @db.Timestamp(6)

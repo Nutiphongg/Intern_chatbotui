@@ -4,6 +4,7 @@ import { signAccessToken,signRefreshToken,verifyRefreshToken } from './jwt';
 import { prisma } from '../setup/prisma'
 import { HttpError } from '../../lib/problem';
 import { Errors} from '../../lib/errors';
+import { ulid } from 'ulid'
 
 //ระบบลงทะเบียนผู้ใช้ใหม่
 export const Register = async (data: RegisterBody) => {
@@ -25,10 +26,12 @@ export const Register = async (data: RegisterBody) => {
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(data.password, salt);
 
+        const newUserId = ulid();
     // 2. ใช้ prisma สร้าง user ใหม่
         const newUser = await prisma.users.create({
             // ข้อมูลที่ต้องบันทึก
             data: {
+                id: newUserId,
                 email: data.email,
                 username: data.username,
                 password_hash: passwordHash,
@@ -83,9 +86,11 @@ export const Login = async (body: LoginBody ,userAgent:string ,ip:string ) => {
     // 5. บันทึก Session ใหม่ลง Database
     const expiresAt = new Date();
     expiresAt.setDate(expiresAt.getDate() + 7);
+    const newSessionId = ulid();
 
     await prisma.sessions.create({
         data: {
+            id: newSessionId,
             user_id: user.id,
             refresh_token: refreshToken,
             user_agent: userAgent,
@@ -151,6 +156,7 @@ export const Refresh = async (refreshToken: string | undefined,userAgent:string 
 
     await prisma.sessions.create({
         data: {
+            id: ulid(),
             user_id: userId,
             refresh_token: newRefreshToken,
             user_agent: userAgent,

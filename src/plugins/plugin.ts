@@ -1,11 +1,12 @@
 
 import { Elysia } from 'elysia';
 import { Errors } from '../lib/errors';
- import { verifyAccessToken } from '../features/auth/jwt'; 
+import { verifyAccessToken } from '../features/auth/jwt'; 
 
-export const authPlugin = new Elysia({ name: 'auth-plugin' })
-    // 🔥 ใช้ .derive() เพื่อสร้างตัวแปรและส่งต่อ Type
-    .derive(async ({ headers }) => {
+
+export const authPlugin =  (app: Elysia) =>
+    //  ใช้ .derive() เพื่อสร้างตัวแปรและส่งต่อ Type
+    app.derive(async ({ headers }) => {
         // 1. ดึง Token จาก Header
         const auth = headers.authorization;
         if (!auth || !auth.startsWith('Bearer ')) {

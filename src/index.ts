@@ -10,6 +10,7 @@ const app = new Elysia()
 //ใช้ test
 .use(cors({
   origin:'http://localhost:3000',
+  methods: "GET,HEAD,PUT,POST,DELETE,OPTIONS",
   credentials:true //ส่ง cookie
 }))
 .use(swagger())
@@ -31,11 +32,15 @@ app.onError(({ error, set, request }) => {
 
   //  fallback
   set.status = 500
+  //สร้างตัวแปรเพื่อแสดงรายละเอียด error
+  const isProduction = process.env.NODE_ENV === 'production';
   return problem({
     type: 'about:blank',
     title: 'Internal Server Error',
     status: 500,
-    detail: error instanceof Error ? error.message : String(error),
+    detail: isProduction 
+        ? "ระบบเกิดข้อผิดพลาด กรุณาติดต่อผู้ดูแลระบบ" 
+        : (error instanceof Error ? error.message : String(error)),
     instance: request.url
   })
 })

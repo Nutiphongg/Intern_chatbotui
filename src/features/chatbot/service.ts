@@ -3,35 +3,31 @@ import { prisma } from '../setup/prisma';
 import { redis } from '../setup/redis';
 import { Errors } from '../../lib/errors';
 import { ChatRequestBody } from './types';
+import { ulid } from 'ulid';
+
 
 const OLLAMA_URL = process.env.OLLAMA_URL || 'http://localhost:11434/api/chat';
 const MAX_HISTORY = 10; // จำแค่ 10 ประโยคล่าสุด
 const REDIS_TTL = 3600; // ให้ Redis จำไว้ 1 ชั่วโมง
 
-export const processChatMessage = async (
-    userIdOrBody: string | ChatRequestBody,
-    maybeBody?: ChatRequestBody
-) => {
-    // รองรับทั้ง signature ใหม่ (body) และเก่า (userId, body)
-    const body = typeof userIdOrBody === 'string' ? maybeBody : userIdOrBody;
+export const processChatMessage = async (userId: string , body : ChatRequestBody) => {
     if (!body) {
         throw Errors.badRequest('ไม่พบข้อมูลข้อความ');
     }
 
-    //  ปรับให้สร้าง Mock ID สำหรับทดสอบ Redis ถ้ายังไม่มี convId
-    let convId = body.conversationId || `temp-session-${Date.now()}`;
+    let convId = body.conversationId ;
     let isNewConv = !body.conversationId;
     const { message } = body;
 
    
-    //  1. จัดการห้องแชท (Conversations) - ปิด DB ไว้ชั่วคราว
-  
-    /*
+    //  1. จัดการห้องแชท (Conversations)   
     if (!convId) {
         // แชทใหม่ 
+        const newConvId = ulid();
         const newConv = await prisma.conversations.create({
-            // temporary: อนุญาต guest conversation โดยยังไม่ผูก users relation
             data: { 
+                id: newConvId,
+                user_id: userId,
                 title: message.substring(0, 30), // เอา 30 ตัวอักษรแรกมาทำชื่อห้อง
                 last_message_at: new Date()
             } as any
@@ -41,7 +37,7 @@ export const processChatMessage = async (
     } else {
         // แชทเก่า อัปเดตเวลาที่มีการคุยล่าสุด
         const updated = await prisma.conversations.updateMany({
-            where: { id: convId },
+            where: { id: convId,user_id: userId },
             data: { last_message_at: new Date() }
         });
         if (updated.count === 0) {
@@ -51,9 +47,13 @@ export const processChatMessage = async (
 
     // เซฟข้อความ User ลง DB
     await prisma.messages.create({
-        data: { conversation_id: convId, role: 'user', content: message }
+        data: { 
+            id: ulid(), 
+            conversation_id: convId, 
+            role: 'user', 
+            content: message }
     });
-    */
+    
 
     // 2. ดึงประวัติจาก Redis (ทำงานปกติ)
   
@@ -73,7 +73,7 @@ export const processChatMessage = async (
             await redis.rpush(redisKey, JSON.stringify(newMessage));
         } else {
             // หมดอายุใน Redis ไปแล้ว ปิดการหาจาก DB ไว้ชั่วคราว
-            /*
+            
             const dbHistory = await prisma.messages.findMany({
                 where: { conversation_id: convId },
                 orderBy: { created_at: 'desc' },
@@ -82,16 +82,14 @@ export const processChatMessage = async (
             });
             messagesForLLM = dbHistory.reverse(); 
 
+            const newMessage = {role: 'user' , content: message };
+            messagesForLLM.push(newMessage);
+
             // ลงใน Redis
             const pipeline = redis.pipeline();
             messagesForLLM.forEach(msg => pipeline.rpush(redisKey, JSON.stringify(msg)));
             await pipeline.exec();
-            */
-
-            // 💡 สร้างเป็นข้อความใหม่ไปเลยสำหรับการทดสอบ กรณี Redis หาย
-            messagesForLLM = [{ role: 'user', content: message }];
-            await redis.rpush(redisKey, JSON.stringify(messagesForLLM[0]));
-        }
+         }
     }
 
     //  3. ยิง API หา Ollama (ทำงานปกติ)
@@ -126,9 +124,10 @@ export const processChatMessage = async (
     
     //  4. บันทึกคำตอบกลับลงระบบ - ปิด DB ไว้ชั่วคราว
    
-    /*
+    
     await prisma.messages.create({
         data: { 
+            id:ulid(),
             conversation_id: convId, 
             role: 'assistant', 
             content: assistantReply,
@@ -137,7 +136,7 @@ export const processChatMessage = async (
             token_usage: ollamaData.eval_count || 0 
         }
     });
-    */
+    
 
     //  แต่ยังคงเซฟประวัติลง Redis อยู่
     await redis.rpush(redisKey, JSON.stringify({ role: 'assistant', content: assistantReply }));
@@ -155,40 +154,48 @@ export const processChatMessage = async (
     };
 };
 
-// ปล่อยฟังก์ชัน getChatHistory และ getUserConversations ไว้เหมือนเดิม
-// เพราะไม่ได้ถูกเรียกตอนส่งข้อความ (แต่อาจจะพังถ้ากดดูประวัติจาก Frontend ตอนนี้ เพราะเรายังไม่ได้เซฟลง DB)
-export const getChatHistory = async (
-    userIdOrConversationId: string,
-    conversationIdOrLimit?: string | number,
-    maybeLimit = 50
-) => {
-    // 1. จัดการเรื่องการรับค่า Parameter (โค้ดเดิมของคุณ)
-    const conversationId =
-        typeof conversationIdOrLimit === 'string'
-            ? conversationIdOrLimit
-            : userIdOrConversationId;
+export const getChatHistory = async (userId: string, conversationId: string, limit: number = 50) => {
+    // check ห้องแชทมีจริง
+    const conversation = await prisma.conversations.findFirst({
+        where: {id:conversationId,is_deleted: false,user_id: userId}
+    });
 
-    // 2. สร้าง Key ให้ตรงกับที่เราเซฟไว้ใน Redis
-    const redisKey = `chat:${conversationId}`;
-
-    // 3. ดึงข้อมูลประวัติทั้งหมดจาก Redis (จาก Index 0 ถึงตัวสุดท้าย -1)
-    const cached = await redis.lrange(redisKey, 0, -1);
-
-    // 4. ถ้าไม่มีข้อมูลใน Redis เลย ให้ส่ง Array ว่างกลับไป
-    if (!cached || cached.length === 0) {
-        return [];
+    if(!conversation) {
+        throw Errors.badRequest('ไม่พบห้องแชท หรือคุณไม่มีสิทธิ์เข้าถึงข้อมูลนี้');
     }
 
-    // 5. แปลงข้อมูลที่ได้จาก Redis (ซึ่งเป็น String) กลับมาเป็น JSON Object
-    const messages = cached.map(msg => JSON.parse(msg));
+    const redisKey = `chat:${conversationId}`;
+   // 2. ลองหาประวัติใน Redis ดูก่อน
+    const cached = await redis.lrange(redisKey,0,-1);
+
+    if(cached && cached.length > 0) {
+        // ถ้าเจอใน Redis ก็ส่งกลับไปเลย
+        return cached.map(msg => JSON.parse(msg));
+    }
+    
+    const dbMessages = await prisma.messages.findMany({
+        where: { conversation_id: conversationId },
+        orderBy: {created_at: 'desc'},
+        take: limit,
+        select: {role:true, content: true }
+    });
+
+    if (dbMessages.length === 0) return [];
+
+    const messages = dbMessages.reverse();
+    const pipeline = redis.pipeline();
+    messages.forEach(msg => pipeline.rpush(redisKey, JSON.stringify(msg)));
+    pipeline.expire(redisKey, REDIS_TTL); // ตั้งเวลาหมดอายุใหม่
+    await pipeline.exec();
 
     return messages;
 };
 
 export const getUserConversations = async (userId: string) => {
     return prisma.conversations.findMany({
-        where: { user_id: userId },
-        orderBy: { last_message_at: 'desc' },
+        where: { user_id: userId,is_deleted: false, }, // ดึงมาเฉพาะห้องของ User 
+        orderBy: { last_message_at: 'desc' }, // เรียงจากแชทที่เพิ่งคุยล่าสุด
+        
         select: {
             id: true,
             title: true,
@@ -197,4 +204,48 @@ export const getUserConversations = async (userId: string) => {
             last_message_at: true
         }
     });
+};
+
+// ฟังก์ชันลบห้องแชท (Soft Delete) 
+export const deleteConversation = async (userId: string, conversationId: string) => {
+  // 1. Soft Delete ใน PostgreSQL
+  await prisma.conversations.updateMany({
+    where: { id: conversationId, user_id: userId },
+    data: { is_deleted: true }
+  });
+
+  // 2. ลบ Cache ใน Redis )
+  await redis.del(`chat:history:${conversationId}`);
+  
+  return { message: "ลบข้อมูลสำเร็จ" };
+};
+
+// ฟังก์ชันแก้ไขข้อความ
+export const editMessage = async (userId: string, messageId: string, newContent: string) => {
+  // 1. ดึงข้อความเดิมมาดูเพื่อเอาข้อมูลเข้า metadata
+  const oldMessage = await prisma.messages.findFirst({
+    where: { id: messageId, conversations: { user_id: userId } }
+  });
+
+  if (!oldMessage) throw new Error("Message not found");
+
+  // 2. อัปเดตใน PostgreSQL
+  const updatedMessage = await prisma.messages.update({
+    where: { id: messageId },
+    data: {
+      content: newContent,
+      metadata: {
+        ...(oldMessage.metadata as object || {}),
+        is_edited: true,
+        last_edited_at: new Date(),
+        // เก็บประวัติข้อความเก่าไว้เผื่อแอดมินตรวจสอบ
+        original_content: oldMessage.content 
+      }
+    }
+  });
+
+  // 3. ลบ Cache ใน Redis ของห้องนั้นทิ้ง 
+  await redis.del(`chat:history:${oldMessage.conversation_id}`);
+
+  return updatedMessage;
 };
