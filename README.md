@@ -24,7 +24,12 @@ DATABASE_URL="postgresql://postgres..."
 ACCESS_SECRET="your_secret_key"
 REFRESH_SECRET="your_refresh_key"
 ```
-4.รัน project
+4.รัน ตัว prisma
+```bash
+bunx prisma db pull
+bunx prisma generate
+```
+5..รัน project
 ```bash
 bun run --watch src/index.ts
 ```
