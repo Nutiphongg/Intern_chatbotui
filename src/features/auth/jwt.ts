@@ -1,7 +1,8 @@
 import jwt from 'jsonwebtoken'
+import { env } from '../../lib/env'
 
-const ACCESS_SECRET = process.env.ACCESS_SECRET!
-const REFRESH_SECRET = process.env.REFRESH_SECRET!
+const ACCESS_SECRET = env.ACCESS_SECRET
+const REFRESH_SECRET = env.REFRESH_SECRET
 
 export const signAccessToken = (payload: any) => 
     jwt.sign(payload,ACCESS_SECRET,{expiresIn: '10m'})

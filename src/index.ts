@@ -5,6 +5,7 @@ import { swagger } from "@elysiajs/swagger";
 import { cookie } from "@elysiajs/cookie";
 import { cors } from "@elysiajs/cors";
 import { problem,HttpError } from "./lib/problem";
+import { env } from "./lib/env";
 
 const app = new Elysia()
 //ใช้ test
@@ -33,7 +34,7 @@ app.onError(({ error, set, request }) => {
   //  fallback
   set.status = 500
   //สร้างตัวแปรเพื่อแสดงรายละเอียด error
-  const isProduction = process.env.NODE_ENV === 'production';
+  const isProduction = env.NODE_ENV === 'production';
   return problem({
     type: 'about:blank',
     title: 'Internal Server Error',

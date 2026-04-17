@@ -1,7 +1,7 @@
 // src/features/chat/route.ts
 import { Elysia, t } from 'elysia';
-import { chatRequestSchema } from './types';
-import { processChatMessage, getChatHistory, getUserConversations,deleteConversation,editMessage } from './service';
+import { chatHistoryQuerySchema, chatRequestSchema, conversationParamsSchema } from './types';
+import { processChatMessageStream, getChatHistory, getUserConversations,deleteConversation,editMessage } from './service';
 import { authPlugin } from '../../plugins/plugin';
 import { redis } from '../setup/redis';
 
@@ -9,35 +9,52 @@ export const chatRoutes = new Elysia({ prefix: '/chat' })
     .use(authPlugin)
     // POST /chatbot
     .post('/', async ({ body, user })  => {
-        const result = await processChatMessage(user.id,body);
-        return { data: result };
+        const result = processChatMessageStream(user.id, body);
+        return new Response(result.stream, {
+            headers: {
+                'Content-Type': 'text/event-stream; charset=utf-8',
+                'Cache-Control': 'no-cache',
+                'X-Conversation-Id': result.conversationId
+            }
+        });
     }, {
         body: chatRequestSchema
     })
-    // GET /chat/histories
-    .get('/histories', async ({user}) => {
-        const data = await getUserConversations(user.id);
-        return {data};
-    })
-
-    // GET /chat/history/:conversationId
-    .get('/history/:conversationId', async ({ params, query, user }) => {
-        const limit = query.limit || 50; 
-        const data = await getChatHistory(user.id ,params.conversationId, limit);
-        return  { data };
+   // GET /chat/histories
+    .get('/histories', async ({ query, user }) => {
+        const rawPage = query.page || 1;
+        const page = Math.max(1, rawPage); // บังคับว่าหน้าต้อง >= 1 เสมอ
+        
+        const rawLimit = query.limit || 10;
+        const limit = Math.max(1, rawLimit); // บังคับว่าต้องดึงอย่างน้อย 1 รายการ
+        
+        // เรียกใช้งาน service
+        return await getUserConversations(user.id, page, limit);
     }, {
-        params: t.Object({
-            conversationId: t.String()
-        }),
         query: t.Object({
+            page: t.Optional(t.Numeric()), 
             limit: t.Optional(t.Numeric())
         })
+    })
+    // GET /chat/history/:conversationId
+    .get('/history/:conversationId', async ({ params, query, user }) => {
+        
+        const rawPage = query.page || 1;
+        const page = Math.max(1, rawPage); // บังคับว่าหน้าต้อง >= 1 เสมอ
+        const rawLimit = query.limit || 1;
+        const limit = Math.max(1, rawLimit); // บังคับว่าต้องดึงอย่างน้อย 1 รายการ
+        
+        return await getChatHistory(user.id, params.conversationId, page, limit);
+        
+    }, {
+        params: conversationParamsSchema,
+        query: chatHistoryQuerySchema 
     })
     // DELETE /chat/:conversationId (ลบห้องแชท)
     .delete('/delete/:conversationId', async ({ params, user }) => {
         return await deleteConversation(user.id, params.conversationId);
     }, {
-        params: t.Object({ conversationId: t.String() })
+        params: conversationParamsSchema
     })
     
    /*

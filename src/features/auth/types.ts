@@ -1,4 +1,5 @@
 import { t, Static } from "elysia";
+import { AuthUser, DeviceInfo, JwtPayloadShape } from "./interface";
 
 // 1. สร้างตัวดักจับ Request 
 export const registerSchema = t.Object({
@@ -16,17 +17,8 @@ export const loginSchema = t.Object({
 export type RegisterBody = Static<typeof registerSchema>;
 export type LoginBody = Static<typeof loginSchema>;
 // COMMON TYPES
-// user ที่ส่งกลับ frontend
-export type User = {
-  id: string;
-  email: string;
-  username: string;
-};
-
-// sessions/devices
-export type Device = {
-  user_agent: string;
-};
+export type User = AuthUser;
+export type Device = DeviceInfo;
 
 //response type
 // success wrapper (ตามที่ใช้ success())
@@ -59,6 +51,4 @@ export type DevicesResponse = ApiResponse<{
 // logout
 export type LogoutResponse = ApiResponse<null>;
 //  JWT TYPE
-export type JwtPayload = {
-  userId: string;
-};
+export type JwtPayload = JwtPayloadShape;
