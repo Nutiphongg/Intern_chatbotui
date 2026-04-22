@@ -32,3 +32,15 @@ export interface LogoutServiceResult {
   message: string;
 }
 
+export interface GuestUser {
+  id: string;
+  isGuest: true;
+  createdAt: Date;
+}
+export interface CreateGuestResponse {
+  data: {
+    accessToken: string; 
+    guestId: string;     
+  };
+  message: string;
+}

@@ -1,9 +1,11 @@
 import {Elysia, t} from "elysia";
 import { registerSchema,loginSchema } from "./types";
-import { Register,Login,Refresh,getActiveDevices,Logout } from "./service";
-import { getUserIdFromToken } from "./jwt";
+import { Register,Login,Refresh,getActiveDevices,Logout,createGuestUser } from "./service";
+import { getUserIdFromToken,signAccessToken } from "./jwt";
 import { success } from "../../lib/response";
 import { Errors } from "../../lib/errors";
+import { env } from "../../lib/env";
+
 
 export const authRoutes = new Elysia({prefix: '/auth'})
 
@@ -99,5 +101,26 @@ export const authRoutes = new Elysia({prefix: '/auth'})
       });
 
       return success(null, result.message);
+  })
+  
+  .post('/guestmode', async ({  set }) => {
+      // 1. สร้าง Guest ID ใน Redis
+      const guest = await createGuestUser();
+      
+      // 2. เอา Guest ID มา Sign เป็น JWT
+      const token = signAccessToken({
+        userId: guest.id,
+        role: 'guest'
+        
+      });
+
+      set.status = 201;
+      return success(
+        { 
+          accessToken: token, 
+          guestId: guest.id 
+        }, 
+        'สร้าง Guest Session สำเร็จ'
+      );
   })
     

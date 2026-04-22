@@ -12,7 +12,8 @@ const app = new Elysia()
 .use(cors({
   origin:'http://localhost:3000',
   methods: "GET,HEAD,PUT,POST,DELETE,OPTIONS",
-  credentials:true //ส่ง cookie
+  credentials:true, //ส่ง cookie
+  exposeHeaders: ['X-Conversation-Id', 'conversation_id']
 }))
 .use(swagger())
 .use(cookie())

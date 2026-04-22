@@ -55,6 +55,7 @@ model messages {
   role            String        @db.VarChar(20)
   content         String
   created_at      DateTime?     @default(now()) @db.Timestamp(6)
+  deleted_at      DateTime?
   model           String?       @db.VarChar(50)
   token_usage     Int?
   response_time   Int?
@@ -63,4 +64,5 @@ model messages {
 
   @@index([conversation_id], map: "idx_messages_conversation_id")
   @@index([created_at(sort: Desc)], map: "idx_messages_created_at")
+  @@index([deleted_at])
 }

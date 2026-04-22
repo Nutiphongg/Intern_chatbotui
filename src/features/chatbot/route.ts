@@ -1,7 +1,7 @@
 // src/features/chat/route.ts
 import { Elysia, t } from 'elysia';
-import { chatHistoryQuerySchema, chatRequestSchema, conversationParamsSchema } from './types';
-import { processChatMessageStream, getChatHistory, getUserConversations,deleteConversation,editMessage } from './service';
+import { chatHistoryQuerySchema, chatRequestSchema, conversationParamsSchema ,editMessageParamsSchema,editMessageBodySchema} from './types';
+import { processChatMessageStream, getChatHistory, getUserConversations,deleteConversation,editMessage, } from './service';
 import { authPlugin } from '../../plugins/plugin';
 import { redis } from '../setup/redis';
 
@@ -9,12 +9,19 @@ export const chatRoutes = new Elysia({ prefix: '/chat' })
     .use(authPlugin)
     // POST /chatbot
     .post('/', async ({ body, user })  => {
-        const result = processChatMessageStream(user.id, body);
+        //  1. ด่านตรวจ Auto-Routing แยกสาย Guest vs User
+        if (user.role === 'guest') {
+            // ถ้าเป็น Guest: บังคับให้ ID ห้องแชท เป็น ID ของ Guest 
+            body.conversationId = user.id; 
+        } 
+        // 2. ส่งข้อมูลที่ปรับแต่ง เข้าฟังก์ชันสตรีม
+        const result = processChatMessageStream(user.id, user.role, body);
+    
         return new Response(result.stream, {
             headers: {
                 'Content-Type': 'text/event-stream; charset=utf-8',
                 'Cache-Control': 'no-cache',
-                'X-Conversation-Id': result.conversationId
+                'X-Conversation-Id': result.conversationId 
             }
         });
     }, {
@@ -29,7 +36,7 @@ export const chatRoutes = new Elysia({ prefix: '/chat' })
         const limit = Math.max(1, rawLimit); // บังคับว่าต้องดึงอย่างน้อย 1 รายการ
         
         // เรียกใช้งาน service
-        return await getUserConversations(user.id, page, limit);
+        return await getUserConversations(user.id, user.role, page, limit);
     }, {
         query: t.Object({
             page: t.Optional(t.Numeric()), 
@@ -41,10 +48,10 @@ export const chatRoutes = new Elysia({ prefix: '/chat' })
         
         const rawPage = query.page || 1;
         const page = Math.max(1, rawPage); // บังคับว่าหน้าต้อง >= 1 เสมอ
-        const rawLimit = query.limit || 1;
+        const rawLimit = query.limit || 5;
         const limit = Math.max(1, rawLimit); // บังคับว่าต้องดึงอย่างน้อย 1 รายการ
         
-        return await getChatHistory(user.id, params.conversationId, page, limit);
+        return await getChatHistory(user.id,user.role, params.conversationId, page, limit);
         
     }, {
         params: conversationParamsSchema,
@@ -56,16 +63,18 @@ export const chatRoutes = new Elysia({ prefix: '/chat' })
     }, {
         params: conversationParamsSchema
     })
-    
-   /*
-   // ไว้ทดสอบ redis
-    .get('/debug/redis/:conversationId', async ({ params }) => {
-        // ดึงข้อมูลทั้งหมดจาก Redis 
-        const history = await redis.lrange(`chat:history:${params.conversationId}`, 0, -1);
-        // แปลง Text กลับเป็น JSON 
-        return history.map((item: string) => JSON.parse(item));
+    // PUT /chat/message/:messageId (แก้ไขข้อความ)
+ 
+    .put('/editmessage/:messageId', async ({ params, body, user }) => {
+        const { messageId } = params;
+        const { newContent } = body;
+
+        const updatedMessage = await editMessage(user.id, messageId, newContent);
+        return {
+            data: updatedMessage
+        };
     }, {
-        params: t.Object({
-            conversationId: t.String()
-        })
-    });*/
+        
+        params: editMessageParamsSchema,
+        body: editMessageBodySchema,
+    })

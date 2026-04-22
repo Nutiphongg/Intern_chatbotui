@@ -5,7 +5,8 @@ import { prisma } from '../setup/prisma'
 import { HttpError } from '../../lib/problem';
 import { Errors} from '../../lib/errors';
 import { ulid } from 'ulid'
-
+import { redis } from "../setup/redis"
+import { GuestUser } from './interface';
 //ระบบลงทะเบียนผู้ใช้ใหม่
 export const Register = async (data: RegisterBody) => {
     //ตรวจสอบ Email หรือ Username ในระบบ
@@ -203,4 +204,29 @@ export const Logout = async (refreshToken: string | undefined) => {
     return {
         message: 'logout success'
     };
+};
+
+const GUEST_SESSION_TTL = 3600; // 1 ชั่วโมง (วินาที)
+
+export const createGuestUser = async (): Promise<GuestUser> => {
+  const guestId = `guest_${ulid()}`;
+  
+  const guestUser: GuestUser = {
+    id: guestId,
+    isGuest: true,
+    createdAt: new Date()
+  };
+
+  await redis.setex(
+    `guest:${guestId}`, 
+    GUEST_SESSION_TTL, 
+    JSON.stringify(guestUser)
+  );
+
+  return guestUser;
+};
+
+export const verifyGuestUser = async (guestId: string): Promise<GuestUser | null> => {
+  const data = await redis.get(`guest:${guestId}`);
+  return data ? JSON.parse(data) : null;
 };
