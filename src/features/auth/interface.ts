@@ -40,7 +40,7 @@ export interface GuestUser {
 export interface CreateGuestResponse {
   data: {
     accessToken: string; 
-    guestId: string;     
+    guest_id: string;     
   };
   message: string;
 }

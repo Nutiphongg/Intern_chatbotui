@@ -2,7 +2,7 @@
 import { prisma } from '../setup/prisma';
 import { redis } from '../setup/redis';
 import { Errors } from '../../lib/errors';
-import { ChatRequestBody } from './types';
+import { ChatRequestBody,EditMessageBody } from './types';
 import { ulid } from 'ulid';
 import { env } from '../../lib/env';
 
@@ -20,6 +20,8 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
     const message = body.message.trim();
     const isNewConv = !body.conversationId;
     const convId = body.conversationId || ulid();
+    const userMessageId = ulid();
+    const assistantMessageId = ulid();
     const redisKey = isGuest? `guest_chat:${convId}`:`chat:${convId}`;
     const encoder = new TextEncoder();
     
@@ -43,7 +45,7 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                 controller.close();
             };
             //แจ้ง metadata กลับทันที เพื่อให้ frontend เข้าสู่โหมด stream เร็วที่สุด
-            writeSse(controller, 'meta', { conversationId: convId });
+            writeSse(controller, 'meta', { conversationId: convId,usermessage_id:userMessageId });
             const run = async () => {
                 try {
                      
@@ -78,23 +80,24 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                         // บันทึกข้อความ user ลงฐานข้อมูล
                         await prisma.messages.create({
                             data: {
-                                id: ulid(),
+                                id: userMessageId,
                                 conversation_id: convId,
                                 role: 'user',
-                                content: message
+                                content: message,
                             }
                         });
                     }
                     // เตรียม history ให้ LLM: ใช้ Redis ก่อน ถ้าไม่มีค่อย fallback ไป DB
                     let messagesForLLM: Array<{ role: string, content: string }> = [];
                     if (isNewConv) {
-                        messagesForLLM = [{ role: 'user', content: message }];
-                        await redis.rpush(redisKey, JSON.stringify(messagesForLLM[0]));
+                        const newUserMessage = { id:userMessageId ,role: 'user', content: message, created_at: new Date().toISOString() };
+                        messagesForLLM = [newUserMessage];
+                        await redis.rpush(redisKey, JSON.stringify(newUserMessage));
                     } else {
                         const cached = await redis.lrange(redisKey, 0, -1);
                         if (cached.length > 0) {
                             messagesForLLM = cached.map(msg => JSON.parse(msg));
-                            const newMessage = { role: 'user', content: message };
+                            const newMessage = { id:userMessageId ,role: 'user', content: message, created_at: new Date().toISOString() };
                             messagesForLLM.push(newMessage);
                             await redis.rpush(redisKey, JSON.stringify(newMessage));
                         } else {
@@ -115,7 +118,7 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                                 await pipeline.exec();
                             
                             } else {
-                                const newMessage = { role: 'user', content: message, created_at: new Date() };
+                                const newMessage = { id: userMessageId,role: 'user', content: message, created_at: new Date().toISOString() };
                             messagesForLLM.push(newMessage);
                             await redis.rpush(redisKey, JSON.stringify(newMessage));
                             }
@@ -189,7 +192,7 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                     // สรุปผลลัพธ์แล้วบันทึกฝั่ง assistant ลง DB/Redis
                     const responseTimeMs = Date.now() - startTime;
                     if (assistantReply) {
-                        const botMessage = {role: 'assistant', content: assistantReply, created_at: new Date() };
+                        const botMessage = {id:assistantMessageId,role: 'assistant', content: assistantReply, created_at: new Date().toISOString() };
                         if(! isGuest) {
                             await prisma.messages.create({
                                 data: {
@@ -210,7 +213,7 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                     }
 
                     // แจ้งจบ stream ให้ frontend ปิด loading/state
-                    writeSse(controller, 'done', { tokenUsage });
+                    writeSse(controller,'done',{done:tokenUsage ,assistantmessage_Id:assistantMessageId});
                     closeSafely();
                 } catch (error) {
                     console.error('LLM Stream Error:', error);
@@ -246,6 +249,7 @@ export const getChatHistory = async (userId: string, role: string, conversationI
         return { data: [], pagination: { currentPage: page, pageSize: limit, totalItems: 0, totalPages: 0 } };
     }
 
+    const allMessages = cached
    
     const totalCount = cached.length;
     const start = totalCount - (page * limit);
@@ -257,13 +261,13 @@ export const getChatHistory = async (userId: string, role: string, conversationI
     const pageItems = cached.slice(safeStart, safeEnd);
     
     
-    const messages = pageItems.map((msg,index) => {
+    const messages = pageItems.map((msg) => {
         const parsed = JSON.parse(msg);
         return {
-            id:`guest_msg_${safeStart + index}`,
+            id:parsed.id,
             role: parsed.role,
             content: parsed.content,
-            created_at: parsed.created_at || null
+            created_at: parsed.created_at ?? new Date().toISOString(),
         };
     });
        
@@ -290,8 +294,8 @@ export const getChatHistory = async (userId: string, role: string, conversationI
 
     const [dbMessages, totalCount] = await Promise.all([
         prisma.messages.findMany({
-            where: { conversation_id: conversationId },
-            orderBy: { created_at: 'desc' }, // 
+            where: { conversation_id: conversationId ,is_generate:false},
+            orderBy: [{ created_at: 'desc' },{id:'desc'}], // 
             skip: skip,
             take: limit,
             select: { id: true, role: true, content: true, created_at: true }
@@ -319,8 +323,16 @@ export const getUserConversations = async (userId: string, role:string, page: nu
     const isGuest = role === 'guest';
 
     if (isGuest) { 
-        // ฝั่ง Guest: จำลองข้อมูลว่ามี 1 ห้องแชทที่เป็นเซสชันปัจจุบัน
-        const mockGuestConversation = {
+        // ฝั่ง Guest: 
+        const redisKey = `guest_chat:${userId}`; // userId ของฝั่งนี้ก็คือ guestId 
+        const messageCount = await redis.llen(redisKey); // นับจำนวนข้อความ
+        if (messageCount === 0) {
+            return {
+                data: [],
+                pagination: { currentPage: 1, pageSize: limit, totalItems: 0, totalPages: 0 }
+            };
+        }
+        const GuestConversation = {
             id: userId, // หรือจะรับค่ามาก็ได้
             title: 'Guest Session',
             created_at: new Date(),
@@ -329,7 +341,7 @@ export const getUserConversations = async (userId: string, role:string, page: nu
         };
 
         return {
-            data: [mockGuestConversation],
+            data: [GuestConversation],
             pagination: {
                 currentPage: 1,
                 pageSize: limit,
@@ -371,6 +383,73 @@ export const getUserConversations = async (userId: string, role:string, page: nu
         }
     };
 };
+// ฟังก์ชันโอนย้ายประวัติแชทจาก Guest ไปหา User
+export const migrateGuestChatToUser = async (userId: string, guestId: string) => {
+    const redisKey = `guest_chat:${guestId}`;
+    const quotaKey = `guest_quota:${guestId}`;
+
+    // 1. ดึงประวัติทั้งหมดจาก Redis
+    const cachedMessages = await redis.lrange(redisKey, 0, -1);
+
+    // ถ้าไม่มีประวัติแชทเลย ให้จบการทำงาน
+    if (!cachedMessages || cachedMessages.length === 0) {
+        return null; 
+    }
+    const parsedMessages = cachedMessages
+        .map((msgStr) => JSON.parse(msgStr))
+
+      
+    const firstMessageData = JSON.parse(cachedMessages[0]);
+    // ตัดเอาแค่ 50 ตัวอักษรแรก ถ้าสั้นกว่านั้นก็เอาทั้งหมด
+    const autoTitle = firstMessageData.content.length > 50 
+        ? firstMessageData.content.substring(0, 50) + "..." 
+        : firstMessageData.content;
+   
+    // 2. สร้างห้องแชทใหม่ให้ User ใน PostgreSQL
+    const newConversation = await prisma.conversations.create({
+        data: {
+            id: ulid(),
+            user_id: userId,
+            is_from_guest: true,
+            // อาจจะตั้งชื่อห้องเริ่มต้นไว้ก่อน
+            title: autoTitle ,
+            last_message_at: new Date()
+        }
+    });
+
+    const baseTime = Date.now();
+    
+    // 3. แปลงข้อมูลจาก Redis ให้ตรงกับ Database Schema
+    const messagesToInsert = parsedMessages.map((msg, index) => {
+        // ใช้ created_at ที่เก็บใน Redis ถ้ามี, fallback เป็น baseTime + index
+        const createdAt = msg.created_at && !isNaN(new Date(msg.created_at).getTime())
+            ? new Date(msg.created_at)
+            : new Date(baseTime + index);
+
+        return {
+            id: msg.id ,
+            conversation_id: newConversation.id,
+            role: msg.role,
+            content: msg.content,
+            model: msg.model ?? null,
+            response_time: msg.response_time ?? null,
+            token_usage: msg.token_usage ?? null,
+            created_at: createdAt,
+        };
+    });
+
+    // 4. บันทึกข้อความทั้งหมดลง PostgreSQL ในรวดเดียว (Bulk Insert)
+    await prisma.messages.createMany({
+        data: messagesToInsert
+    });
+
+    // 5. คลีนอัป: ลบข้อมูล Guest ใน Redis ทิ้งทั้งหมด
+    await redis.del(redisKey);
+    await redis.del(quotaKey);
+
+    // คืนค่า ID ห้องแชทใหม่ เผื่อ Frontend อยากเอาไป Redirect
+    return newConversation.id; 
+};
 
 // ฟังก์ชันลบห้องแชท (Soft Delete) 
 export const deleteConversation = async (userId: string, conversationId: string) => {
@@ -386,56 +465,74 @@ export const deleteConversation = async (userId: string, conversationId: string)
   return { message: "delete conversation" };
 };
 
-// ฟังก์ชันแก้ไขข้อความ
-export const editMessage = async (userId: string, messageId: string, newContent: string) => {
+export const editMessage = async (
+  userId: string,
+  messageId: string,
+  newContent: string,
+  is_generate: boolean // 
+) => {
 
-      const oldMessage = await prisma.messages.findFirst({
-    where: { id: messageId, conversations: { user_id: userId } }
+  // 1. หา message เดิม
+  const oldMessage = await prisma.messages.findFirst({
+    where: {
+      id: messageId,
+      conversations: { user_id: userId },
+      deleted_at: null
+    }
   });
 
   if (!oldMessage) throw new Error("Message not found");
-  if (oldMessage.role !== 'user') throw new Error("Message not Edits");
-  //ต้องเช็คเฉพาะข้อความที่ "ยังไม่ถูกลบ"
-  const laterUserMessage = await prisma.messages.findFirst({
-    where:{
-        conversation_id: oldMessage.conversation_id,
-        role: 'user',
-        deleted_at: null // 
+  if (oldMessage.role !== "user") throw new Error("Edit only user message");
+
+  // 2. หา latest ด้วย ULID (สำคัญ)
+  const latestUserMessage = await prisma.messages.findFirst({
+    where: {
+      conversation_id: oldMessage.conversation_id,
+      role: "user",
+      deleted_at: null,
+      is_generate: false
     },
-    orderBy:{created_at:'desc'}
+    orderBy: { id: "desc" } // 
   });
 
-  if (laterUserMessage?.id !== messageId){
-    throw new Error("Edit laterMessage");
+  if (latestUserMessage?.id !== messageId) {
+    throw new Error("Can edit only latest message");
   }
+
+  // 3. mark ตั้งแต่ message นี้ไปทั้งหมดเป็น obsolete
   await prisma.messages.updateMany({
     where: {
-        conversation_id: oldMessage.conversation_id,
-        created_at: {gt: oldMessage.created_at! },
-        deleted_at: null
+      conversation_id: oldMessage.conversation_id,
+      id: { gte: messageId }, // 
+      deleted_at: null,
+      is_generate: false
     },
-    data:{
-        deleted_at: new Date()
-    }
-  });
-  // 2. อัปเดตใน PostgreSQL
-  const updatedMessage = await prisma.messages.update({
-    where: { id: messageId },
     data: {
-      content: newContent,
-      metadata: {
-        ...(typeof oldMessage.metadata === 'object' && oldMessage.metadata !== null ? oldMessage.metadata : {}),
-        is_edited: true,
-        last_edited_at: new Date(),
-        original_content: oldMessage.content // เก็บประวัติเก่าไว้
-      }
+      is_generate: true
     }
   });
 
-  // 3. ลบ Cache ใน Redis ของห้องนั้นทิ้ง 
-  await redis.del(`chat:history:${oldMessage.conversation_id}`);
+  // 4. สร้าง message ใหม่
+  const newMessage = await prisma.messages.create({
+    data: {
+      id: ulid(),
+      conversation_id: oldMessage.conversation_id,
+      role: "user",
+      content: newContent,
+      //  ใช้ค่าจาก frontend
+      is_generate: is_generate ?? false
+    },
+    select: {
+      id: true,
+      content: true,
+      role: true,
+      created_at: true
+    }
+  });
 
-  return updatedMessage;
-      
+  // 5. clear cache
+  await redis.del(`chat:${oldMessage.conversation_id}`);
+  await redis.del(`guest_chat:${oldMessage.conversation_id}`);
 
+  return newMessage;
 };

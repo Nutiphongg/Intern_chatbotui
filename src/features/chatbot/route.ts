@@ -65,16 +65,26 @@ export const chatRoutes = new Elysia({ prefix: '/chat' })
     })
     // PUT /chat/message/:messageId (แก้ไขข้อความ)
  
-    .put('/editmessage/:messageId', async ({ params, body, user }) => {
-        const { messageId } = params;
-        const { newContent } = body;
+.put('/editmessage/:messageId', async ({ params, body, user }) => {
+    if (!user) throw new Error("Unauthorized");
 
-        const updatedMessage = await editMessage(user.id, messageId, newContent);
-        return {
-            data: updatedMessage
-        };
+    const { messageId } = params;
+    const { newContent, is_generate } = body;
+
+    console.log("is_generate:", is_generate);
+
+    const updatedMessage = await editMessage(
+        user.id,
+        messageId,
+        newContent,
+        is_generate
+    );
+
+    return {
+        message: "Edit message success",
+        data: updatedMessage
+    };
     }, {
-        
-        params: editMessageParamsSchema,
-        body: editMessageBodySchema,
-    })
+    params: editMessageParamsSchema,
+    body: editMessageBodySchema,
+})

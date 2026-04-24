@@ -5,21 +5,29 @@ import { getUserIdFromToken,signAccessToken } from "./jwt";
 import { success } from "../../lib/response";
 import { Errors } from "../../lib/errors";
 import { env } from "../../lib/env";
+import { migrateGuestChatToUser } from "../chatbot/service";
 
 
 export const authRoutes = new Elysia({prefix: '/auth'})
 
   .post('/register',async ({body,set}) => {
-      const user = await Register(body);
+      const {guest_id, ...registerData } = body;
+      const user = await Register(registerData);
+
+      let redirecConversationId = null;
+
+      if(guest_id) {
+        redirecConversationId = await migrateGuestChatToUser(user.id, guest_id);
+      }
       set.status = 201;
-      return success(user,"สมัครสมาชิกสำเร็จ")
+      return success({user,redirecConversationId:redirecConversationId},"สมัครสมาชิกสำเร็จ")
 
   },{
     body: registerSchema
   })
 
   .post('/login', async ({ body, cookie: { refresh_token },headers,request, set }) => {
-    
+      const {guest_id, ...loginData } = body;
       //ดึง  user-agent
       const userAgent = headers['user-agent'] || 'unknown';
       //ngrok proxy แก้ไขถ้าใช้ตัวอื่น
@@ -39,8 +47,14 @@ export const authRoutes = new Elysia({prefix: '/auth'})
         secure: true,//ยิงผ่าน api https
       });
 
+      let redirectConversationId = null;
+
+      if(guest_id) {
+        redirectConversationId = await migrateGuestChatToUser(user.id, guest_id);
+      }
+
       
-      return success({user,accessToken}, "เข้าสู่ระบบสำเร็จ")
+      return success({user,accessToken,redirectConversationId}, "เข้าสู่ระบบสำเร็จ")
   }, {
     body: loginSchema
   })

@@ -67,12 +67,12 @@ export const editMessageParamsSchema = t.Object({
 export type EditMessageParams = Static<typeof editMessageParamsSchema>;
 
 export const editMessageBodySchema = t.Object({
-  newContent: t.String({ minLength: 1, error: "ข้อความห้ามว่างเปล่า" })
+  newContent: t.String({ minLength: 1, error: "ข้อความห้ามว่างเปล่า" }),
+  is_generate: t.Boolean({ error: "ต้องระบุสถานะ is_generate เป็น boolean" }),
 });
 export type EditMessageBody = Static<typeof editMessageBodySchema>;
 
 // (Optional) Type สำหรับ Response ที่ส่งกลับไป
 export type EditMessageResponse = {
-  message: string;
   data: ChatMessage; 
 };

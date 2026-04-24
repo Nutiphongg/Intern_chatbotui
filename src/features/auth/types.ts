@@ -5,12 +5,14 @@ import { AuthUser, DeviceInfo, JwtPayloadShape } from "./interface";
 export const registerSchema = t.Object({
   email: t.String({ format: "email" }),
   username: t.String(),
-  password: t.String()
+  password: t.String(),
+  guest_id: t.Optional(t.String())// ไม่ส่งก็ได้
 });
 
 export const loginSchema = t.Object({
   email: t.String(),
-  password: t.String()
+  password: t.String(),
+  guest_id: t.Optional(t.String())
 });
 
 // 2. แปลง Schema ด้านบนให้กลายเป็น Interface 
