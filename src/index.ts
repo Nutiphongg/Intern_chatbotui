@@ -1,6 +1,6 @@
 import { Elysia } from "elysia";
-import { authRoutes } from "./features/auth/route";
-import { chatRoutes } from "./features/chatbot/route";
+import { authRoute, authRoutes } from "./features/auth/route";
+import { chatRoute, chatRoutes } from "./features/chatbot/route";
 import { swagger } from "@elysiajs/swagger";
 import { cookie } from "@elysiajs/cookie";
 import { cors } from "@elysiajs/cors";
@@ -47,8 +47,10 @@ app.onError(({ error, set, request }) => {
   })
 })
 .get("/", () => "welcome to auth api")
-.use(authRoutes)
-.use(chatRoutes)
+//.use(authRoutes)
+.use(authRoute)
+//.use(chatRoutes)
+.use(chatRoute)
 .listen(3000);
 
 

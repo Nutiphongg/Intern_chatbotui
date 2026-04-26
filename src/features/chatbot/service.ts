@@ -8,6 +8,7 @@ import { env } from '../../lib/env';
 
 
 const OLLAMA_URL = env.OLLAMA_URL;
+const DEFAULT_CHAT_MODEL = 'llama3';
 const MAX_HISTORY = 10; // จำแค่ 10 ประโยคล่าสุด
 const REDIS_TTL = 3600; // ให้ Redis จำไว้ 1 ชั่วโมง
 
@@ -18,6 +19,7 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
 
     const isGuest = role === 'guest';
     const message = body.message.trim();
+    const selectedModel = body.model?.trim() || DEFAULT_CHAT_MODEL;
     const isNewConv = !body.conversationId;
     const convId = body.conversationId || ulid();
     const userMessageId = ulid();
@@ -45,7 +47,11 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                 controller.close();
             };
             //แจ้ง metadata กลับทันที เพื่อให้ frontend เข้าสู่โหมด stream เร็วที่สุด
-            writeSse(controller, 'meta', { conversationId: convId,usermessage_id:userMessageId });
+            writeSse(controller, 'meta', {
+                conversationId: convId,
+                usermessage_id: userMessageId,
+                model: selectedModel
+            });
             const run = async () => {
                 try {
                      
@@ -124,14 +130,13 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                             }
                         }
                     }
-
                     // เรียก Ollama แบบ stream เพื่อรับ token ทีละส่วน
                     const startTime = Date.now();
                     const ollamaResponse = await fetch(OLLAMA_URL, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({
-                            model: 'llama3',
+                            model: selectedModel,
                             messages: messagesForLLM,
                             stream: true
                         })
@@ -192,15 +197,21 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                     // สรุปผลลัพธ์แล้วบันทึกฝั่ง assistant ลง DB/Redis
                     const responseTimeMs = Date.now() - startTime;
                     if (assistantReply) {
-                        const botMessage = {id:assistantMessageId,role: 'assistant', content: assistantReply, created_at: new Date().toISOString() };
+                        const botMessage = {
+                            id: assistantMessageId,
+                            role: 'assistant',
+                            content: assistantReply,
+                            model: selectedModel,
+                            created_at: new Date().toISOString()
+                        };
                         if(! isGuest) {
                             await prisma.messages.create({
                                 data: {
-                                    id: ulid(),
+                                    id: assistantMessageId,
                                     conversation_id: convId,
                                     role: 'assistant',
                                     content: assistantReply,
-                                    model: 'llama3',
+                                    model: selectedModel,
                                     response_time: responseTimeMs,
                                     token_usage: tokenUsage
                                 }
@@ -213,7 +224,11 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                     }
 
                     // แจ้งจบ stream ให้ frontend ปิด loading/state
-                    writeSse(controller,'done',{done:tokenUsage ,assistantmessage_Id:assistantMessageId});
+                    writeSse(controller, 'done', {
+                        done: tokenUsage,
+                        tokenUsage,
+                        assistantmessage_Id: assistantMessageId,
+                    });
                     closeSafely();
                 } catch (error) {
                     console.error('LLM Stream Error:', error);
@@ -536,3 +551,43 @@ export const editMessage = async (
 
   return newMessage;
 };
+
+export const editConvTitle = async (
+    userId: string,
+    conversationId: string,
+    newTitle: string
+) => {
+    // check ว่ามีห้อง chat 
+    const existingConv = await prisma.conversations.findFirst({
+        where: {
+            id: conversationId,
+            user_id: userId,
+            is_deleted : false
+        }
+    });
+
+    if (!existingConv) {
+        throw new Error("not found chat")
+    }
+
+    const updatedConv = await prisma.conversations.update({
+        where: {
+            id: conversationId
+        },
+        data: {
+            title: newTitle,
+            updated_at: new Date()
+        },
+        select: {
+            id: true,
+            title: true,
+            updated_at: true,
+        }
+    });
+    
+    await redis.del(`chat:${conversationId}`);
+    await redis.del(`guest_chat:${conversationId}`);
+
+    return updatedConv;
+
+}
