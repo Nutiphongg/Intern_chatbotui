@@ -17,7 +17,8 @@ export const chatRequestSchema = t.Object({
   // Optional เพราะถ้าเป็นการกด New Chat จะยังไม่มี ID
   conversationId: t.Optional(t.String()), 
   message: t.String({ minLength: 1, error: "ข้อความห้ามว่างเปล่า" }),
-  model: t.Optional(t.String({ minLength: 1, error: "modle is" }))
+  model: t.Optional(t.String({ minLength: 1, error: "modle is" })),
+  feeling: t.Optional(t.String({default:"normal"}))
 }, {
   // ปิดรับ field อื่นที่ไม่กำหนดใน schema  userId
   additionalProperties: false

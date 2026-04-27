@@ -61,4 +61,5 @@ export interface SendChatRequest {
   conversationId?: string; // ว่างไว้ถ้าสร้างห้องใหม่ / ส่ง ID 
   message: string;         // ข้อความที่พิมพ์
   model?: string;
+  feeling?: string;
 }

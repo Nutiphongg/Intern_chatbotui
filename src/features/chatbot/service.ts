@@ -8,7 +8,7 @@ import { env } from '../../lib/env';
 
 
 const OLLAMA_URL = env.OLLAMA_URL;
-const DEFAULT_CHAT_MODEL = 'llama3';
+const DEFAULT_CHAT_MODEL = 'qwen2.5';
 const MAX_HISTORY = 10; // จำแค่ 10 ประโยคล่าสุด
 const REDIS_TTL = 3600; // ให้ Redis จำไว้ 1 ชั่วโมง
 
@@ -23,12 +23,16 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
     const isNewConv = !body.conversationId;
     const convId = body.conversationId || ulid();
     const userMessageId = ulid();
-    const assistantMessageId = ulid();
+    const userMessageCreatedAt = new Date();
     const redisKey = isGuest? `guest_chat:${convId}`:`chat:${convId}`;
     const encoder = new TextEncoder();
     
     const writeSse = (controller: ReadableStreamDefaultController<Uint8Array>, event: string, data: unknown) => {
+        try {
         controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+        } catch (err) {
+            console.log(`[SSE] skipped sending event '${event}' because the client disconnected`);
+        }
     };
 
     let heartbeat: Timer | null = null;
@@ -69,13 +73,13 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                                     id: convId,
                                     user_id: userId,
                                     title: message.substring(0, 30),
-                                    last_message_at: new Date()
+                                    last_message_at: userMessageCreatedAt
                                 } as any
                             });
                         } else {
                             const updated = await prisma.conversations.updateMany({
                                 where: { id: convId, user_id: userId },
-                                data: { last_message_at: new Date() }
+                                data: { last_message_at: userMessageCreatedAt }
                             });
                             if (updated.count === 0) {
                                 writeSse(controller, 'error', { message: 'conversation_not_found' });
@@ -90,33 +94,115 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                                 conversation_id: convId,
                                 role: 'user',
                                 content: message,
+                                created_at: userMessageCreatedAt,
                             }
                         });
                     }
+                    const personas: Record<string, string> = {
+                        normal: `
+                        You are a helpful, neutral, and efficient AI assistant.
+
+                        Your goal is to answer clearly, accurately, and concisely.
+                        Use direct language without unnecessary emotional tone, exaggeration, or filler.
+                        Prioritize practical, useful information.
+                        Format answers so they are easy to scan and understand.
+                        If the user asks in Thai, respond in Thai.
+                        If the user asks in English, respond in English.
+                        `,
+                        polite: `
+                        You are a highly polite, empathetic, and professional assistant.
+                        Communicate with warmth, patience, and respect.
+                        Use formal, diplomatic language.
+                        Acknowledge the user's request before answering.
+                        Be helpful without being overly verbose.
+                        When appropriate, apologize for inconvenience and offer clear next steps.
+                        If responding in Thai:
+                        - Use polite vocabulary.
+                        - Use appropriate ending particles such as "ครับ" or "ค่ะ".
+                        - Avoid casual, harsh, or confrontational wording.
+                        `,
+                        aggressive: `
+                        Style mode: AGGRESSIVE.
+                        You are a blunt, playful, rude-but-helpful close friend.
+
+                        Core behavior:
+                        - Always answer in the same language as the user.
+                        - Be useful first, with a casual, teasing, slightly annoyed tone.
+                        - Sound like a close friend, not a customer-service agent.
+                        - Keep the rudeness light and playful, not scripted.
+                        - Avoid formal Thai particles such as "ครับ", "ค่ะ", "นะครับ", or "นะคะ" unless the user clearly wants politeness.
+                        - Avoid stock polite openers such as "ได้เลย", "ยินดี", "พร้อมช่วย", "แน่นอน", "Certainly", or "Of course".
+                        - Do not force a fixed opening sentence.
+                        - Match the user's energy and the seriousness of the topic.
+
+                        Thai style:
+                        - Use natural casual Thai.
+                        - Use mild sarcasm only when it fits.
+                        - Keep explanations clear and helpful.
+
+                        Safety boundaries:
+                        - Do not use hate speech, slurs, threats, or targeted harassment.
+                        - Do not encourage violence, self-harm, illegal activity, or abuse.
+                        - The rudeness should feel playful and stylistic, not genuinely abusive.
+                        `
+                        };
+                    
+                    //ดึงอารมณ์ใช้ที่ User เลือก default 
+                    const feelingAliases: Record<string, string> = {
+                        normal: 'normal',
+                        default: 'normal',
+                        polite: 'polite',
+                        humble: 'polite',
+                        gentle: 'polite',
+                        สุภาพ: 'polite',
+                        อ่อนน้อม: 'polite',
+                        aggressive: 'aggressive',
+                        angry: 'aggressive',
+                        rude: 'aggressive',
+                        sarcastic: 'aggressive',
+                        savage: 'aggressive',
+                        เกรี้ยวกราด: 'aggressive',
+                        เกี้ยวกาจ: 'aggressive',
+                        กวน: 'aggressive',
+                        กวนตีน: 'aggressive'
+                    };
+                    const rawFeelingKey = body.feeling?.trim().toLowerCase() || 'normal';
+                    const selectedFeelingKey = feelingAliases[rawFeelingKey] || 'normal';
+                    if (!feelingAliases[rawFeelingKey]) {
+                        console.warn(`[chat] unknown feeling '${body.feeling}', fallback to normal`);
+                    }
+                    
+                    const selectedFeeling = personas[selectedFeelingKey] || personas['normal'];
+                    const systemMessage = { role: 'system', content: selectedFeeling };
+                    const styleReminder = {
+                        role: 'system',
+                        content: `Use the "${selectedFeelingKey}" persona naturally for the next reply. Treat it as tone guidance, not a fixed script.`
+                    };
+                    
                     // เตรียม history ให้ LLM: ใช้ Redis ก่อน ถ้าไม่มีค่อย fallback ไป DB
                     let messagesForLLM: Array<{ role: string, content: string }> = [];
                     if (isNewConv) {
-                        const newUserMessage = { id:userMessageId ,role: 'user', content: message, created_at: new Date().toISOString() };
+                        const newUserMessage = { id:userMessageId ,role: 'user', content: message, created_at: userMessageCreatedAt.toISOString() };
                         messagesForLLM = [newUserMessage];
                         await redis.rpush(redisKey, JSON.stringify(newUserMessage));
                     } else {
                         const cached = await redis.lrange(redisKey, 0, -1);
                         if (cached.length > 0) {
                             messagesForLLM = cached.map(msg => JSON.parse(msg));
-                            const newMessage = { id:userMessageId ,role: 'user', content: message, created_at: new Date().toISOString() };
+                            const newMessage = { id:userMessageId ,role: 'user', content: message, created_at: userMessageCreatedAt.toISOString() };
                             messagesForLLM.push(newMessage);
                             await redis.rpush(redisKey, JSON.stringify(newMessage));
                         } else {
                             if (!isGuest) {
                                 const dbHistory = await prisma.messages.findMany({
                                     where: { conversation_id: convId },
-                                    orderBy: { created_at: 'desc' },
+                                    orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
                                     take: MAX_HISTORY,
-                                    select: { role: true, content: true }
+                                    select: { id: true, role: true, content: true, created_at: true }
                                 });
 
                                 messagesForLLM = dbHistory.reverse();
-                                const newMessage = { role: 'user', content: message };
+                                const newMessage = { id: userMessageId, role: 'user', content: message, created_at: userMessageCreatedAt.toISOString() };
                                 messagesForLLM.push(newMessage);
 
                                 const pipeline = redis.pipeline();
@@ -124,22 +210,39 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                                 await pipeline.exec();
                             
                             } else {
-                                const newMessage = { id: userMessageId,role: 'user', content: message, created_at: new Date().toISOString() };
+                                const newMessage = { id: userMessageId,role: 'user', content: message, created_at: userMessageCreatedAt.toISOString() };
                             messagesForLLM.push(newMessage);
                             await redis.rpush(redisKey, JSON.stringify(newMessage));
                             }
                         }
                     }
+                    const sanitizedMessagesForLLM = messagesForLLM
+                        .filter((msg) => msg.role !== 'system')
+                        .map((msg) => ({ role: msg.role, content: msg.content }));
+                    const lastMessageForLLM = sanitizedMessagesForLLM.pop();
+                    const messagesForOllama = [
+                        systemMessage,
+                        ...sanitizedMessagesForLLM,
+                        styleReminder,
+                        ...(lastMessageForLLM ? [lastMessageForLLM] : [])
+                    ];
                     // เรียก Ollama แบบ stream เพื่อรับ token ทีละส่วน
                     const startTime = Date.now();
-                    const ollamaResponse = await fetch(OLLAMA_URL, {
+                    const ollamaPayload: Record<string, unknown> = {
+                        model: selectedModel,
+                        messages: messagesForOllama,
+                        stream: true
+                    };
+                    if (selectedFeelingKey === 'aggressive') {
+                        ollamaPayload.options = { temperature: 0.7, top_p: 0.9 };
+                    } else if (selectedFeelingKey === 'polite') {
+                        ollamaPayload.options = { temperature: 0.45, top_p: 0.85 };
+                    }
+                    
+                    const ollamaResponse = await fetch(`${env.OLLAMA_URL}/api/chat`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({
-                            model: selectedModel,
-                            messages: messagesForLLM,
-                            stream: true
-                        })
+                        body: JSON.stringify(ollamaPayload)
                     });
 
                     if (!ollamaResponse.ok || !ollamaResponse.body) {
@@ -196,13 +299,15 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
 
                     // สรุปผลลัพธ์แล้วบันทึกฝั่ง assistant ลง DB/Redis
                     const responseTimeMs = Date.now() - startTime;
+                    const assistantMessageId = ulid();
+                    const assistantMessageCreatedAt = new Date(Math.max(Date.now(), userMessageCreatedAt.getTime() + 1));
                     if (assistantReply) {
                         const botMessage = {
                             id: assistantMessageId,
                             role: 'assistant',
                             content: assistantReply,
                             model: selectedModel,
-                            created_at: new Date().toISOString()
+                            created_at: assistantMessageCreatedAt.toISOString()
                         };
                         if(! isGuest) {
                             await prisma.messages.create({
@@ -213,9 +318,14 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                                     content: assistantReply,
                                     model: selectedModel,
                                     response_time: responseTimeMs,
-                                    token_usage: tokenUsage
+                                    token_usage: tokenUsage,
+                                    created_at: assistantMessageCreatedAt
                                 }
-                           }) 
+                           });
+                            await prisma.conversations.updateMany({
+                                where: { id: convId, user_id: userId },
+                                data: { last_message_at: assistantMessageCreatedAt }
+                            });
                         };
 
                         await redis.rpush(redisKey, JSON.stringify(botMessage));
@@ -225,7 +335,7 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
 
                     // แจ้งจบ stream ให้ frontend ปิด loading/state
                     writeSse(controller, 'done', {
-                        done: tokenUsage,
+                        done :
                         tokenUsage,
                         assistantmessage_Id: assistantMessageId,
                     });
@@ -591,3 +701,38 @@ export const editConvTitle = async (
     return updatedConv;
 
 }
+
+export const getAvailableModels = async () => {
+    const url = `${env.OLLAMA_URL}/api/tags`; 
+    
+    try {
+        const response = await fetch(url);
+
+        if (!response.ok) {
+            // ถ้าเชื่อมต่อได้ แต่ Ollama ฟ้อง Error กลับมา (เช่น 404, 400)
+            const errorText = await response.text();
+            console.error(` Ollama Response Error [Status: ${response.status}]:`, errorText);
+            throw new Error(`Ollama responded with status ${response.status}`);
+        }
+
+        const data = await response.json();
+        const availableModels = data.models.map((model: any) => {
+            const paramSize = model.details?.parameter_size;
+          return {
+              id: model.name, 
+            name: model.name.split(':')[0].toUpperCase(), 
+            size: paramSize 
+          };
+        });
+
+        return availableModels; 
+        
+    } catch (error) {
+       
+       
+        console.error('รายละเอียด Error:', error);
+        
+        // โยน Error 500 กลับไปให้ Route 
+        throw Errors.internalServerError(); 
+    }
+};

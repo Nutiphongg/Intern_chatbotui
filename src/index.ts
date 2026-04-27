@@ -1,6 +1,6 @@
 import { Elysia } from "elysia";
-import { authRoute, authRoutes } from "./features/auth/route";
-import { chatRoute, chatRoutes } from "./features/chatbot/route";
+import { authRoutes } from "./features/auth/route";
+import { chatRoutes } from "./features/chatbot/route";
 import { swagger } from "@elysiajs/swagger";
 import { cookie } from "@elysiajs/cookie";
 import { cors } from "@elysiajs/cors";
@@ -15,7 +15,26 @@ const app = new Elysia()
   credentials:true, //ส่ง cookie
   exposeHeaders: ['X-Conversation-Id', 'conversation_id']
 }))
-.use(swagger())
+app.use(
+  swagger({
+    documentation: {
+      components: {
+        securitySchemes: {
+          bearerAuth: {
+            type: 'http',
+            scheme: 'bearer',
+            bearerFormat: 'JWT'
+          }
+        }
+      },
+      security: [
+        {
+          bearerAuth: []
+        }
+      ]
+    }
+  })
+)
 .use(cookie())
 app.onError(({ error, set, request }) => {
   set.headers['Content-Type'] = 'application/json'
@@ -48,9 +67,9 @@ app.onError(({ error, set, request }) => {
 })
 .get("/", () => "welcome to auth api")
 //.use(authRoutes)
-.use(authRoute)
+.use(authRoutes)
 //.use(chatRoutes)
-.use(chatRoute)
+.use(chatRoutes)
 .listen(3000);
 
 
