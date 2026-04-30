@@ -5,6 +5,7 @@ import {
   ChatMessage,
   DeleteConversationResult,
   ChatErrorEvent,
+  ChatMapEvent,
   ChatMetaEvent,
   ChatPingEvent,
   ChatResponsePayload,
@@ -41,13 +42,14 @@ export type ChatHistoryQuery = Static<typeof chatHistoryQuerySchema>;
 export type ChatResponse = ChatResponsePayload;
 export type ChatStreamResponse = ChatStreamPayload;
 
-export type ChatStreamEventName = "meta" | "token" | "ping" | "done" | "error";
+export type ChatStreamEventName = "meta" | "token" | "ping" | "done" | "error" | "map" | "map_error";
 export type ChatStreamEventData =
   | ChatMetaEvent
   | ChatTokenEvent
   | ChatPingEvent
   | ChatDoneEvent
-  | ChatErrorEvent;
+  | ChatErrorEvent
+  | ChatMapEvent;
 
 
 export type DeleteConversationResponse = DeleteConversationResult;

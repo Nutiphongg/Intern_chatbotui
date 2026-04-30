@@ -7,16 +7,21 @@ import { redis } from '../setup/redis';
 import { env} from '../../lib/env'
 
 export const chatRoutes = new Elysia({ prefix: '/chat' })
+ //GET /models
+    .get('/models', async () => {
+     return await getAvailableModels();
+    })
     .use(authPlugin)
     // POST /chatbot
-    .post('', async ({ body, user })  => {
+    .post('', async ({ body, user, request })  => {
         //  1. ด่านตรวจ Auto-Routing แยกสาย Guest vs User
         if (user.role === 'guest') {
             // ถ้าเป็น Guest: บังคับให้ ID ห้องแชท เป็น ID ของ Guest 
             body.conversationId = user.id; 
         } 
         // 2. ส่งข้อมูลที่ปรับแต่ง เข้าฟังก์ชันสตรีม
-        const result = processChatMessageStream(user.id, user.role, body);
+        const apiKey = request.headers.get('x-api-key') || undefined;
+        const result = processChatMessageStream(user.id, user.role, body, apiKey);
     
         return new Response(result.stream, {
             headers: {
@@ -28,10 +33,7 @@ export const chatRoutes = new Elysia({ prefix: '/chat' })
     }, {
         body: chatRequestSchema
     })
-    //GET /models
-    .get('/models', async () => {
-     return await getAvailableModels();
-    })
+   
    // GET /conversations
     .get('/conversations', async ({ query, user }) => {
         const rawPage = query.page || 1;

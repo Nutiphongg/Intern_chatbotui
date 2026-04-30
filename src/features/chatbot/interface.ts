@@ -1,6 +1,7 @@
 export interface ChatMessage {
   role: string;
   content: string;
+  metadata?: unknown;
 }
 
 export interface ChatReply {
@@ -37,6 +38,16 @@ export interface ChatDoneEvent {
 
 export interface ChatErrorEvent {
   message: string;
+}
+
+export interface ChatMapEvent {
+  event: "hotspots" | "disaster";
+  query: unknown;
+  geojsonUrl?: string;
+  layerId: string;
+  source: string;
+  data: unknown;
+  mapAction: unknown;
 }
 export interface ChatConversationSummary {
   id: string;

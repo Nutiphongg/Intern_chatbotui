@@ -5,6 +5,8 @@ import { Errors } from '../../lib/errors';
 import { ChatRequestBody,EditMessageBody } from './types';
 import { ulid } from 'ulid';
 import { env } from '../../lib/env';
+import { get_map_layer_catalog } from '../mapv2/tools';
+import type { Prisma } from '@prisma/client';
 
 
 const OLLAMA_URL = env.OLLAMA_URL;
@@ -12,7 +14,20 @@ const DEFAULT_CHAT_MODEL = 'qwen2.5';
 const MAX_HISTORY = 10; // จำแค่ 10 ประโยคล่าสุด
 const REDIS_TTL = 3600; // ให้ Redis จำไว้ 1 ชั่วโมง
 
-export const processChatMessageStream = (userId: string,role:string, body: ChatRequestBody) => {
+const shouldUseMapV2Tool = (message: string): boolean => {
+    const normalized = message.toLowerCase();
+    const mapWords = ['map', 'maps', 'แผนที่', 'layer', 'url', 'wms', 'wmts', 'tms'];
+    const hazardWords = ['viirs', 'hotspot', 'hotspots', 'ไฟป่า', 'ไฟไหม้', 'จุดความร้อน', 'น้ำท่วม', 'flood', 'ภัยแล้ง', 'drought', 'dri'];
+
+    return mapWords.some((word) => normalized.includes(word))
+        || hazardWords.some((word) => normalized.includes(word));
+};
+
+const toPrismaJsonObject = (value: unknown): Prisma.InputJsonObject => {
+    return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonObject;
+};
+
+export const processChatMessageStream = (userId: string,role:string, body: ChatRequestBody, apiKey?: string) => {
     if (!body || !body.message?.trim()) {
         throw Errors.badRequest('no message data found');
     }
@@ -25,6 +40,8 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
     const userMessageId = ulid();
     const userMessageCreatedAt = new Date();
     const redisKey = isGuest? `guest_chat:${convId}`:`chat:${convId}`;
+
+
     const encoder = new TextEncoder();
     
     const writeSse = (controller: ReadableStreamDefaultController<Uint8Array>, event: string, data: unknown) => {
@@ -198,7 +215,7 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                                     where: { conversation_id: convId },
                                     orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
                                     take: MAX_HISTORY,
-                                    select: { id: true, role: true, content: true, created_at: true }
+                                    select: { id: true, role: true, content: true, metadata: true, created_at: true }
                                 });
 
                                 messagesForLLM = dbHistory.reverse();
@@ -220,10 +237,66 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                         .filter((msg) => msg.role !== 'system')
                         .map((msg) => ({ role: msg.role, content: msg.content }));
                     const lastMessageForLLM = sanitizedMessagesForLLM.pop();
+                    let mapToolContext: { role: string, content: string } | undefined;
+                    let mapMetadata: Prisma.InputJsonObject | undefined;
+                    // Temporarily disabled old map stream text while testing mapv2 with streamsse.
+                    // try {
+                    //     const mapToolResult = await runHotspotsToolFromMessage(message);
+                    //     if (mapToolResult) {
+                    //         const hotspots = mapToolResult.result.data.features.length;
+                    //         writeSse(controller, 'map', {
+                    //             event: mapToolResult.event,
+                    //             query: mapToolResult.query,
+                    //             geojsonUrl: mapToolResult.geojsonUrl,
+                    //             ...mapToolResult.result
+                    //         });
+                    //         mapMetadata = toPrismaJsonObject({
+                    //             type: 'map',
+                    //             event: mapToolResult.event,
+                    //             layerId: mapToolResult.result.layerId,
+                    //             source: mapToolResult.result.source,
+                    //             query: mapToolResult.query,
+                    //             geojsonUrl: mapToolResult.geojsonUrl,
+                    //             featureCount: hotspots,
+                    //             mapAction: mapToolResult.result.mapAction,
+                    //         });
+                    //         const layerDescription = mapToolResult.event === 'hotspots'
+                    //             ? `VIIRS hotspot (${mapToolResult.query.days} day)`
+                    //             : `${mapToolResult.query.kind} at lat ${mapToolResult.query.lat}, lon ${mapToolResult.query.lon}`;
+                    //         mapToolContext = {
+                    //             role: 'system',
+                    //             content: `Map tool already returned ${hotspots} ${layerDescription} feature(s) to the frontend as GeoJSON. Briefly tell the user that the map layer is ready, and do not paste raw GeoJSON.`
+                    //         };
+                    //     }
+                    // } catch (error) {
+                    //     console.error('Map Tool Error:', error);
+                    //     writeSse(controller, 'map_error', {
+                    //         message: error instanceof Error ? error.message : 'map_tool_failed'
+                    //     });
+                    // }
+                    if (shouldUseMapV2Tool(message)) {
+                        try {
+                            const toolResult = await get_map_layer_catalog.execute({ message, apiKey });
+
+                            writeSse(controller, 'map', toolResult);
+                            mapMetadata = toPrismaJsonObject(toolResult);
+                            mapToolContext = {
+                                role: 'system',
+                                content: `MapV2 generated a ${toolResult.layer.type.toUpperCase()} URL for ${toolResult.query.hazard} ${toolResult.query.days} days: ${toolResult.layer.url}. Tell the user the map URL is ready and keep the response brief.`
+                            };
+                        } catch (error) {
+                            console.error('MapV2 Tool Error:', error);
+                            writeSse(controller, 'map_error', {
+                                message: error instanceof Error ? error.message : 'mapv2_tool_failed'
+                            });
+                        }
+                    }
+
                     const messagesForOllama = [
                         systemMessage,
                         ...sanitizedMessagesForLLM,
                         styleReminder,
+                        ...(mapToolContext ? [mapToolContext] : []),
                         ...(lastMessageForLLM ? [lastMessageForLLM] : [])
                     ];
                     // เรียก Ollama แบบ stream เพื่อรับ token ทีละส่วน
@@ -307,6 +380,7 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                             role: 'assistant',
                             content: assistantReply,
                             model: selectedModel,
+                            metadata: mapMetadata,
                             created_at: assistantMessageCreatedAt.toISOString()
                         };
                         if(! isGuest) {
@@ -319,6 +393,7 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                                     model: selectedModel,
                                     response_time: responseTimeMs,
                                     token_usage: tokenUsage,
+                                    metadata: mapMetadata,
                                     created_at: assistantMessageCreatedAt
                                 }
                            });
@@ -392,6 +467,7 @@ export const getChatHistory = async (userId: string, role: string, conversationI
             id:parsed.id,
             role: parsed.role,
             content: parsed.content,
+            metadata: parsed.metadata,
             created_at: parsed.created_at ?? new Date().toISOString(),
         };
     });
@@ -423,7 +499,7 @@ export const getChatHistory = async (userId: string, role: string, conversationI
             orderBy: [{ created_at: 'desc' },{id:'desc'}], // 
             skip: skip,
             take: limit,
-            select: { id: true, role: true, content: true, created_at: true }
+            select: { id: true, role: true, content: true, metadata: true, created_at: true }
         }),
         prisma.messages.count({
             where: { conversation_id: conversationId }

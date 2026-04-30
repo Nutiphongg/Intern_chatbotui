@@ -69,3 +69,11 @@ model messages {
   @@index([created_at(sort: Desc)], map: "idx_messages_created_at")
   @@index([deleted_at])
 }
+model SystemSettings {
+  id                Int    @id @default(1)
+  userAccessExpiry  String @default("10m") @map("user_access_expiry")
+  guestAccessExpiry String @default("1h")  @map("guest_access_expiry")
+  refreshExpiry     String @default("7d")  @map("refresh_expiry")
+
+  @@map("system_settings")
+}

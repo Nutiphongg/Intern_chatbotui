@@ -1,0 +1,96 @@
+import { MapLayerService } from "./service";
+import type {
+  HazardType,
+  MapLayerType,
+  DayRange,
+  GetMapLayerCatalogInput,
+} from "./type";
+
+const service = new MapLayerService();
+
+type MapLayerToolInput = {
+  message?: string;
+  hazard?: HazardType;
+  days?: DayRange;
+  type?: MapLayerType;
+  apiKey?: string;
+};
+
+export function parseMapIntent(message: string): GetMapLayerCatalogInput {
+  const lower = message.toLowerCase();
+
+  let days: DayRange = 7;;
+
+  if (lower.includes("1 วัน") || lower.includes("1 day")) days = 1;
+  if (lower.includes("3 วัน") || lower.includes("3 day")) days = 3;
+  if (lower.includes("7 วัน") || lower.includes("7 day")) days = 7;
+  if (lower.includes("30 วัน") || lower.includes("30 day")) days = 30;
+
+  let hazard: HazardType = "viirs";
+
+  if (
+    lower.includes("ไฟป่า") ||
+    lower.includes("ไฟไหม้") ||
+    lower.includes("fire") ||
+    lower.includes("hotspot") ||
+    lower.includes("viirs")
+  ) {
+    hazard = "viirs";
+  } else if (
+    lower.includes("น้ำท่วม") ||
+    lower.includes("flood") ||
+    lower.includes("อุทกภัย")
+  ) {
+    hazard = "flood";
+  } else if (
+    lower.includes("ภัยแล้ง") ||
+    lower.includes("แล้ง") ||
+    lower.includes("drought") ||
+    lower.includes("dri")
+  ) {
+    hazard = "dri";
+  }
+  let type: MapLayerType = "wms";
+  if (lower.includes("tms") || lower.includes("tile") || lower.includes("ไทล์")) type = "tms";
+  if (lower.includes("wmts")) type = "wmts";
+
+  return {
+    hazard,
+    days,
+    type,
+  };
+}
+export const get_map_layer_catalog = {
+  name: "get_map_layer_catalog",
+  description: "Get map layer WMS/WMTS/TMS for hazard visualization",
+
+  parameters: {
+    type: "object",
+    properties: {
+      message: { type: "string" },
+      hazard: { type: "string", enum: ["viirs", "flood", "dri"] },
+      days: { type: "number", enum: [1, 3, 7, 30] },
+      type: { type: "string", enum: ["wms", "wmts", "tms"] },
+    },
+    required: [],
+  },
+
+  execute: async (input: MapLayerToolInput) => {
+    const parsedIntent = input.message ? parseMapIntent(input.message) : undefined;
+    const intent: GetMapLayerCatalogInput = {
+      hazard: (input.hazard ?? parsedIntent?.hazard ?? "viirs") as HazardType,
+      days: (input.days ?? parsedIntent?.days ?? 7) as DayRange,
+      type: (input.type ?? parsedIntent?.type ?? "wms") as MapLayerType,
+    };
+
+    console.log("[MAP LAYER INTENT]", intent);
+
+    const result = await service.getLayerCatalog(intent, input.apiKey);
+
+    return {
+      event: "layer_catalog",
+      query: intent,
+      layer: result,
+    };
+  },
+};
