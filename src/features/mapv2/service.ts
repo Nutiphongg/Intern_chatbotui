@@ -1,13 +1,22 @@
 import { GetMapLayerCatalogInput, MapLayerCatalogResult } from "./type";
+import { env } from "../../lib/env";
 
 
-const BASE = "https://api-gateway.gistda.or.th/api/2.0/resources/maps";
+const normalizeConfiguredUrl = (value: string): string => {
+  return value
+    .trim()
+    .replace(/;+\s*$/, "")
+    .replace(/^["']|["']$/g, "")
+    .replace(/\/+$/, "");
+};
+
+const BASE = normalizeConfiguredUrl(env.GISTDA_API_BASE_URL);
 
 export class MapLayerService {
   async getLayerCatalog(input: GetMapLayerCatalogInput, apiKey?: string): Promise<MapLayerCatalogResult> {
     const { hazard, days, type } = input;
     const dayPath = days === 1 ? "1day" : `${days}days`;
-    const url  = `${BASE}/${hazard}/${dayPath}/${type}`;
+    const url = this.buildLayerUrl(hazard, dayPath, type);
 
     if (type === "tms") {
       return {
@@ -18,10 +27,10 @@ export class MapLayerService {
       };
     }
 
-    const resolvedApiKey = apiKey?.trim();
+    const resolvedApiKey = apiKey?.trim() ;
 
     if (!resolvedApiKey) {
-      throw new Error("X-API-Key header is required");
+      throw new Error("X-API-Key header env is required");
     }
 
     const requestUrl = this.buildRequestUrl(url, type);
@@ -29,6 +38,7 @@ export class MapLayerService {
     const response = await fetch(requestUrl, {
       headers: {
         "API-Key": resolvedApiKey,
+        "X-API-Key": resolvedApiKey,
         Accept: "application/json, application/xml, text/xml",
       },
     });
@@ -55,13 +65,19 @@ export class MapLayerService {
     };
   }
 
+  private buildLayerUrl(hazard: string, dayPath: string, type: GetMapLayerCatalogInput["type"]): string {
+    return [BASE, hazard, dayPath, type]
+      .map((part) => String(part).replace(/^\/+|\/+$/g, ""))
+      .join("/");
+  }
+
   private buildRequestUrl(url: string, type: GetMapLayerCatalogInput["type"]): string {
     if (type === "wms") {
-      return `${url}?service=WMS&request=GetCapabilities`;
+      return `${url}?service=WMS&version=1.3.0&request=GetCapabilities`;
     }
 
     if (type === "wmts") {
-      return `${url}?service=WMTS&request=GetCapabilities`;
+      return `${url}?service=WMTS&version=1.0.0&request=GetCapabilities`;
     }
 
     return url;

@@ -19,7 +19,7 @@ export const env = {
     REFRESH_SECRET: getRequiredEnv('REFRESH_SECRET'),
     JWT_SECRET: getRequiredEnv("JWT_SECRET"),
     OLLAMA_URL: getRequiredEnv('OLLAMA_URL'),
-    GISTDA_API_KEY: getRequiredEnv('GISTDA_API_KEY'),
-    GISTDA_API_BASE_URL: getOptionalEnv('GISTDA_API_BASE_URL','https://api-gateway.gistda.or.th/api/2.0/resources')
+    GISTDA_API_BASE_URL: getRequiredEnv('GISTDA_API_BASE_URL'),
+    
 
 };

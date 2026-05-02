@@ -2,6 +2,7 @@ export interface ChatMessage {
   role: string;
   content: string;
   metadata?: unknown;
+  is_silent_retry?: boolean;
 }
 
 export interface ChatReply {
@@ -73,4 +74,5 @@ export interface SendChatRequest {
   message: string;         // ข้อความที่พิมพ์
   model?: string;
   feeling?: string;
+  is_silent_retry?: boolean;
 }

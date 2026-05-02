@@ -51,7 +51,7 @@ export function parseMapIntent(message: string): GetMapLayerCatalogInput {
     hazard = "dri";
   }
   let type: MapLayerType = "wms";
-  if (lower.includes("tms") || lower.includes("tile") || lower.includes("ไทล์")) type = "tms";
+  if (lower.includes("tms") ) type = "tms";
   if (lower.includes("wmts")) type = "wmts";
 
   return {
@@ -89,7 +89,6 @@ export const get_map_layer_catalog = {
 
     return {
       event: "layer_catalog",
-      query: intent,
       layer: result,
     };
   },

@@ -16,7 +16,7 @@ const REDIS_TTL = 3600; // ให้ Redis จำไว้ 1 ชั่วโม�
 
 const shouldUseMapV2Tool = (message: string): boolean => {
     const normalized = message.toLowerCase();
-    const mapWords = ['map', 'maps', 'แผนที่', 'layer', 'url', 'wms', 'wmts', 'tms'];
+    const mapWords = ['map', 'maps', 'แมพ', 'แมป', 'แผนที่', 'layer', 'url', 'wms', 'wmts', 'tms', 'tile', 'tiles', 'ไทล์', 'vector', 'vector tile', 'vector tiles', 'mvt', 'pbf', 'เวกเตอร์'];
     const hazardWords = ['viirs', 'hotspot', 'hotspots', 'ไฟป่า', 'ไฟไหม้', 'จุดความร้อน', 'น้ำท่วม', 'flood', 'ภัยแล้ง', 'drought', 'dri'];
 
     return mapWords.some((word) => normalized.includes(word))
@@ -35,6 +35,9 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
     const isGuest = role === 'guest';
     const message = body.message.trim();
     const selectedModel = body.model?.trim() || DEFAULT_CHAT_MODEL;
+    const isSilentRetry = body.is_silent_retry === true;
+    const isMapRequest = shouldUseMapV2Tool(message);
+    const hasMapApiKey = Boolean(apiKey?.trim());
     const isNewConv = !body.conversationId;
     const convId = body.conversationId || ulid();
     const userMessageId = ulid();
@@ -98,12 +101,39 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                                 where: { id: convId, user_id: userId },
                                 data: { last_message_at: userMessageCreatedAt }
                             });
+                        
                             if (updated.count === 0) {
                                 writeSse(controller, 'error', { message: 'conversation_not_found' });
                                 closeSafely();
                                 return;
                             }
                         }
+                        if (isSilentRetry && !isNewConv){
+                            const latestVisibleUserMessage = await prisma.messages.findFirst({
+                                where: {
+                                    conversation_id: convId,
+                                    role: 'user',
+                                    deleted_at:null,
+                                    is_generate:false
+                                },
+                                orderBy:[{created_at:'desc'},{id:'desc'}],
+                                select: {id: true}
+
+                            });
+                            if (latestVisibleUserMessage) {
+                                await prisma.messages.update({
+                                    where: { id: latestVisibleUserMessage.id },
+                                    data: {
+                                        is_generate: true,
+                                        is_silent_retry: true
+                                    }
+                                });
+                            }
+
+                            await redis.del(redisKey);
+                        }
+                        
+                        
                         // บันทึกข้อความ user ลงฐานข้อมูล
                         await prisma.messages.create({
                             data: {
@@ -112,6 +142,7 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                                 role: 'user',
                                 content: message,
                                 created_at: userMessageCreatedAt,
+                                is_silent_retry: false
                             }
                         });
                     }
@@ -199,27 +230,46 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                     // เตรียม history ให้ LLM: ใช้ Redis ก่อน ถ้าไม่มีค่อย fallback ไป DB
                     let messagesForLLM: Array<{ role: string, content: string }> = [];
                     if (isNewConv) {
-                        const newUserMessage = { id:userMessageId ,role: 'user', content: message, created_at: userMessageCreatedAt.toISOString() };
+                        const newUserMessage = { id:userMessageId ,role: 'user', content: message, created_at: userMessageCreatedAt.toISOString(), is_silent_retry: false };
                         messagesForLLM = [newUserMessage];
                         await redis.rpush(redisKey, JSON.stringify(newUserMessage));
                     } else {
+                        if (isGuest && isSilentRetry) {
+                            const cachedForRetry = await redis.lrange(redisKey, 0, -1);
+                            for (let index = cachedForRetry.length - 1; index >= 0; index--) {
+                                const cachedMessage = JSON.parse(cachedForRetry[index]);
+                                if (cachedMessage.role === 'user') {
+                                    cachedForRetry.splice(index, 1);
+                                    break;
+                                }
+                            }
+                            await redis.del(redisKey);
+                            if (cachedForRetry.length > 0) {
+                                await redis.rpush(redisKey, ...cachedForRetry);
+                                await redis.expire(redisKey, REDIS_TTL);
+                            }
+                        }
                         const cached = await redis.lrange(redisKey, 0, -1);
                         if (cached.length > 0) {
                             messagesForLLM = cached.map(msg => JSON.parse(msg));
-                            const newMessage = { id:userMessageId ,role: 'user', content: message, created_at: userMessageCreatedAt.toISOString() };
+                            const newMessage = { id:userMessageId ,role: 'user', content: message, created_at: userMessageCreatedAt.toISOString(), is_silent_retry: false };
                             messagesForLLM.push(newMessage);
                             await redis.rpush(redisKey, JSON.stringify(newMessage));
                         } else {
                             if (!isGuest) {
                                 const dbHistory = await prisma.messages.findMany({
-                                    where: { conversation_id: convId },
+                                    where: {
+                                        conversation_id: convId,
+                                        deleted_at: null,
+                                        is_generate: false
+                                    },
                                     orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
                                     take: MAX_HISTORY,
-                                    select: { id: true, role: true, content: true, metadata: true, created_at: true }
+                                    select: { id: true, role: true, content: true, metadata: true, created_at: true, is_silent_retry: true }
                                 });
 
                                 messagesForLLM = dbHistory.reverse();
-                                const newMessage = { id: userMessageId, role: 'user', content: message, created_at: userMessageCreatedAt.toISOString() };
+                                const newMessage = { id: userMessageId, role: 'user', content: message, created_at: userMessageCreatedAt.toISOString(), is_silent_retry: false };
                                 messagesForLLM.push(newMessage);
 
                                 const pipeline = redis.pipeline();
@@ -227,7 +277,7 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                                 await pipeline.exec();
                             
                             } else {
-                                const newMessage = { id: userMessageId,role: 'user', content: message, created_at: userMessageCreatedAt.toISOString() };
+                                const newMessage = { id: userMessageId,role: 'user', content: message, created_at: userMessageCreatedAt.toISOString(), is_silent_retry: false };
                             messagesForLLM.push(newMessage);
                             await redis.rpush(redisKey, JSON.stringify(newMessage));
                             }
@@ -239,6 +289,22 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                     const lastMessageForLLM = sanitizedMessagesForLLM.pop();
                     let mapToolContext: { role: string, content: string } | undefined;
                     let mapMetadata: Prisma.InputJsonObject | undefined;
+                    if (isMapRequest && !hasMapApiKey) {
+                        writeSse(controller, 'map_error', {
+                            message: 'missing_x_api_key',
+                            needsApiKey: true,
+                            silentRetrySupported: true
+                        });
+                        writeSse(controller, 'done', {
+                            done: true,
+                            tokenUsage: 0,
+                            assistantmessage_Id: null,
+                            skippedAssistantReply: true,
+                            reason: 'missing_x_api_key'
+                        });
+                        closeSafely();
+                        return;
+                    }
                     // Temporarily disabled old map stream text while testing mapv2 with streamsse.
                     // try {
                     //     const mapToolResult = await runHotspotsToolFromMessage(message);
@@ -274,7 +340,7 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                     //         message: error instanceof Error ? error.message : 'map_tool_failed'
                     //     });
                     // }
-                    if (shouldUseMapV2Tool(message)) {
+                    if (isMapRequest) {
                         try {
                             const toolResult = await get_map_layer_catalog.execute({ message, apiKey });
 
@@ -282,7 +348,7 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                             mapMetadata = toPrismaJsonObject(toolResult);
                             mapToolContext = {
                                 role: 'system',
-                                content: `MapV2 generated a ${toolResult.layer.type.toUpperCase()} URL for ${toolResult.query.hazard} ${toolResult.query.days} days: ${toolResult.layer.url}. Tell the user the map URL is ready and keep the response brief.`
+                                content: `MapV2 generated a ${toolResult.layer.type.toUpperCase()} URL for days: ${toolResult.layer.url}. Tell the user the map URL is ready and keep the response brief.`
                             };
                         } catch (error) {
                             console.error('MapV2 Tool Error:', error);
@@ -468,6 +534,7 @@ export const getChatHistory = async (userId: string, role: string, conversationI
             role: parsed.role,
             content: parsed.content,
             metadata: parsed.metadata,
+            is_silent_retry: parsed.is_silent_retry ?? false,
             created_at: parsed.created_at ?? new Date().toISOString(),
         };
     });
@@ -499,10 +566,10 @@ export const getChatHistory = async (userId: string, role: string, conversationI
             orderBy: [{ created_at: 'desc' },{id:'desc'}], // 
             skip: skip,
             take: limit,
-            select: { id: true, role: true, content: true, metadata: true, created_at: true }
+            select: { id: true, role: true, content: true, metadata: true, created_at: true, is_silent_retry: true }
         }),
         prisma.messages.count({
-            where: { conversation_id: conversationId }
+            where: { conversation_id: conversationId,is_generate: false }
         })
     ]);
 
