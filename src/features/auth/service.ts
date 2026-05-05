@@ -70,7 +70,8 @@ export const Login = async (body: LoginBody ,userAgent:string ,ip:string ) => {
             user_id: user.id,
             expires_at:{gt: new Date()}// เอาเฉพาะที่ยังไม่หมดอายุ
         },
-        orderBy: { created_at:'asc'}
+        orderBy: { created_at:'asc'},
+        select: { id: true }
     });
     //login เกินให้ลบแบบ(FIFO)
     if (sessions.length >= 3) {

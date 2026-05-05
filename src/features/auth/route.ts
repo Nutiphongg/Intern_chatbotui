@@ -54,7 +54,7 @@ export const authRoutes = new Elysia({prefix: '/auth'})
       }
 
       
-      return success({user,accessToken,redirectConversationId}, "เข้าสู่ระบบสำเร็จ")
+      return success({user,accessToken,redirectConversationId})
   }, {
     body: loginSchema
   })
@@ -83,7 +83,6 @@ export const authRoutes = new Elysia({prefix: '/auth'})
       set.status = 200;
       return success(
       { accessToken: newAccessToken },
-      "refresh สำเร็จ"
     )
   })
 
@@ -97,7 +96,7 @@ export const authRoutes = new Elysia({prefix: '/auth'})
       // 3. ส่ง userId ไปให้ Service นับจำนวนจาก Database
       const devices = await getActiveDevices(userId);
 
-      return success(devices, "ดึงข้อมูลสำเร็จ") 
+      return success(devices) 
   })
   .delete('/sessions', async ({ cookie: { refresh_token }, set }) => {
     
@@ -134,7 +133,6 @@ export const authRoutes = new Elysia({prefix: '/auth'})
           accessToken: token, 
           guestId: guest.id 
         }, 
-        'สร้าง Guest Session สำเร็จ'
       );
   })
     

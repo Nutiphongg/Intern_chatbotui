@@ -20,11 +20,6 @@ export const env = {
     JWT_SECRET: getRequiredEnv("JWT_SECRET"),
     OLLAMA_URL: getRequiredEnv('OLLAMA_URL'),
     GISTDA_API_BASE_URL: getRequiredEnv('GISTDA_API_BASE_URL'),
-    VALLARIS_URL: getOptionalEnv(
-        'VALLARIS_URL',
-        'https://vallaris.dragonfly.gistda.or.th/core/api/tiles/1.0-beta/tiles/66b43475dcc3ef870b9c9f27'
-    ),
-    VALLARIS_API_KEY: getOptionalEnv('VALLARIS_API_KEY', ''),
-    
+    VALLARIS_URL: getRequiredEnv('VALLARIS_URL')
 
 };

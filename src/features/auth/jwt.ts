@@ -1,21 +1,11 @@
 import jwt from 'jsonwebtoken'
 import { env } from '../../lib/env'
-import { PrismaClient } from '@prisma/client'
-import {Pool} from 'pg';
-import { PrismaPg} from '@prisma/adapter-pg'
-
-const pool = new Pool({ connectionString: env.DATABASE_URL as string })
-
-// 3. ห่อด้วย Prisma Adapter
-const adapter = new PrismaPg(pool)
-
-// 4. สร้าง PrismaClient โดยยัด Adapter เข้าไป (ตรงนี้แหละที่มันเรียกร้องหาอยู่)
-const prisma = new PrismaClient({ adapter })
+import { prisma } from '../setup/prisma'
 
 const ACCESS_SECRET = env.ACCESS_SECRET as string
 const REFRESH_SECRET = env.REFRESH_SECRET as string
 
-export let jwtConfig = {} as {
+export const jwtConfig = {} as {
     userAccess: string;
     guestAccess: string;
     refresh: string;

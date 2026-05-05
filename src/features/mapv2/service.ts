@@ -85,8 +85,6 @@ export class MapLayerService {
       || input.apiKey?.trim()
       || apiKey?.trim()
       || apiKeyFromUrl
-      || env.VALLARIS_API_KEY.trim();
-
     if (!resolvedApiKey) {
       throw new Error("X-Vector-API-Key header or api_key query is required");
     }

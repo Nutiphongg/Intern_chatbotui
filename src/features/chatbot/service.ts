@@ -65,6 +65,29 @@ export const processChatMessageStream = (
 
     let heartbeat: Timer | null = null;
     let isClosed = false;
+    let ollamaAbortController: AbortController | null = null;
+    let ollamaReader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+
+    const clearHeartbeat = () => {
+        if (heartbeat) {
+            clearInterval(heartbeat);
+            heartbeat = null;
+        }
+    };
+
+    const abortOllamaStream = () => {
+        ollamaAbortController?.abort();
+        ollamaAbortController = null;
+        if (ollamaReader) {
+            void ollamaReader.cancel().catch(() => undefined);
+            try {
+                ollamaReader.releaseLock();
+            } catch {
+                // Reader can already be released after cancel/stream completion.
+            }
+            ollamaReader = null;
+        }
+    };
 
     // เปิด stream ทันที แล้วค่อยทำงานหนักใน background
     const stream = new ReadableStream<Uint8Array>({
@@ -72,10 +95,7 @@ export const processChatMessageStream = (
             const closeSafely = () => {
                 if (isClosed) return;
                 isClosed = true;
-                if (heartbeat) {
-                    clearInterval(heartbeat);
-                    heartbeat = null;
-                }
+                clearHeartbeat();
                 controller.close();
             };
             //แจ้ง metadata กลับทันที เพื่อให้ frontend เข้าสู่โหมด stream เร็วที่สุด
@@ -86,13 +106,16 @@ export const processChatMessageStream = (
             });
             const run = async () => {
                 try {
+                    if (isClosed) return;
                      
                     // ส่ง heartbeat กัน proxy/ngrok ตัด connection ตอนโมเดลยังไม่ตอบ token แรก
-                    heartbeat = setInterval(() => {
-                        if (!isClosed) {
-                            writeSse(controller, 'ping', { ts: Date.now() });
-                        }
-                    }, 10000);
+                    if (!isClosed) {
+                        heartbeat = setInterval(() => {
+                            if (!isClosed) {
+                                writeSse(controller, 'ping', { ts: Date.now() });
+                            }
+                        }, 10000);
+                    }
                     if (!isGuest) {
                     // จัดการ/ตรวจสอบห้องแชทก่อนบันทึกข้อความ
                         if (isNewConv) {
@@ -241,6 +264,7 @@ export const processChatMessageStream = (
                         const newUserMessage = { id:userMessageId ,role: 'user', content: message, created_at: userMessageCreatedAt.toISOString(), is_silent_retry: false };
                         messagesForLLM = [newUserMessage];
                         await redis.rpush(redisKey, JSON.stringify(newUserMessage));
+                        await redis.expire(redisKey, REDIS_TTL);
                     } else {
                         if (isGuest && isSilentRetry) {
                             const cachedForRetry = await redis.lrange(redisKey, 0, -1);
@@ -263,6 +287,7 @@ export const processChatMessageStream = (
                             const newMessage = { id:userMessageId ,role: 'user', content: message, created_at: userMessageCreatedAt.toISOString(), is_silent_retry: false };
                             messagesForLLM.push(newMessage);
                             await redis.rpush(redisKey, JSON.stringify(newMessage));
+                            await redis.expire(redisKey, REDIS_TTL);
                         } else {
                             if (!isGuest) {
                                 const dbHistory = await prisma.messages.findMany({
@@ -282,12 +307,14 @@ export const processChatMessageStream = (
 
                                 const pipeline = redis.pipeline();
                                 messagesForLLM.forEach(msg => pipeline.rpush(redisKey, JSON.stringify(msg)));
+                                pipeline.expire(redisKey, REDIS_TTL);
                                 await pipeline.exec();
-                            
+                             
                             } else {
                                 const newMessage = { id: userMessageId,role: 'user', content: message, created_at: userMessageCreatedAt.toISOString(), is_silent_retry: false };
                             messagesForLLM.push(newMessage);
                             await redis.rpush(redisKey, JSON.stringify(newMessage));
+                            await redis.expire(redisKey, REDIS_TTL);
                             }
                         }
                     }
@@ -413,10 +440,12 @@ export const processChatMessageStream = (
                         ollamaPayload.options = { temperature: 0.45, top_p: 0.85 };
                     }
                     
+                    ollamaAbortController = new AbortController();
                     const ollamaResponse = await fetch(`${env.OLLAMA_URL}/api/chat`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify(ollamaPayload)
+                        body: JSON.stringify(ollamaPayload),
+                        signal: ollamaAbortController.signal
                     });
 
                     if (!ollamaResponse.ok || !ollamaResponse.body) {
@@ -430,6 +459,7 @@ export const processChatMessageStream = (
                     let tokenUsage = 0;
                     const decoder = new TextDecoder();
                     const reader = ollamaResponse.body.getReader();
+                    ollamaReader = reader;
                     let buffer = '';
 
                     while (!isClosed) {
@@ -469,6 +499,12 @@ export const processChatMessageStream = (
                                 tokenUsage = chunk.eval_count;
                             }
                         }
+                    }
+                    ollamaReader = null;
+                    try {
+                        reader.releaseLock();
+                    } catch {
+                        // Reader may already be released if the stream closed first.
                     }
 
                     // สรุปผลลัพธ์แล้วบันทึกฝั่ง assistant ลง DB/Redis
@@ -517,10 +553,20 @@ export const processChatMessageStream = (
                     });
                     closeSafely();
                 } catch (error) {
+                    if (isClosed || ollamaAbortController?.signal.aborted) {
+                        return;
+                    }
                     console.error('LLM Stream Error:', error);
                     // ส่ง error event แทนการปล่อย connection ตายเงียบ
                     writeSse(controller, 'error', { message: 'stream_failed' });
                     closeSafely();
+                } finally {
+                    clearHeartbeat();
+                    if (isClosed) {
+                        abortOllamaStream();
+                    } else {
+                        ollamaAbortController = null;
+                    }
                 }
             };
 
@@ -528,10 +574,8 @@ export const processChatMessageStream = (
         },
         cancel() {
             isClosed = true;
-            if (heartbeat) {
-                clearInterval(heartbeat);
-                heartbeat = null;
-            }
+            clearHeartbeat();
+            abortOllamaStream();
         }
     });
 
@@ -763,7 +807,8 @@ export const deleteConversation = async (userId: string, conversationId: string)
   });
 
   // 2. ลบ Cache ใน Redis )
-  await redis.del(`chat:history:${conversationId}`);
+  await redis.del(`chat:${conversationId}`);
+  await redis.del(`guest_chat:${conversationId}`);
   
   return { message: "delete conversation" };
 };
