@@ -1,5 +1,10 @@
 import { GetMapLayerCatalogInput, MapLayerCatalogResult } from "./type";
 import { env } from "../../lib/env";
+//usermapconfig
+import {prisma} from "../setup/prisma";
+import { CreateMapConfigPayload,CreateApiKeyPayload} from '../mapv2/interface';
+import { encrypt } from "./encryption";
+import { ulid } from "ulid";
 
 
 const normalizeConfiguredUrl = (value: string): string => {
@@ -309,4 +314,98 @@ export class MapLayerService {
     return names[names.length - 1];
   }
 }
+//usermapconfig
+
+export const createMapConfig = async (data: CreateMapConfigPayload) => {
+  // 1. ตรวจสอบ API Key (ถ้ามีการระบุเข้ามา)
+  if (data.apiKeyId) {
+    const apiKey = await prisma.userapikey.findUnique({
+      where: { id: data.apiKeyId }
+    });
+
+    // เช็คว่ามี Key ไหม และเป็นของ User คนนี้จริงๆ หรือเปล่า
+    if (!apiKey || apiKey.userId !== data.userId) {
+      throw new Error('API Key not correct');
+    }
+
+    // [ไฮไลท์!] เช็คว่า Provider ของ Key ตรงกับ Provider ของ Config หรือไม่
+    if (apiKey.provider !== data.provider) {
+      throw new Error(`ไม่สามารถใช้ API Key ของ ${apiKey.provider} กับ Service ${data.provider} ได้`);
+    }
+  }
+
+  // 2. เช็คว่า User เคยสร้าง Config ของ Intent และ Provider นี้ไปแล้วหรือยัง
+  const existingConfig = await prisma.usermapconfig.findUnique({
+    where: {
+      userId_intentName_provider: {
+        userId: data.userId,
+        intentName: data.intentName,
+        provider: data.provider
+      }
+    }
+  });
+
+  if (existingConfig) {
+    throw new Error(`คุณมีการตั้งค่า ${data.intentName} สำหรับ ${data.provider} อยู่แล้ว`);
+  }
+  const id_config = ulid();
+  // 3. บันทึกลง Database
+  const newConfig = await prisma.usermapconfig.create({
+    data: {
+      id:id_config,
+      userId: data.userId,
+      intentName: data.intentName,
+      provider: data.provider,
+      baseUrl: data.baseUrl,
+      urlTemplate: data.urlTemplate,
+      // ถ้าไม่ได้ส่งมาให้เซฟเป็น Object ว่างๆ
+      layerConfigTemplate: data.layerConfigTemplate || {}, 
+      apiKeyId: data.apiKeyId || null
+    }
+  });
+
+  return newConfig;
+};
+// userapikey
+export const createApiKey = async (data: CreateApiKeyPayload) => {
+  // 1. เช็คว่า User เคยตั้งชื่อ Key นี้ซ้ำใน Provider เดียวกันหรือไม่
+  const existingKey = await prisma.userapikey.findUnique({
+    where: {
+      userId_provider_keyName: {
+        userId: data.userId,
+        provider: data.provider,
+        keyName: data.keyName
+      }
+    }
+  });
+
+  if (existingKey) {
+    throw new Error(`you have API Key name "${data.keyName}"  ${data.provider} `);
+  }
+
+  // 2. [พระเอกออกโรง] นำ keyValue ที่ Frontend ส่งมาไปเข้ารหัส 
+  const { iv, encryptedKey } = encrypt(data.keyValue);
+  const  id_apikey = ulid();
+  // 3. บันทึกลง Database (เก็บแค่ตัวที่เข้ารหัสแล้วกับ IV)
+  const newApiKey = await prisma.userapikey.create({
+    data: {
+      id: id_apikey,
+      userId: data.userId,
+      provider: data.provider,
+      keyName: data.keyName,
+      encryptedKey: encryptedKey,
+      iv: iv
+    }
+  });
+
+  // 4. [สำคัญด้าน Security] ส่งกลับไปให้ Frontend เฉพาะข้อมูลที่ปลอดภัย 
+  // ห้ามส่ง encryptedKey หรือ keyValue กลับไปเด็ดขาด!
+  return {
+    id: id_apikey,
+    provider: newApiKey.provider,
+    keyName: newApiKey.keyName,
+    createdAt: newApiKey.createdAt
+  };
+};
 export const mapLayerService = new MapLayerService();
+

@@ -19,6 +19,7 @@ export const env = {
     REFRESH_SECRET: getRequiredEnv('REFRESH_SECRET'),
     JWT_SECRET: getRequiredEnv("JWT_SECRET"),
     OLLAMA_URL: getRequiredEnv('OLLAMA_URL'),
+    ENCRYPTION_KEY:getRequiredEnv('ENCRYPTION_KEY'),
     GISTDA_API_BASE_URL: getRequiredEnv('GISTDA_API_BASE_URL'),
     VALLARIS_URL: getRequiredEnv('VALLARIS_URL')
 

@@ -1,12 +1,14 @@
 import { Elysia } from "elysia";
 import { authRoutes } from "./features/auth/route";
 import { chatRoutes } from "./features/chatbot/route"
+import { mapConfigRoutes } from "./features/mapv2/route";
 import { swagger } from "@elysiajs/swagger";
 import { cookie } from "@elysiajs/cookie";
 import { cors } from "@elysiajs/cors";
 import { problem,HttpError } from "./lib/problem";
 import { env } from "./lib/env";
 import { loadJwtConfig } from "./features/auth/jwt";
+
 
 await loadJwtConfig();
 const app = new Elysia()
@@ -75,6 +77,7 @@ app.onError(({ error, set, request }) => {
 .use(authRoutes)
 //.use(chatRoutes)
 .use(chatRoutes)
+.use(mapConfigRoutes)
 .listen(3000);
 
 

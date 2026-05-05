@@ -78,3 +78,37 @@ model SystemSettings {
 
   @@map("system_settings")
 }
+
+model userapikey {
+  id             String   @id @default(uuid())
+  userId         String   
+  provider       String   // เช่น 'GISTDA', 'VALLARIS', 'GOOGLE_MAPS'
+  keyName        String   
+  encryptedKey   String   // รหัสที่ถูกเข้ารหัส
+  iv             String   // ค่าสุ่มที่ใช้คู่กับ encryptedKey ตอนถอดรหัส
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+
+  configs        usermapconfig[] 
+
+  @@unique([userId, provider, keyName]) 
+}
+model usermapconfig {
+  id               String  @id @default(uuid())
+  userId           String  
+  
+  intentName       String  
+  provider         String  
+  
+  baseUrl          String  
+  urlTemplate      String  
+  layerConfigTemplate Json?  
+
+  apiKeyId         String?     // เก็บ ID ของ Key ที่ User เลือกใช้
+  apiKey           userapikey? @relation(fields: [apiKeyId], references: [id], onDelete: SetNull)
+
+  isActive         Boolean @default(true)
+  createdAt        DateTime @default(now())
+
+  @@unique([userId, intentName, provider]) 
+}
