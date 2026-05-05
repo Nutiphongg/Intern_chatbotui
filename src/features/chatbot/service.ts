@@ -5,7 +5,7 @@ import { Errors } from '../../lib/errors';
 import { ChatRequestBody,EditMessageBody } from './types';
 import { ulid } from 'ulid';
 import { env } from '../../lib/env';
-import { get_map_layer_catalog } from '../mapv2/tools';
+import { get_map_layer_catalog, parseMapIntent } from '../mapv2/tools';
 import type { Prisma } from '@prisma/client';
 
 
@@ -27,7 +27,13 @@ const toPrismaJsonObject = (value: unknown): Prisma.InputJsonObject => {
     return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonObject;
 };
 
-export const processChatMessageStream = (userId: string,role:string, body: ChatRequestBody, apiKey?: string) => {
+export const processChatMessageStream = (
+    userId: string,
+    role: string,
+    body: ChatRequestBody,
+    apiKey?: string,
+    vectorApiKey?: string
+) => {
     if (!body || !body.message?.trim()) {
         throw Errors.badRequest('no message data found');
     }
@@ -38,6 +44,8 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
     const isSilentRetry = body.is_silent_retry === true;
     const isMapRequest = shouldUseMapV2Tool(message);
     const hasMapApiKey = Boolean(apiKey?.trim());
+    const mapIntent = isMapRequest ? parseMapIntent(message) : undefined;
+    const hasVectorApiKey = Boolean(vectorApiKey?.trim() || mapIntent?.apiKey?.trim() || apiKey?.trim());
     const isNewConv = !body.conversationId;
     const convId = body.conversationId || ulid();
     const userMessageId = ulid();
@@ -289,7 +297,24 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                     const lastMessageForLLM = sanitizedMessagesForLLM.pop();
                     let mapToolContext: { role: string, content: string } | undefined;
                     let mapMetadata: Prisma.InputJsonObject | undefined;
-                    if (isMapRequest && !hasMapApiKey) {
+                    if (isMapRequest && mapIntent?.type === 'vector' && !hasVectorApiKey) {
+                        writeSse(controller, 'map_error', {
+                            message: 'missing_vector_api_key',
+                            needsApiKey: true,
+                            apiKeyHeader: 'X-Vector-API-Key',
+                            silentRetrySupported: true
+                        });
+                        writeSse(controller, 'done', {
+                            done: true,
+                            tokenUsage: 0,
+                            assistantmessage_Id: null,
+                            skippedAssistantReply: true,
+                            reason: 'missing_vector_api_key'
+                        });
+                        closeSafely();
+                        return;
+                    }
+                    if (isMapRequest && mapIntent?.type !== 'vector' && !hasMapApiKey) {
                         writeSse(controller, 'map_error', {
                             message: 'missing_x_api_key',
                             needsApiKey: true,
@@ -342,7 +367,7 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                     // }
                     if (isMapRequest) {
                         try {
-                            const toolResult = await get_map_layer_catalog.execute({ message, apiKey });
+                            const toolResult = await get_map_layer_catalog.execute({ message, apiKey, vectorApiKey });
 
                             writeSse(controller, 'map', toolResult);
                             mapMetadata = toPrismaJsonObject(toolResult);
@@ -352,9 +377,19 @@ export const processChatMessageStream = (userId: string,role:string, body: ChatR
                             };
                         } catch (error) {
                             console.error('MapV2 Tool Error:', error);
+                            const reason = error instanceof Error ? error.message : 'mapv2_tool_failed';
                             writeSse(controller, 'map_error', {
-                                message: error instanceof Error ? error.message : 'mapv2_tool_failed'
+                                message: reason
                             });
+                            writeSse(controller, 'done', {
+                                done: true,
+                                tokenUsage: 0,
+                                assistantmessage_Id: null,
+                                skippedAssistantReply: true,
+                                reason
+                            });
+                            closeSafely();
+                            return;
                         }
                     }
 

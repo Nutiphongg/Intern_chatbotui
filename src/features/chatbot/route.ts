@@ -21,7 +21,10 @@ export const chatRoutes = new Elysia({ prefix: '/chat' })
         } 
         // 2. ส่งข้อมูลที่ปรับแต่ง เข้าฟังก์ชันสตรีม
         const apiKey = request.headers.get('x-api-key') || undefined;
-        const result = processChatMessageStream(user.id, user.role, body, apiKey);
+        const vectorApiKey = request.headers.get('x-vector-api-key')
+            || request.headers.get('x-vallaris-api-key')
+            || undefined;
+        const result = processChatMessageStream(user.id, user.role, body, apiKey, vectorApiKey);
     
         return new Response(result.stream, {
             headers: {

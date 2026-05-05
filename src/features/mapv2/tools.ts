@@ -13,7 +13,28 @@ type MapLayerToolInput = {
   hazard?: HazardType;
   days?: DayRange;
   type?: MapLayerType;
+  url?: string;
   apiKey?: string;
+  vectorApiKey?: string;
+};
+
+const extractVectorTileUrl = (message: string): string | undefined => {
+  const match = message.match(/https?:\/\/[^\s"'<>]+\/core\/api\/tiles\/[^\s"'<>]+/i);
+  return match?.[0]?.replace(/[),.;]+$/, "");
+};
+
+const extractApiKeyFromUrl = (url?: string): string | undefined => {
+  if (!url) return undefined;
+
+  try {
+    const parsedUrl = new URL(url);
+    return parsedUrl.searchParams.get("api_key")?.trim()
+      || parsedUrl.searchParams.get("apikey")?.trim()
+      || parsedUrl.searchParams.get("apiKey")?.trim()
+      || undefined;
+  } catch {
+    return undefined;
+  }
 };
 
 export function parseMapIntent(message: string): GetMapLayerCatalogInput {
@@ -53,16 +74,29 @@ export function parseMapIntent(message: string): GetMapLayerCatalogInput {
   let type: MapLayerType = "wms";
   if (lower.includes("tms") ) type = "tms";
   if (lower.includes("wmts")) type = "wmts";
+  if (
+    lower.includes("vector") ||
+    lower.includes("เวกเตอร์") ||
+    lower.includes("mvt") ||
+    lower.includes("pbf") ||
+    lower.includes("vallaris.dragonfly.gistda.or.th") ||
+    lower.includes("/core/api/tiles/")
+  ) {
+    type = "vector";
+  }
+
+  const url = extractVectorTileUrl(message);
 
   return {
     hazard,
     days,
     type,
+    url,
   };
 }
 export const get_map_layer_catalog = {
   name: "get_map_layer_catalog",
-  description: "Get map layer WMS/WMTS/TMS for hazard visualization",
+  description: "Get map layer WMS/WMTS/TMS/Vector Tiles for hazard visualization",
 
   parameters: {
     type: "object",
@@ -70,7 +104,9 @@ export const get_map_layer_catalog = {
       message: { type: "string" },
       hazard: { type: "string", enum: ["viirs", "flood", "dri"] },
       days: { type: "number", enum: [1, 3, 7, 30] },
-      type: { type: "string", enum: ["wms", "wmts", "tms"] },
+      type: { type: "string", enum: ["wms", "wmts", "tms", "vector"] },
+      url: { type: "string" },
+      vectorApiKey: { type: "string" },
     },
     required: [],
   },
@@ -81,11 +117,14 @@ export const get_map_layer_catalog = {
       hazard: (input.hazard ?? parsedIntent?.hazard ?? "viirs") as HazardType,
       days: (input.days ?? parsedIntent?.days ?? 7) as DayRange,
       type: (input.type ?? parsedIntent?.type ?? "wms") as MapLayerType,
+      url: input.url ?? parsedIntent?.url,
+      apiKey: input.vectorApiKey ?? parsedIntent?.apiKey,
     };
 
-    console.log("[MAP LAYER INTENT]", intent);
+    const { apiKey: _apiKey, ...safeIntent } = intent;
+    console.log("[MAP LAYER INTENT]", safeIntent);
 
-    const result = await service.getLayerCatalog(intent, input.apiKey);
+    const result = await service.getLayerCatalog(intent, input.apiKey, input.vectorApiKey);
 
     return {
       event: "layer_catalog",

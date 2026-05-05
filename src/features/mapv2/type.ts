@@ -6,6 +6,8 @@ export type GetMapLayerCatalogInput = {
   hazard: HazardType; 
   days: DayRange;
   type: MapLayerType;
+  url?: string;
+  apiKey?: string;
 }
 
 export type MapLayerCatalogResult = {
@@ -14,4 +16,10 @@ export type MapLayerCatalogResult = {
   type: MapLayerType;
   url: string;
   layerName?: string;
+  basename?: string;
+  minzoom?: number;
+  maxzoom?: number;
+  center?: number[];
+  bounds?: number[];
+  tiles?: string[];
 }
