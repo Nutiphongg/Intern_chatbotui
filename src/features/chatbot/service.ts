@@ -5,8 +5,11 @@ import { Errors } from '../../lib/errors';
 import { ChatRequestBody,EditMessageBody } from './types';
 import { ulid } from 'ulid';
 import { env } from '../../lib/env';
-import { get_map_layer_catalog, parseMapIntent } from '../mapv2/tools';
+// Old mapv2 tools are disabled while config-map driven tools are being built.
+// import { get_map_layer_catalog, parseMapIntent } from '../mapv2/tools';
+import { mapToolSchema, handleMapTool, checkMapAccessSchema, handleCheckMapAccess } from '../mapv2/toolsv2';
 import type { Prisma } from '@prisma/client';
+
 
 
 const OLLAMA_URL = env.OLLAMA_URL;
@@ -16,15 +19,43 @@ const REDIS_TTL = 3600; // ให้ Redis จำไว้ 1 ชั่วโม�
 
 const shouldUseMapV2Tool = (message: string): boolean => {
     const normalized = message.toLowerCase();
-    const mapWords = ['map', 'maps', 'แมพ', 'แมป', 'แผนที่', 'layer', 'url', 'wms', 'wmts', 'tms', 'tile', 'tiles', 'ไทล์', 'vector', 'vector tile', 'vector tiles', 'mvt', 'pbf', 'เวกเตอร์'];
-    const hazardWords = ['viirs', 'hotspot', 'hotspots', 'ไฟป่า', 'ไฟไหม้', 'จุดความร้อน', 'น้ำท่วม', 'flood', 'ภัยแล้ง', 'drought', 'dri'];
+    const mapWords = [
+        'map', 'maps', 'แมพ', 'แมป', 'แผนที่', 'layer', 'layers',
+        'url', 'wms', 'wmts', 'tms', 'tile', 'tiles', 'ไทล์',
+        'vector', 'vector tile', 'vector tiles', 'mvt', 'pbf', 'เวกเตอร์'
+    ];
+    const mapDomainWords = [
+        'viirs', 'hotspot', 'hotspots', 'ไฟป่า', 'ไฟไหม้', 'จุดความร้อน',
+        'น้ำท่วม', 'flood', 'ภัยแล้ง', 'drought', 'dri',
+        'pm25', 'pm2.5', 'ฝุ่น', 'rainfall', 'rain', 'ฝน'
+    ];
 
     return mapWords.some((word) => normalized.includes(word))
-        || hazardWords.some((word) => normalized.includes(word));
+        || mapDomainWords.some((word) => normalized.includes(word));
 };
+
+// const toPrismaJsonObject = (value: unknown): Prisma.InputJsonObject => {
+//     return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonObject;
+// };
 
 const toPrismaJsonObject = (value: unknown): Prisma.InputJsonObject => {
     return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonObject;
+};
+
+const parseToolArguments = (rawArguments: unknown): Record<string, unknown> => {
+    if (!rawArguments) return {};
+    if (typeof rawArguments === 'object') {
+        return rawArguments as Record<string, unknown>;
+    }
+    if (typeof rawArguments !== 'string') {
+        return {};
+    }
+
+    try {
+        return JSON.parse(rawArguments) as Record<string, unknown>;
+    } catch {
+        return {};
+    }
 };
 
 export const processChatMessageStream = (
@@ -43,9 +74,8 @@ export const processChatMessageStream = (
     const selectedModel = body.model?.trim() || DEFAULT_CHAT_MODEL;
     const isSilentRetry = body.is_silent_retry === true;
     const isMapRequest = shouldUseMapV2Tool(message);
-    const hasMapApiKey = Boolean(apiKey?.trim());
-    const mapIntent = isMapRequest ? parseMapIntent(message) : undefined;
-    const hasVectorApiKey = Boolean(vectorApiKey?.trim() || mapIntent?.apiKey?.trim() || apiKey?.trim());
+    const mapHeaderApiKey = apiKey?.trim() || vectorApiKey?.trim();
+    const hasMapApiKey = Boolean(mapHeaderApiKey);
     const isNewConv = !body.conversationId;
     const convId = body.conversationId || ulid();
     const userMessageId = ulid();
@@ -324,39 +354,40 @@ export const processChatMessageStream = (
                     const lastMessageForLLM = sanitizedMessagesForLLM.pop();
                     let mapToolContext: { role: string, content: string } | undefined;
                     let mapMetadata: Prisma.InputJsonObject | undefined;
-                    if (isMapRequest && mapIntent?.type === 'vector' && !hasVectorApiKey) {
-                        writeSse(controller, 'map_error', {
-                            message: 'missing_vector_api_key',
-                            needsApiKey: true,
-                            apiKeyHeader: 'X-Vector-API-Key',
-                            silentRetrySupported: true
-                        });
-                        writeSse(controller, 'done', {
-                            done: true,
-                            tokenUsage: 0,
-                            assistantmessage_Id: null,
-                            skippedAssistantReply: true,
-                            reason: 'missing_vector_api_key'
-                        });
-                        closeSafely();
-                        return;
-                    }
-                    if (isMapRequest && mapIntent?.type !== 'vector' && !hasMapApiKey) {
-                        writeSse(controller, 'map_error', {
-                            message: 'missing_x_api_key',
-                            needsApiKey: true,
-                            silentRetrySupported: true
-                        });
-                        writeSse(controller, 'done', {
-                            done: true,
-                            tokenUsage: 0,
-                            assistantmessage_Id: null,
-                            skippedAssistantReply: true,
-                            reason: 'missing_x_api_key'
-                        });
-                        closeSafely();
-                        return;
-                    }
+                    // Old mapv2 tools are disabled while config-map driven tools are being built.
+                    // if (isMapRequest && mapIntent?.type === 'vector' && !hasVectorApiKey) {
+                    //     writeSse(controller, 'map_error', {
+                    //         message: 'missing_vector_api_key',
+                    //         needsApiKey: true,
+                    //         apiKeyHeader: 'X-Vector-API-Key',
+                    //         silentRetrySupported: true
+                    //     });
+                    //     writeSse(controller, 'done', {
+                    //         done: true,
+                    //         tokenUsage: 0,
+                    //         assistantmessage_Id: null,
+                    //         skippedAssistantReply: true,
+                    //         reason: 'missing_vector_api_key'
+                    //     });
+                    //     closeSafely();
+                    //     return;
+                    // }
+                    // if (isMapRequest && mapIntent?.type !== 'vector' && !hasMapApiKey) {
+                    //     writeSse(controller, 'map_error', {
+                    //         message: 'missing_x_api_key',
+                    //         needsApiKey: true,
+                    //         silentRetrySupported: true
+                    //     });
+                    //     writeSse(controller, 'done', {
+                    //         done: true,
+                    //         tokenUsage: 0,
+                    //         assistantmessage_Id: null,
+                    //         skippedAssistantReply: true,
+                    //         reason: 'missing_x_api_key'
+                    //     });
+                    //     closeSafely();
+                    //     return;
+                    // }
                     // Temporarily disabled old map stream text while testing mapv2 with streamsse.
                     // try {
                     //     const mapToolResult = await runHotspotsToolFromMessage(message);
@@ -392,38 +423,65 @@ export const processChatMessageStream = (
                     //         message: error instanceof Error ? error.message : 'map_tool_failed'
                     //     });
                     // }
-                    if (isMapRequest) {
-                        try {
-                            const toolResult = await get_map_layer_catalog.execute({ message, apiKey, vectorApiKey });
+                    // Old mapv2 tools are disabled while config-map driven tools are being built.
+                    // if (isMapRequest) {
+                    //     try {
+                    //         const toolResult = await get_map_layer_catalog.execute({ message, apiKey, vectorApiKey });
+                    //
+                    //         writeSse(controller, 'map', toolResult);
+                    //         mapMetadata = toPrismaJsonObject(toolResult);
+                    //         mapToolContext = {
+                    //             role: 'system',
+                    //             content: `MapV2 generated a ${toolResult.layer.type.toUpperCase()} URL for days: ${toolResult.layer.url}. Tell the user the map URL is ready and keep the response brief.`
+                    //         };
+                    //     } catch (error) {
+                    //         console.error('MapV2 Tool Error:', error);
+                    //         const reason = error instanceof Error ? error.message : 'mapv2_tool_failed';
+                    //         writeSse(controller, 'map_error', {
+                    //             message: reason
+                    //         });
+                    //         writeSse(controller, 'done', {
+                    //             done: true,
+                    //             tokenUsage: 0,
+                    //             assistantmessage_Id: null,
+                    //             skippedAssistantReply: true,
+                    //             reason
+                    //         });
+                    //         closeSafely();
+                    //         return;
+                    //     }
+                    // }
 
-                            writeSse(controller, 'map', toolResult);
-                            mapMetadata = toPrismaJsonObject(toolResult);
-                            mapToolContext = {
-                                role: 'system',
-                                content: `MapV2 generated a ${toolResult.layer.type.toUpperCase()} URL for days: ${toolResult.layer.url}. Tell the user the map URL is ready and keep the response brief.`
-                            };
-                        } catch (error) {
-                            console.error('MapV2 Tool Error:', error);
-                            const reason = error instanceof Error ? error.message : 'mapv2_tool_failed';
-                            writeSse(controller, 'map_error', {
-                                message: reason
-                            });
-                            writeSse(controller, 'done', {
-                                done: true,
-                                tokenUsage: 0,
-                                assistantmessage_Id: null,
-                                skippedAssistantReply: true,
-                                reason
-                            });
-                            closeSafely();
-                            return;
-                        }
+                    if (isMapRequest && !hasMapApiKey) {
+                        writeSse(controller, 'map_error', {
+                            message: 'missing_x_api_key',
+                            needsApiKey: true,
+                            apiKeyHeader: 'X-API-Key',
+                            silentRetrySupported: true
+                        });
+                        writeSse(controller, 'done', {
+                            done: true,
+                            tokenUsage: 0,
+                            assistantmessage_Id: null,
+                            skippedAssistantReply: true,
+                            reason: 'missing_x_api_key'
+                        });
+                        closeSafely();
+                        return;
                     }
+
+                    const mapAccessResult = await handleCheckMapAccess(userId, mapHeaderApiKey);
+                    writeSse(controller, 'map_access', mapAccessResult);
+                    const mapAccessContext = {
+                        role: 'system',
+                        content: `Map access context for this user. Use this only when the user asks for map/layer data. Pick get_map_layer arguments from these configs and never invent a provider or intentName outside this list: ${JSON.stringify(mapAccessResult)}`
+                    };
 
                     const messagesForOllama = [
                         systemMessage,
                         ...sanitizedMessagesForLLM,
                         styleReminder,
+                        mapAccessContext,
                         ...(mapToolContext ? [mapToolContext] : []),
                         ...(lastMessageForLLM ? [lastMessageForLLM] : [])
                     ];
@@ -432,6 +490,7 @@ export const processChatMessageStream = (
                     const ollamaPayload: Record<string, unknown> = {
                         model: selectedModel,
                         messages: messagesForOllama,
+                        tools: [checkMapAccessSchema, mapToolSchema],
                         stream: true
                     };
                     if (selectedFeelingKey === 'aggressive') {
@@ -461,6 +520,75 @@ export const processChatMessageStream = (
                     const reader = ollamaResponse.body.getReader();
                     ollamaReader = reader;
                     let buffer = '';
+                    const handledToolCalls = new Set<string>();
+                    let loggedNoToolDecision = false;
+
+                    const handleOllamaChunk = async (chunk: any) => {
+                        const textPart = chunk?.message?.content || '';
+                        if (textPart) {
+                            assistantReply += textPart;
+                            writeSse(controller, 'token', { text: textPart });
+                        }
+
+                        const toolCalls = Array.isArray(chunk?.message?.tool_calls)
+                            ? chunk.message.tool_calls
+                            : [];
+
+                        if (toolCalls.length > 0) {
+                            console.log("=== สิ่งที่ AI คิดและตอบกลับมา ===");
+                            console.log(JSON.stringify(toolCalls, null, 2));
+                        }
+
+                        for (const [index, toolCall] of toolCalls.entries()) {
+                            const toolName = toolCall?.function?.name || toolCall?.name;
+                            const toolCallKey = toolCall?.id || `${toolName}:${index}:${JSON.stringify(toolCall?.function?.arguments ?? toolCall?.arguments ?? {})}`;
+                            if (handledToolCalls.has(toolCallKey)) continue;
+                            handledToolCalls.add(toolCallKey);
+
+                            console.log(`AI ตัดสินใจเรียก Tool ชื่อ: ${toolName}`);
+                            console.log('พร้อมกับแนบข้อมูลมาให้คือ:', toolCall?.function?.arguments ?? toolCall?.arguments);
+
+                            if (toolName === 'check_user_map') {
+                                const accessResult = await handleCheckMapAccess(userId, mapHeaderApiKey);
+                                writeSse(controller, 'map_access', accessResult);
+
+                                if (!accessResult.success) {
+                                    const accessErrorMessage = accessResult.message || 'ไม่พบสิทธิ์การใช้งานแผนที่ครับ';
+                                    assistantReply += accessErrorMessage;
+                                    writeSse(controller, 'token', { text: accessErrorMessage });
+                                }
+                                continue;
+                            }
+
+                            if (toolName !== 'get_map_layer') continue;
+
+                            const aiArguments = parseToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments);
+                            const mapResult = await handleMapTool(userId, aiArguments, mapHeaderApiKey);
+
+                            if (mapResult.success) {
+                                writeSse(controller, 'map', mapResult.payload);
+                                mapMetadata = toPrismaJsonObject(mapResult.payload);
+
+                                const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';
+                                assistantReply += mapSummary;
+                                writeSse(controller, 'token', { text: mapSummary });
+                            } else {
+                                const mapErrorMessage = mapResult.error || 'ไม่สามารถดึงข้อมูลแผนที่ได้ครับ';
+                                writeSse(controller, 'map_error', { message: mapErrorMessage });
+                                assistantReply += mapErrorMessage;
+                                writeSse(controller, 'token', { text: mapErrorMessage });
+                            }
+                        }
+
+                        if (chunk?.done && handledToolCalls.size === 0 && !loggedNoToolDecision) {
+                            loggedNoToolDecision = true;
+                            console.log("AI เลือกที่จะตอบเป็นข้อความธรรมดา (ไม่ได้เรียก Tool)");
+                        }
+
+                        if (chunk?.done && typeof chunk?.eval_count === 'number') {
+                            tokenUsage = chunk.eval_count;
+                        }
+                    };
 
                     while (!isClosed) {
                         const { done, value } = await reader.read();
@@ -469,14 +597,7 @@ export const processChatMessageStream = (
                             const lastLine = buffer.trim();
                             if (lastLine) {
                                 const chunk = JSON.parse(lastLine);
-                                const textPart = chunk?.message?.content || '';
-                                if (textPart) {
-                                    assistantReply += textPart;
-                                    writeSse(controller, 'token', { text: textPart });
-                                }
-                                if (chunk?.done && typeof chunk?.eval_count === 'number') {
-                                    tokenUsage = chunk.eval_count;
-                                }
+                                await handleOllamaChunk(chunk);
                             }
                             break;
                         }
@@ -490,14 +611,7 @@ export const processChatMessageStream = (
                             if (!trimmed) continue;
 
                             const chunk = JSON.parse(trimmed);
-                            const textPart = chunk?.message?.content || '';
-                            if (textPart) {
-                                assistantReply += textPart;
-                                writeSse(controller, 'token', { text: textPart });
-                            }
-                            if (chunk?.done && typeof chunk?.eval_count === 'number') {
-                                tokenUsage = chunk.eval_count;
-                            }
+                            await handleOllamaChunk(chunk);
                         }
                     }
                     ollamaReader = null;

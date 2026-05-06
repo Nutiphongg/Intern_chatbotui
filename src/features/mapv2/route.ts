@@ -7,7 +7,7 @@ import { authPlugin } from '../../plugins/plugin';
 export const mapConfigRoutes = new Elysia({ prefix: '/map' })
   .use(authPlugin)
   .post(
-    '/config', 
+    '/configs', 
     async ({ body, user, set }) => {
       try {
         const userId = user.id;
@@ -24,8 +24,7 @@ export const mapConfigRoutes = new Elysia({ prefix: '/map' })
           provider: body.provider,
           baseUrl: body.baseUrl,
           urlTemplate: body.urlTemplate,
-          layerConfigTemplate: body.layerConfigTemplate,
-          apiKeyId: body.apiKeyId
+          layerConfigTemplate: body.layerConfigTemplate
         });
 
         // HTTP Status 201 Created ส่ง Data กลับไปเพียวๆ 

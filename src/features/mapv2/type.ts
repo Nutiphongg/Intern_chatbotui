@@ -31,9 +31,8 @@ export const CreateMapConfigBody = t.Object({
   intentName: t.String({ description: 'view_map' }),
   provider: t.Union([ t.Literal('GISTDA'), t.Literal('VALLARIS')]),
   baseUrl: t.Union([t.Literal('https://api-gateway.gistda.or.th'),t.Literal('https://vallaris.dragonfly.gistda.or.th')]),
-  urlTemplate: t.Union([t.Literal('/api/2.0/resources/maps/{hazard}/{days}days/{type}'),t.Literal('/core/api/tiles/1.0-beta/tiles/{layerId}/{z}/{x}/{y}')]),
-  layerConfigTemplate: t.Optional(t.Any()), 
-  apiKeyId: t.Optional(t.String())
+  urlTemplate: t.Union([t.Literal('/api/2.0/resources/maps/{hazard}/{dayPath}/{type}'),t.Literal('/core/api/tiles/1.0-beta/tiles/{layerId}/{z}/{x}/{y}')]),
+  layerConfigTemplate: t.Optional(t.Any())
 });
 
 // 2. [พระเอกอยู่ตรงนี้!] สกัด Type ออกมาให้ Frontend หรือส่วนอื่นๆ เรียกใช้งาน (Static Type)
