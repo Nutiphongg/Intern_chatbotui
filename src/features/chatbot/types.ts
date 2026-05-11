@@ -17,10 +17,11 @@ import {
 export const chatRequestSchema = t.Object({
   // Optional เพราะถ้าเป็นการกด New Chat จะยังไม่มี ID
   conversationId: t.Optional(t.String()), 
-  message: t.String({ minLength: 1, error: "ข้อความห้ามว่างเปล่า" }),
+  message: t.String({ error: "ข้อความห้ามว่างเปล่า" }),
   model: t.Optional(t.String({ minLength: 1, error: "modle is" })),
   feeling: t.Optional(t.String({default:"normal"})),
-  is_silent_retry: t.Optional(t.Boolean({default: false}))
+  is_silent_retry: t.Optional(t.Boolean({default: false})),
+  mapSelection: t.Optional(t.Any())
 }, {
   // ปิดรับ field อื่นที่ไม่กำหนดใน schema  userId
   additionalProperties: false
@@ -43,7 +44,7 @@ export type ChatHistoryQuery = Static<typeof chatHistoryQuerySchema>;
 export type ChatResponse = ChatResponsePayload;
 export type ChatStreamResponse = ChatStreamPayload;
 
-export type ChatStreamEventName = "meta" | "token" | "ping" | "done" | "error" | "map" | "map_error";
+export type ChatStreamEventName = "meta" | "token" | "ping" | "done" | "error" | "map" | "map_error" | "map_access" | "map_options" | "option_info";
 export type ChatStreamEventData =
   | ChatMetaEvent
   | ChatTokenEvent

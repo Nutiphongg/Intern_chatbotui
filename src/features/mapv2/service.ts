@@ -2,9 +2,18 @@ import { GetMapLayerCatalogInput, MapLayerCatalogResult } from "./type";
 import { env } from "../../lib/env";
 //usermapconfig
 import {prisma} from "../setup/prisma";
-import { CreateMapConfigPayload,CreateApiKeyPayload} from '../mapv2/interface';
-import { encrypt, hashApiKey } from "../setup/encryption";
+import {
+  ApiKeyDetailResponse,
+  ApiKeySummaryResponse,
+  CreatedApiKeyResponse,
+  DeleteApiKeyResponse,
+  EncryptedApiKeyRecord,
+  CreateApiKeyPayload,
+  UpdateApiKeyPayload
+} from '../mapv2/interface';
+import { decrypt, encrypt, hashApiKey } from "../setup/encryption";
 import { ulid } from "ulid";
+import { Errors } from "../../lib/errors";
 
 
 const normalizeConfiguredUrl = (value: string): string => {
@@ -17,6 +26,36 @@ const normalizeConfiguredUrl = (value: string): string => {
 
 const BASE = normalizeConfiguredUrl(env.GISTDA_API_BASE_URL);
 const VALLARIS_TILE_URL = normalizeConfiguredUrl(env.VALLARIS_URL);
+
+const normalizeProvider = (provider: string): string => {
+  return provider.trim().toUpperCase();
+};
+
+const sameProvider = (left: string, right: string): boolean => {
+  return normalizeProvider(left) === normalizeProvider(right);
+};
+
+const maskApiKey = (apiKey: string): string => {
+  const cleanApiKey = apiKey.trim();
+  if (cleanApiKey.length <= 8) {
+    return "*".repeat(cleanApiKey.length);
+  }
+
+  return `${cleanApiKey.slice(0, 4)}${"*".repeat(Math.max(cleanApiKey.length - 8, 8))}${cleanApiKey.slice(-4)}`;
+};
+
+const toSafeApiKeyResponse = (apiKey: EncryptedApiKeyRecord): ApiKeySummaryResponse => {
+  const keyValue = decrypt(apiKey.encryptedKey, apiKey.iv);
+
+  return {
+    id: apiKey.id,
+    provider: apiKey.provider,
+    keyName: apiKey.keyName,
+    maskedKey: maskApiKey(keyValue),
+    isActive: apiKey.isActive,
+    createdAt: apiKey.createdAt
+  };
+};
 
 export class MapLayerService {
   async getLayerCatalog(
@@ -318,53 +357,25 @@ export class MapLayerService {
     return names[names.length - 1];
   }
 }
-//usermapconfig
-
-export const createMapConfig = async (data: CreateMapConfigPayload) => {
-  // mapconfig เป็น config กลางของระบบ ไม่ผูกกับ API key ของ user
-  const existingConfig = await prisma.mapconfig.findUnique({
-    where: {
-      intentName_provider: {
-        intentName: data.intentName,
-        provider: data.provider
-      }
-    }
-  });
-
-  if (existingConfig) {
-    throw new Error(`คุณมีการตั้งค่า ${data.intentName} สำหรับ ${data.provider} อยู่แล้ว`);
-  }
-  const id_config = ulid();
-  // บันทึก config กลางลง Database
-  const newConfig = await prisma.mapconfig.create({
-    data: {
-      id:id_config,
-      intentName: data.intentName,
-      provider: data.provider,
-      baseUrl: data.baseUrl,
-      urlTemplate: data.urlTemplate,
-      // ถ้าไม่ได้ส่งมาให้เซฟเป็น Object ว่างๆ
-      layerConfigTemplate: data.layerConfigTemplate || {}
-    }
-  });
-
-  return newConfig;
-};
 // userapikey
-export const createApiKey = async (data: CreateApiKeyPayload) => {
+export const createApiKey = async (data: CreateApiKeyPayload): Promise<CreatedApiKeyResponse> => {
+  const provider = normalizeProvider(data.provider);
+  const keyName = data.keyName.trim();
+
   // 1. เช็คว่า User เคยตั้งชื่อ Key นี้ซ้ำใน Provider เดียวกันหรือไม่
-  const existingKey = await prisma.user_apikey.findUnique({
+  const existingKeys = await prisma.user_apikey.findMany({
     where: {
-      userId_provider_keyName: {
-        userId: data.userId,
-        provider: data.provider,
-        keyName: data.keyName
-      }
+      userId: data.userId,
+      keyName,
+      deletedAt: null
+    },
+    select: {
+      provider: true
     }
   });
 
-  if (existingKey) {
-    throw new Error(`you have API Key name "${data.keyName}"  ${data.provider} `);
+  if (existingKeys.some((key) => sameProvider(key.provider, provider))) {
+    throw new Error(`you have API Key name "${keyName}"  ${provider} `);
   }
 
   // 2. [พระเอกออกโรง] นำ keyValue ที่ Frontend ส่งมาไปเข้ารหัส 
@@ -376,21 +387,162 @@ export const createApiKey = async (data: CreateApiKeyPayload) => {
     data: {
       id: id_apikey,
       userId: data.userId,
-      provider: data.provider,
-      keyName: data.keyName,
+      provider,
+      keyName,
       encryptedKey: encryptedKey,
       iv: iv,
       keyHash
     }
   });
-
-  // 4. [สำคัญด้าน Security] ส่งกลับไปให้ Frontend เฉพาะข้อมูลที่ปลอดภัย 
-  // ห้ามส่ง encryptedKey หรือ keyValue กลับไปเด็ดขาด!
   return {
-    id: id_apikey,
+    id: newApiKey.id,
     provider: newApiKey.provider,
     keyName: newApiKey.keyName,
-    createdAt: newApiKey.createdAt
+    isActive: newApiKey.isActive,
+    createdAt: newApiKey.createdAt,
+  }
+};
+
+export const getApiKeys = async (userId: string): Promise<ApiKeySummaryResponse[]> => {
+  const apiKeys = await prisma.user_apikey.findMany({
+    where: {
+      userId,
+      deletedAt: null
+    },
+    select: {
+      id: true,
+      provider: true,
+      keyName: true,
+      encryptedKey: true,
+      iv: true,
+      isActive: true,
+      createdAt: true
+    },
+    orderBy: { createdAt: "desc" }
+  });
+
+  return apiKeys.map(toSafeApiKeyResponse);
+};
+
+export const getApiKeyById = async (
+  userId: string,
+  apiKeyId: string
+): Promise<ApiKeyDetailResponse> => {
+  const apiKey = await prisma.user_apikey.findFirst({
+    where: {
+      id: apiKeyId,
+      userId,
+      deletedAt: null
+    },
+    select: {
+      id: true,
+      provider: true,
+      keyName: true,
+      encryptedKey: true,
+      iv: true,
+      isActive: true,
+      createdAt: true
+    }
+  });
+
+  if (!apiKey) {
+    throw Errors.badRequest("api key not found");
+  }
+
+  const keyValue = decrypt(apiKey.encryptedKey, apiKey.iv);
+
+  return {
+    ...toSafeApiKeyResponse(apiKey),
+    apiKey: keyValue
+  };
+};
+
+export const updateApiKey = async (data: UpdateApiKeyPayload): Promise<ApiKeySummaryResponse> => {
+  if (
+    data.keyName === undefined
+    && data.isActive === undefined
+  ) {
+    throw Errors.badRequest("no api key update data found");
+  }
+
+  const existingKey = await prisma.user_apikey.findFirst({
+    where: {
+      id: data.apiKeyId,
+      userId: data.userId,
+      deletedAt: null
+    }
+  });
+
+  if (!existingKey) {
+    throw Errors.badRequest("api key not found");
+  }
+
+  const nextKeyName = data.keyName?.trim() || existingKey.keyName;
+
+  if (nextKeyName !== existingKey.keyName) {
+    const duplicateKeys = await prisma.user_apikey.findMany({
+      where: {
+        userId: data.userId,
+        keyName: nextKeyName,
+        deletedAt: null
+      },
+      select: {
+        id: true,
+        provider: true
+      }
+    });
+
+    const duplicateKey = duplicateKeys.find((key) => {
+      return key.id !== data.apiKeyId && sameProvider(key.provider, existingKey.provider);
+    });
+
+    if (duplicateKey) {
+      throw Errors.badRequest(`you have API Key name "${nextKeyName}" ${existingKey.provider}`);
+    }
+  }
+
+  const updatedApiKey = await prisma.user_apikey.update({
+    where: { id: data.apiKeyId },
+    data: {
+      keyName: nextKeyName,
+      ...(data.isActive !== undefined ? { isActive: data.isActive } : {})
+    },
+    select: {
+      id: true,
+      provider: true,
+      keyName: true,
+      encryptedKey: true,
+      iv: true,
+      isActive: true,
+      createdAt: true
+    }
+  });
+
+  return toSafeApiKeyResponse(updatedApiKey);
+};
+
+export const deleteApiKey = async (
+  userId: string,
+  apiKeyId: string
+): Promise<DeleteApiKeyResponse> => {
+  const deleted = await prisma.user_apikey.updateMany({
+    where: {
+      id: apiKeyId,
+      userId,
+      deletedAt: null
+    },
+    data: {
+      deletedAt: new Date(),
+      isActive: false
+    }
+  });
+
+  if (deleted.count === 0) {
+    throw Errors.badRequest("api key not found");
+  }
+
+  return {
+    message: "delete api key success"
   };
 };
 export const mapLayerService = new MapLayerService();

@@ -7,7 +7,17 @@ import { ulid } from 'ulid';
 import { env } from '../../lib/env';
 // Old mapv2 tools are disabled while config-map driven tools are being built.
 // import { get_map_layer_catalog, parseMapIntent } from '../mapv2/tools';
-import { mapToolSchema, handleMapTool, checkMapAccessSchema, handleCheckMapAccess } from '../mapv2/toolsv2';
+import {
+    mapToolSchema,
+    handleMapTool,
+    checkMapAccessSchema,
+    handleCheckMapAccess,
+    mapOptionToolSchema,
+    handleMapOptionsTool,
+    buildDynamicMapOptionToolSchema,
+    resolveUserMapToolConfigs,
+    buildMapOptionChoiceContext
+} from '../mapv2/toolsv2';
 import type { Prisma } from '@prisma/client';
 
 
@@ -27,7 +37,8 @@ const shouldUseMapV2Tool = (message: string): boolean => {
     const mapDomainWords = [
         'viirs', 'hotspot', 'hotspots', 'ไฟป่า', 'ไฟไหม้', 'จุดความร้อน',
         'น้ำท่วม', 'flood', 'ภัยแล้ง', 'drought', 'dri',
-        'pm25', 'pm2.5', 'ฝุ่น', 'rainfall', 'rain', 'ฝน'
+        'pm25', 'pm2.5', 'ฝุ่น', 'rainfall', 'rain', 'ฝน',
+        'แผ่นดินไหว', 'earthquake', 'quake', 'seismic'
     ];
 
     return mapWords.some((word) => normalized.includes(word))
@@ -58,6 +69,307 @@ const parseToolArguments = (rawArguments: unknown): Record<string, unknown> => {
     }
 };
 
+const asRecord = (value: unknown): Record<string, unknown> => {
+    return value && typeof value === 'object' && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : {};
+};
+
+const getToolErrorMessage = (value: unknown, fallback: string): string => {
+    const error = asRecord(value).error;
+    return typeof error === 'string' && error.trim()
+        ? error
+        : fallback;
+};
+
+const mergeMapToolArgs = (...argsList: Array<Record<string, unknown> | undefined>) => {
+    const merged: Record<string, unknown> = {};
+    const mergedParams: Record<string, unknown> = {};
+    const mergedOptions: Record<string, unknown> = {};
+    const mergedVariables: Record<string, unknown> = {};
+
+    for (const args of argsList) {
+        if (!args) continue;
+
+        Object.assign(merged, args);
+        Object.assign(mergedParams, asRecord(args.params));
+        Object.assign(mergedOptions, asRecord(args.options));
+        Object.assign(mergedVariables, asRecord(args.variables));
+    }
+
+    if (Object.keys(mergedParams).length > 0) merged.params = mergedParams;
+    if (Object.keys(mergedOptions).length > 0) merged.options = mergedOptions;
+    if (Object.keys(mergedVariables).length > 0) merged.variables = mergedVariables;
+
+    return merged;
+};
+
+const normalizeMapSelectionArgs = (selection: unknown): Record<string, unknown> | undefined => {
+    const record = asRecord(selection);
+    if (Object.keys(record).length === 0) return undefined;
+
+    const explicitParams = asRecord(record.params);
+    const explicitOptions = asRecord(record.options);
+    const explicitVariables = asRecord(record.variables);
+    const key = typeof record.key === 'string'
+        ? record.key
+        : typeof record.currentKey === 'string'
+            ? record.currentKey
+            : undefined;
+    const value = record.value ?? record.selectedValue;
+    const inlineParams = Object.fromEntries(
+        Object.entries(record).filter(([entryKey]) => {
+            return ![
+                'intentName',
+                'provider',
+                'params',
+                'options',
+                'variables',
+                'key',
+                'currentKey',
+                'value',
+                'selectedValue'
+            ].includes(entryKey);
+        })
+    );
+    const selectedParam = key && value !== undefined && value !== null && value !== ''
+        ? { [key]: value }
+        : {};
+    const params = {
+        ...inlineParams,
+        ...selectedParam,
+        ...explicitParams
+    };
+
+    return {
+        ...(typeof record.intentName === 'string' ? { intentName: record.intentName } : {}),
+        ...(typeof record.provider === 'string' ? { provider: record.provider } : {}),
+        ...(Object.keys(params).length > 0 ? { params } : {}),
+        ...(Object.keys(explicitOptions).length > 0 ? { options: explicitOptions } : {}),
+        ...(Object.keys(explicitVariables).length > 0 ? { variables: explicitVariables } : {})
+    };
+};
+
+const toStringArray = (value: unknown): string[] => {
+    return Array.isArray(value)
+        ? value.filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
+        : [];
+};
+
+const getOptionKeys = (options: unknown): string[] => {
+    if (!Array.isArray(options)) return [];
+
+    return options
+        .map((option) => {
+            if (!option || typeof option !== 'object') return undefined;
+            const key = (option as Record<string, unknown>).key;
+            return typeof key === 'string' && key.trim() ? key.trim() : undefined;
+        })
+        .filter((key): key is string => Boolean(key));
+};
+
+const sanitizePublicMapUrl = (value: string): string | undefined => {
+    if (!value.trim()) return undefined;
+
+    try {
+        const parsedUrl = new URL(value);
+        parsedUrl.searchParams.delete('api_key');
+        parsedUrl.searchParams.delete('apikey');
+        parsedUrl.searchParams.delete('apiKey');
+
+        return parsedUrl
+            .toString()
+            .replace(/%7B/gi, '{')
+            .replace(/%7D/gi, '}');
+    } catch {
+        return value
+            .replace(/([?&])(api_key|apikey|apiKey)=[^&]*/gi, '$1')
+            .replace(/[?&]$/g, '')
+            .replace('?&', '?')
+            .replace(/%7B/gi, '{')
+            .replace(/%7D/gi, '}');
+    }
+};
+
+const compactMapOption = (option: unknown) => {
+    if (!option || typeof option !== 'object') return undefined;
+
+    const record = option as Record<string, unknown>;
+    const choices = Array.isArray(record.choices)
+        ? record.choices
+            .map((choice) => {
+                if (!choice || typeof choice !== 'object') return undefined;
+                const choiceRecord = choice as Record<string, unknown>;
+                const value = typeof choiceRecord.value === 'string' ? choiceRecord.value : undefined;
+                const url = typeof choiceRecord.url === 'string'
+                    ? sanitizePublicMapUrl(choiceRecord.url)
+                    : undefined;
+                if (!value) return undefined;
+
+                return {
+                    label: typeof choiceRecord.label === 'string' ? choiceRecord.label : value,
+                    value,
+                    description: typeof choiceRecord.description === 'string' ? choiceRecord.description : undefined,
+                    ...(url ? { url } : {}),
+                    type: typeof choiceRecord.type === 'string' ? choiceRecord.type : undefined,
+                    styleId: typeof choiceRecord.styleId === 'string' ? choiceRecord.styleId : undefined,
+                    styleTitle: typeof choiceRecord.styleTitle === 'string' ? choiceRecord.styleTitle : undefined,
+                    templated: typeof choiceRecord.templated === 'boolean' ? choiceRecord.templated : undefined,
+                    mediaType: typeof choiceRecord.mediaType === 'string' ? choiceRecord.mediaType : undefined,
+                    rel: typeof choiceRecord.rel === 'string' ? choiceRecord.rel : undefined
+                };
+            })
+            .filter(Boolean) as Array<{ label: string; value: string; [key: string]: unknown }>
+        : [];
+
+    return {
+        key: record.key,
+        required: record.required,
+        source: record.source,
+        label: record.label,
+        description: typeof record.description === 'string' ? record.description : undefined,
+        choices
+    };
+};
+
+const isSensitiveMapUrl = (value: string) => {
+    return /^https?:\/\//i.test(value) && /[?&](api_key|apikey|apiKey)=/i.test(value);
+};
+
+const sanitizeMapOptionsSelectedValues = (value: unknown): unknown => {
+    if (Array.isArray(value)) {
+        return value
+            .map(sanitizeMapOptionsSelectedValues)
+            .filter((item) => item !== undefined);
+    }
+
+    if (!value || typeof value !== 'object') {
+        return value;
+    }
+
+    const sanitized: Record<string, unknown> = {};
+    for (const [key, nestedValue] of Object.entries(value as Record<string, unknown>)) {
+        if (key === 'url' || key === 'href' || key === 'mapOptions') continue;
+        if (typeof nestedValue === 'string' && isSensitiveMapUrl(nestedValue)) continue;
+
+        const cleanValue = sanitizeMapOptionsSelectedValues(nestedValue);
+        if (cleanValue !== undefined) {
+            sanitized[key] = cleanValue;
+        }
+    }
+
+    return sanitized;
+};
+
+const buildMapOptionsEvent = (result: any) => {
+    const rawOptions: unknown[] = Array.isArray(result.options) ? result.options : [];
+    const missingKeys = toStringArray(result.missingKeys);
+    const invalidKeys = toStringArray(result.invalidKeys);
+    const complete = result.complete === true;
+    const resolvedMissingKeys = missingKeys.length > 0
+        ? missingKeys
+        : result.needInfo === true && !complete
+            ? getOptionKeys(rawOptions)
+            : [];
+    const currentKey = invalidKeys[0] || resolvedMissingKeys[0];
+    const currentOption = rawOptions.find((option) => {
+        if (!option || typeof option !== 'object') return false;
+        return (option as Record<string, unknown>).key === currentKey;
+    });
+    const compactOption = compactMapOption(currentOption);
+
+    return {
+        needInfo: !complete && (result.needInfo === true || resolvedMissingKeys.length > 0 || invalidKeys.length > 0),
+        key: currentKey,
+        choices: compactOption?.choices || [],
+        selectedValues: result.selectedValues && typeof result.selectedValues === 'object'
+            ? sanitizeMapOptionsSelectedValues(result.selectedValues)
+            : undefined,
+        complete,
+        intentName: typeof result.intentName === 'string' ? result.intentName : undefined,
+        provider: typeof result.provider === 'string' ? result.provider : undefined,
+        question: typeof result.question === 'string' ? result.question : undefined,
+        message: typeof result.message === 'string' ? result.message : undefined
+    };
+};
+
+const buildMapOptionsFingerprint = (payload: ReturnType<typeof buildMapOptionsEvent>) => {
+    return JSON.stringify({
+        needInfo: payload.needInfo,
+        key: payload.key,
+        complete: payload.complete,
+        intentName: payload.intentName,
+        provider: payload.provider,
+        question: payload.question,
+        message: payload.message
+    });
+};
+
+const normalizeMapSearchText = (value: unknown): string => {
+    return typeof value === 'string'
+        ? value.toLowerCase().replace(/[\s()[\]{}"'`.,:;|/_-]+/g, '')
+        : '';
+};
+
+const buildDbBackedMapChoiceTerms = (choiceContext: unknown) => {
+    const terms: Array<{ key: string; value: string; terms: string[] }> = [];
+
+    if (!Array.isArray(choiceContext)) return terms;
+
+    for (const config of choiceContext) {
+        const configRecord = asRecord(config);
+        const options = Array.isArray(configRecord.options) ? configRecord.options : [];
+
+        for (const option of options) {
+            const optionRecord = asRecord(option);
+            const key = typeof optionRecord.key === 'string' ? optionRecord.key : undefined;
+            if (!key) continue;
+
+            const choices = Array.isArray(optionRecord.choices) ? optionRecord.choices : [];
+            for (const choice of choices) {
+                const choiceRecord = asRecord(choice);
+                const value = typeof choiceRecord.value === 'string' ? choiceRecord.value : undefined;
+                if (!value) continue;
+
+                const normalizedTerms = [
+                    choiceRecord.value,
+                    choiceRecord.label,
+                    choiceRecord.description
+                ]
+                    .map(normalizeMapSearchText)
+                    .filter((term, index, allTerms) => term.length >= 2 && allTerms.indexOf(term) === index);
+
+                if (normalizedTerms.length > 0) {
+                    terms.push({ key, value, terms: normalizedTerms });
+                }
+            }
+        }
+    }
+
+    return terms;
+};
+
+const inferMapArgsFromDbChoiceText = (
+    message: string,
+    choiceContext: unknown
+): Record<string, unknown> | undefined => {
+    const normalizedMessage = normalizeMapSearchText(message);
+    if (!normalizedMessage) return undefined;
+
+    const terms = buildDbBackedMapChoiceTerms(choiceContext);
+    const params: Record<string, unknown> = {};
+
+    for (const choice of terms) {
+        if (params[choice.key] !== undefined) continue;
+        const matched = choice.terms.some((term) => normalizedMessage.includes(term));
+        if (matched) {
+            params[choice.key] = choice.value;
+        }
+    }
+
+    return Object.keys(params).length > 0 ? { params } : undefined;
+};
+
 export const processChatMessageStream = (
     userId: string,
     role: string,
@@ -65,15 +377,20 @@ export const processChatMessageStream = (
     apiKey?: string,
     vectorApiKey?: string
 ) => {
-    if (!body || !body.message?.trim()) {
+    const rawMessage = body?.message ?? '';
+    const hasMapSelection = Boolean(body?.mapSelection);
+    const hasUserMessage = Boolean(rawMessage.trim());
+
+    if (!body || (!hasUserMessage && !hasMapSelection)) {
         throw Errors.badRequest('no message data found');
     }
 
     const isGuest = role === 'guest';
-    const message = body.message.trim();
+    const message = rawMessage.trim();
     const selectedModel = body.model?.trim() || DEFAULT_CHAT_MODEL;
     const isSilentRetry = body.is_silent_retry === true;
     const isMapRequest = shouldUseMapV2Tool(message);
+    const shouldHandleMap = isMapRequest || hasMapSelection;
     const mapHeaderApiKey = apiKey?.trim() || vectorApiKey?.trim();
     const hasMapApiKey = Boolean(mapHeaderApiKey);
     const isNewConv = !body.conversationId;
@@ -81,6 +398,10 @@ export const processChatMessageStream = (
     const userMessageId = ulid();
     const userMessageCreatedAt = new Date();
     const redisKey = isGuest? `guest_chat:${convId}`:`chat:${convId}`;
+    const mapSelectionStateKey = `${redisKey}:map_selection`;
+    const currentUserHistoryMessage = hasUserMessage
+        ? { id: userMessageId, role: 'user', content: message, created_at: userMessageCreatedAt.toISOString(), is_silent_retry: false }
+        : undefined;
 
 
     const encoder = new TextEncoder();
@@ -153,7 +474,7 @@ export const processChatMessageStream = (
                                 data: {
                                     id: convId,
                                     user_id: userId,
-                                    title: message.substring(0, 30),
+                                    title: hasUserMessage ? message.substring(0, 30) : 'Map selection',
                                     last_message_at: userMessageCreatedAt
                                 } as any
                             });
@@ -169,7 +490,7 @@ export const processChatMessageStream = (
                                 return;
                             }
                         }
-                        if (isSilentRetry && !isNewConv){
+                        if (isSilentRetry && !isNewConv && hasUserMessage){
                             const latestVisibleUserMessage = await prisma.messages.findFirst({
                                 where: {
                                     conversation_id: convId,
@@ -195,17 +516,19 @@ export const processChatMessageStream = (
                         }
                         
                         
-                        // บันทึกข้อความ user ลงฐานข้อมูล
-                        await prisma.messages.create({
-                            data: {
-                                id: userMessageId,
-                                conversation_id: convId,
-                                role: 'user',
-                                content: message,
-                                created_at: userMessageCreatedAt,
-                                is_silent_retry: false
-                            }
-                        });
+                        // บันทึกเฉพาะข้อความที่ user พิมพ์จริง ส่วน mapSelection เป็น UI state ไม่ใช่ chat bubble
+                        if (currentUserHistoryMessage) {
+                            await prisma.messages.create({
+                                data: {
+                                    id: userMessageId,
+                                    conversation_id: convId,
+                                    role: 'user',
+                                    content: message,
+                                    created_at: userMessageCreatedAt,
+                                    is_silent_retry: false
+                                }
+                            });
+                        }
                     }
                     const personas: Record<string, string> = {
                         normal: `
@@ -291,10 +614,11 @@ export const processChatMessageStream = (
                     // เตรียม history ให้ LLM: ใช้ Redis ก่อน ถ้าไม่มีค่อย fallback ไป DB
                     let messagesForLLM: Array<{ role: string, content: string }> = [];
                     if (isNewConv) {
-                        const newUserMessage = { id:userMessageId ,role: 'user', content: message, created_at: userMessageCreatedAt.toISOString(), is_silent_retry: false };
-                        messagesForLLM = [newUserMessage];
-                        await redis.rpush(redisKey, JSON.stringify(newUserMessage));
-                        await redis.expire(redisKey, REDIS_TTL);
+                        messagesForLLM = currentUserHistoryMessage ? [currentUserHistoryMessage] : [];
+                        if (currentUserHistoryMessage) {
+                            await redis.rpush(redisKey, JSON.stringify(currentUserHistoryMessage));
+                            await redis.expire(redisKey, REDIS_TTL);
+                        }
                     } else {
                         if (isGuest && isSilentRetry) {
                             const cachedForRetry = await redis.lrange(redisKey, 0, -1);
@@ -314,10 +638,11 @@ export const processChatMessageStream = (
                         const cached = await redis.lrange(redisKey, 0, -1);
                         if (cached.length > 0) {
                             messagesForLLM = cached.map(msg => JSON.parse(msg));
-                            const newMessage = { id:userMessageId ,role: 'user', content: message, created_at: userMessageCreatedAt.toISOString(), is_silent_retry: false };
-                            messagesForLLM.push(newMessage);
-                            await redis.rpush(redisKey, JSON.stringify(newMessage));
-                            await redis.expire(redisKey, REDIS_TTL);
+                            if (currentUserHistoryMessage) {
+                                messagesForLLM.push(currentUserHistoryMessage);
+                                await redis.rpush(redisKey, JSON.stringify(currentUserHistoryMessage));
+                                await redis.expire(redisKey, REDIS_TTL);
+                            }
                         } else {
                             if (!isGuest) {
                                 const dbHistory = await prisma.messages.findMany({
@@ -332,8 +657,9 @@ export const processChatMessageStream = (
                                 });
 
                                 messagesForLLM = dbHistory.reverse();
-                                const newMessage = { id: userMessageId, role: 'user', content: message, created_at: userMessageCreatedAt.toISOString(), is_silent_retry: false };
-                                messagesForLLM.push(newMessage);
+                                if (currentUserHistoryMessage) {
+                                    messagesForLLM.push(currentUserHistoryMessage);
+                                }
 
                                 const pipeline = redis.pipeline();
                                 messagesForLLM.forEach(msg => pipeline.rpush(redisKey, JSON.stringify(msg)));
@@ -341,10 +667,11 @@ export const processChatMessageStream = (
                                 await pipeline.exec();
                              
                             } else {
-                                const newMessage = { id: userMessageId,role: 'user', content: message, created_at: userMessageCreatedAt.toISOString(), is_silent_retry: false };
-                            messagesForLLM.push(newMessage);
-                            await redis.rpush(redisKey, JSON.stringify(newMessage));
-                            await redis.expire(redisKey, REDIS_TTL);
+                                if (currentUserHistoryMessage) {
+                                    messagesForLLM.push(currentUserHistoryMessage);
+                                    await redis.rpush(redisKey, JSON.stringify(currentUserHistoryMessage));
+                                    await redis.expire(redisKey, REDIS_TTL);
+                                }
                             }
                         }
                     }
@@ -452,7 +779,7 @@ export const processChatMessageStream = (
                     //     }
                     // }
 
-                    if (isMapRequest && !hasMapApiKey) {
+                    if (shouldHandleMap && !hasMapApiKey) {
                         writeSse(controller, 'map_error', {
                             message: 'missing_x_api_key',
                             needsApiKey: true,
@@ -470,18 +797,183 @@ export const processChatMessageStream = (
                         return;
                     }
 
-                    const mapAccessResult = await handleCheckMapAccess(userId, mapHeaderApiKey);
-                    writeSse(controller, 'map_access', mapAccessResult);
-                    const mapAccessContext = {
-                        role: 'system',
-                        content: `Map access context for this user. Use this only when the user asks for map/layer data. Pick get_map_layer arguments from these configs and never invent a provider or intentName outside this list: ${JSON.stringify(mapAccessResult)}`
+                    const sentMapOptionPayloads = new Set<string>();
+                    const writeMapOptionsEvent = (payload: ReturnType<typeof buildMapOptionsEvent>) => {
+                        const fingerprint = buildMapOptionsFingerprint(payload);
+                        if (sentMapOptionPayloads.has(fingerprint)) {
+                            return false;
+                        }
+
+                        sentMapOptionPayloads.add(fingerprint);
+                        writeSse(controller, 'map_options', payload);
+                        return true;
                     };
+
+                    let savedMapSelectionArgs: Record<string, unknown> | undefined;
+                    let inferredMapArgs: Record<string, unknown> | undefined;
+                    if (shouldHandleMap) {
+                        if (hasMapSelection) {
+                            const cachedMapSelection = await redis.get(mapSelectionStateKey);
+                            if (cachedMapSelection) {
+                                try {
+                                    savedMapSelectionArgs = JSON.parse(cachedMapSelection) as Record<string, unknown>;
+                                } catch {
+                                    savedMapSelectionArgs = undefined;
+                                }
+                            }
+                        } else {
+                            await redis.del(mapSelectionStateKey);
+                        }
+                    }
+
+                    const mapSelectionArgs = normalizeMapSelectionArgs(body.mapSelection);
+                    const buildContextualMapToolArgs = (aiArguments: Record<string, unknown>) => {
+                        const latestQueryArgs = hasUserMessage
+                            ? { query: message, message }
+                            : undefined;
+                        return mergeMapToolArgs(savedMapSelectionArgs, mapSelectionArgs, inferredMapArgs, latestQueryArgs, aiArguments);
+                    };
+                    const persistMapSelectionState = async (payload: ReturnType<typeof buildMapOptionsEvent>) => {
+                        const selectedValues = asRecord(payload.selectedValues);
+                        const statePatch = {
+                            ...(payload.intentName ? { intentName: payload.intentName } : {}),
+                            ...(payload.provider ? { provider: payload.provider } : {}),
+                            ...(Object.keys(selectedValues).length > 0 ? { params: selectedValues } : {})
+                        };
+
+                        if (Object.keys(statePatch).length === 0) return;
+
+                        savedMapSelectionArgs = mergeMapToolArgs(savedMapSelectionArgs, statePatch);
+                        await redis.set(mapSelectionStateKey, JSON.stringify(savedMapSelectionArgs), 'EX', REDIS_TTL);
+                    };
+                    const clearMapSelectionState = async () => {
+                        savedMapSelectionArgs = undefined;
+                        await redis.del(mapSelectionStateKey);
+                    };
+                    let dynamicMapOptionToolSchema: unknown = mapOptionToolSchema;
+                    let mapAccessContext: { role: string; content: string } | undefined;
+                    let sentMapAccessEvent = false;
+
+                    if (shouldHandleMap) {
+                        const mapAccessResult = await handleCheckMapAccess(userId, mapHeaderApiKey);
+                        writeSse(controller, 'map_access', mapAccessResult);
+                        sentMapAccessEvent = true;
+
+                        const mapConfigs = mapAccessResult.success
+                            ? await resolveUserMapToolConfigs(userId, mapHeaderApiKey)
+                            : [];
+                        const mapChoiceContext = buildMapOptionChoiceContext(mapConfigs);
+                        inferredMapArgs = hasUserMessage && mapChoiceContext.length > 0
+                            ? inferMapArgsFromDbChoiceText(message, mapChoiceContext)
+                            : undefined;
+                        dynamicMapOptionToolSchema = mapConfigs.length > 0
+                            ? buildDynamicMapOptionToolSchema(mapConfigs)
+                            : mapOptionToolSchema;
+                        mapAccessContext = {
+                            role: 'system',
+                            content: `Map access context for this user. Use this only when the user asks for map/layer data. Pick provider and intentName from these configs and never invent access outside this list: ${JSON.stringify(mapAccessResult)}
+If the user asks for map/layer data and there is no complete mapSelection yet, do not ask a normal text follow-up first. Call the map_options tool immediately so the backend can return DB/API-backed choices.
+DB-backed map choice context for semantic matching: ${JSON.stringify(mapChoiceContext)}
+Inferred params already extracted from the latest user message by the map inference pass: ${JSON.stringify(inferredMapArgs || {})}
+For VALLARIS, always include the latest user message in query/message when calling map_options or get_map_layer. The backend will fetch the configured style endpoint, enrich empty descriptions from metadata/stylesheet links, match the requested topic to styleId, then ask the user to choose from the map links exposed by that style using each link title as the user-facing label. Never expose provider API keys in map_options choices.
+Infer params from the user's wording and the DB-backed enum descriptions in the map_options tool schema, including natural day/date wording into the matching dayPath choice value. Include inferred values in map_options.params. Do not call map_options with empty params when the user's wording already matches a choice. If the user already selected values in mapSelection, keep those values and continue with the next missing option.
+For URL/template placeholders, ask the user using only the DB-backed map_options choices. When hazard/dayPath/type or other required placeholders are complete, call get_map_layer with params.`
+                        };
+
+                        if (hasMapSelection) {
+                            const contextualArguments = buildContextualMapToolArgs({});
+                            const optionResult = await handleMapOptionsTool(userId, contextualArguments, mapHeaderApiKey);
+                            const optionPayload = buildMapOptionsEvent(optionResult);
+                            await persistMapSelectionState(optionPayload);
+
+                            if (!optionPayload.complete) {
+                                writeMapOptionsEvent(optionPayload);
+                                const optionSummary = optionResult.success
+                                    ? optionPayload.question || 'ขอข้อมูลแผนที่เพิ่มอีกนิดครับ'
+                                    : optionResult.message || 'ไม่สามารถตรวจข้อมูลแผนที่ที่ขาดได้ครับ';
+
+                                if (optionSummary) {
+                                    writeSse(controller, 'token', { text: optionSummary });
+                                }
+
+                                writeSse(controller, 'done', {
+                                    done: true,
+                                    tokenUsage: 0,
+                                    assistantmessage_Id: null,
+                                    skippedAssistantReply: true,
+                                    reason: 'map_options_ready'
+                                });
+                                closeSafely();
+                                return;
+                            }
+
+                            if (optionPayload.intentName && optionPayload.provider) {
+                                const selectedValues = asRecord(optionPayload.selectedValues);
+                                const mapResult = await handleMapTool(
+                                    userId,
+                                    {
+                                        ...contextualArguments,
+                                        intentName: optionPayload.intentName,
+                                        provider: optionPayload.provider,
+                                        params: {
+                                            ...selectedValues,
+                                            ...asRecord(contextualArguments.params)
+                                        },
+                                        options: {
+                                            ...selectedValues,
+                                            ...asRecord(contextualArguments.options)
+                                        }
+                                    },
+                                    mapHeaderApiKey
+                                );
+
+                                if (mapResult.success) {
+                                    await clearMapSelectionState();
+                                    writeSse(controller, 'map', mapResult.payload);
+                                    writeSse(controller, 'token', { text: 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ' });
+                                    writeSse(controller, 'done', {
+                                        done: true,
+                                        tokenUsage: 0,
+                                        assistantmessage_Id: null,
+                                        skippedAssistantReply: true,
+                                        reason: 'map_ready'
+                                    });
+                                    closeSafely();
+                                    return;
+                                }
+
+                                if (mapResult.needsOptions && mapResult.payload) {
+                                    const nextOptionPayload = buildMapOptionsEvent(mapResult.payload);
+                                    await persistMapSelectionState(nextOptionPayload);
+                                    writeMapOptionsEvent(nextOptionPayload);
+                                    const optionSummary = nextOptionPayload.question || 'ขอข้อมูลแผนที่เพิ่มอีกนิดครับ';
+                                    writeSse(controller, 'token', { text: optionSummary });
+                                    writeSse(controller, 'done', {
+                                        done: true,
+                                        tokenUsage: 0,
+                                        assistantmessage_Id: null,
+                                        skippedAssistantReply: true,
+                                        reason: 'map_options_ready'
+                                    });
+                                    closeSafely();
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                    const mapSelectionContext = body.mapSelection
+                        ? {
+                            role: 'system',
+                            content: `The user selected these map options in the UI. Treat these as DB-backed params/options for get_map_layer, validate via map_options if uncertain, and call get_map_layer when every required placeholder is present: ${JSON.stringify(body.mapSelection)}`
+                        }
+                        : undefined;
 
                     const messagesForOllama = [
                         systemMessage,
                         ...sanitizedMessagesForLLM,
                         styleReminder,
-                        mapAccessContext,
+                        ...(mapAccessContext ? [mapAccessContext] : []),
+                        ...(mapSelectionContext ? [mapSelectionContext] : []),
                         ...(mapToolContext ? [mapToolContext] : []),
                         ...(lastMessageForLLM ? [lastMessageForLLM] : [])
                     ];
@@ -490,9 +982,15 @@ export const processChatMessageStream = (
                     const ollamaPayload: Record<string, unknown> = {
                         model: selectedModel,
                         messages: messagesForOllama,
-                        tools: [checkMapAccessSchema, mapToolSchema],
                         stream: true
                     };
+                    if (shouldHandleMap) {
+                        ollamaPayload.tools = [
+                            checkMapAccessSchema,
+                            dynamicMapOptionToolSchema,
+                            mapToolSchema
+                        ] as unknown[];
+                    }
                     if (selectedFeelingKey === 'aggressive') {
                         ollamaPayload.options = { temperature: 0.7, top_p: 0.9 };
                     } else if (selectedFeelingKey === 'polite') {
@@ -524,15 +1022,14 @@ export const processChatMessageStream = (
                     let loggedNoToolDecision = false;
 
                     const handleOllamaChunk = async (chunk: any) => {
-                        const textPart = chunk?.message?.content || '';
-                        if (textPart) {
-                            assistantReply += textPart;
-                            writeSse(controller, 'token', { text: textPart });
-                        }
-
                         const toolCalls = Array.isArray(chunk?.message?.tool_calls)
                             ? chunk.message.tool_calls
                             : [];
+                        const textPart = chunk?.message?.content || '';
+                        if (textPart && !shouldHandleMap) {
+                            assistantReply += textPart;
+                            writeSse(controller, 'token', { text: textPart });
+                        }
 
                         if (toolCalls.length > 0) {
                             console.log("=== สิ่งที่ AI คิดและตอบกลับมา ===");
@@ -550,7 +1047,10 @@ export const processChatMessageStream = (
 
                             if (toolName === 'check_user_map') {
                                 const accessResult = await handleCheckMapAccess(userId, mapHeaderApiKey);
-                                writeSse(controller, 'map_access', accessResult);
+                                if (!sentMapAccessEvent) {
+                                    writeSse(controller, 'map_access', accessResult);
+                                    sentMapAccessEvent = true;
+                                }
 
                                 if (!accessResult.success) {
                                     const accessErrorMessage = accessResult.message || 'ไม่พบสิทธิ์การใช้งานแผนที่ครับ';
@@ -560,20 +1060,97 @@ export const processChatMessageStream = (
                                 continue;
                             }
 
+                            if (toolName === 'map_options') {
+                                const aiArguments = parseToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments);
+                                const contextualArguments = buildContextualMapToolArgs(aiArguments);
+                                const optionResult = await handleMapOptionsTool(userId, contextualArguments, mapHeaderApiKey);
+                                const optionPayload = buildMapOptionsEvent(optionResult);
+                                await persistMapSelectionState(optionPayload);
+                                const wroteOptionPayload = optionPayload.complete
+                                    ? false
+                                    : writeMapOptionsEvent(optionPayload);
+
+                                if (optionPayload.complete && optionPayload.intentName && optionPayload.provider) {
+                                    const selectedValues = asRecord(optionPayload.selectedValues);
+                                    const mapResult = await handleMapTool(
+                                        userId,
+                                        {
+                                            ...contextualArguments,
+                                            intentName: optionPayload.intentName,
+                                            provider: optionPayload.provider,
+                                            params: {
+                                                ...selectedValues,
+                                                ...asRecord(contextualArguments.params)
+                                            },
+                                            options: {
+                                                ...selectedValues,
+                                                ...asRecord(contextualArguments.options)
+                                            }
+                                        },
+                                        mapHeaderApiKey
+                                    );
+
+                                    if (mapResult.success) {
+                                        await clearMapSelectionState();
+                                        writeSse(controller, 'map', mapResult.payload);
+                                        mapMetadata = toPrismaJsonObject(mapResult.payload);
+
+                                        const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';
+                                        assistantReply += mapSummary;
+                                        writeSse(controller, 'token', { text: mapSummary });
+                                    } else if (mapResult.needsOptions && mapResult.payload) {
+                                        const nextOptionPayload = buildMapOptionsEvent(mapResult.payload);
+                                        await persistMapSelectionState(nextOptionPayload);
+                                        const wroteNextOptionPayload = writeMapOptionsEvent(nextOptionPayload);
+                                        if (wroteNextOptionPayload) {
+                                            const optionSummary = nextOptionPayload.question || 'ขอข้อมูลแผนที่เพิ่มอีกนิดครับ';
+                                            assistantReply += optionSummary;
+                                            writeSse(controller, 'token', { text: optionSummary });
+                                        }
+                                    } else {
+                                        const mapErrorMessage = getToolErrorMessage(mapResult, 'ไม่สามารถดึงข้อมูลแผนที่ได้ครับ');
+                                        writeSse(controller, 'map_error', { message: mapErrorMessage });
+                                        assistantReply += mapErrorMessage;
+                                        writeSse(controller, 'token', { text: mapErrorMessage });
+                                    }
+                                    continue;
+                                }
+
+                                const optionSummary = optionResult.success
+                                    ? optionPayload.question || 'ขอข้อมูลแผนที่เพิ่มอีกนิดครับ'
+                                    : optionResult.message || 'ไม่สามารถตรวจข้อมูลแผนที่ที่ขาดได้ครับ';
+                                if (wroteOptionPayload) {
+                                    assistantReply += optionSummary;
+                                    writeSse(controller, 'token', { text: optionSummary });
+                                }
+                                continue;
+                            }
+
                             if (toolName !== 'get_map_layer') continue;
 
                             const aiArguments = parseToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments);
-                            const mapResult = await handleMapTool(userId, aiArguments, mapHeaderApiKey);
+                            const contextualArguments = buildContextualMapToolArgs(aiArguments);
+                            const mapResult = await handleMapTool(userId, contextualArguments, mapHeaderApiKey);
 
                             if (mapResult.success) {
+                                await clearMapSelectionState();
                                 writeSse(controller, 'map', mapResult.payload);
                                 mapMetadata = toPrismaJsonObject(mapResult.payload);
 
                                 const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';
                                 assistantReply += mapSummary;
                                 writeSse(controller, 'token', { text: mapSummary });
+                            } else if (mapResult.needsOptions && mapResult.payload) {
+                                const optionPayload = buildMapOptionsEvent(mapResult.payload);
+                                await persistMapSelectionState(optionPayload);
+                                const wroteOptionPayload = writeMapOptionsEvent(optionPayload);
+                                if (wroteOptionPayload) {
+                                    const optionSummary = optionPayload.question || 'ขอข้อมูลแผนที่เพิ่มอีกนิดครับ';
+                                    assistantReply += optionSummary;
+                                    writeSse(controller, 'token', { text: optionSummary });
+                                }
                             } else {
-                                const mapErrorMessage = mapResult.error || 'ไม่สามารถดึงข้อมูลแผนที่ได้ครับ';
+                                const mapErrorMessage = getToolErrorMessage(mapResult, 'ไม่สามารถดึงข้อมูลแผนที่ได้ครับ');
                                 writeSse(controller, 'map_error', { message: mapErrorMessage });
                                 assistantReply += mapErrorMessage;
                                 writeSse(controller, 'token', { text: mapErrorMessage });
@@ -583,6 +1160,69 @@ export const processChatMessageStream = (
                         if (chunk?.done && handledToolCalls.size === 0 && !loggedNoToolDecision) {
                             loggedNoToolDecision = true;
                             console.log("AI เลือกที่จะตอบเป็นข้อความธรรมดา (ไม่ได้เรียก Tool)");
+
+                            if (shouldHandleMap) {
+                                const contextualArguments = buildContextualMapToolArgs({});
+                                const optionResult = await handleMapOptionsTool(userId, contextualArguments, mapHeaderApiKey);
+                                const optionPayload = buildMapOptionsEvent(optionResult);
+                                await persistMapSelectionState(optionPayload);
+                                const wroteOptionPayload = optionPayload.complete
+                                    ? false
+                                    : writeMapOptionsEvent(optionPayload);
+
+                                if (optionPayload.complete && optionPayload.intentName && optionPayload.provider) {
+                                    const selectedValues = asRecord(optionPayload.selectedValues);
+                                    const mapResult = await handleMapTool(
+                                        userId,
+                                        {
+                                            ...contextualArguments,
+                                            intentName: optionPayload.intentName,
+                                            provider: optionPayload.provider,
+                                            params: {
+                                                ...selectedValues,
+                                                ...asRecord(contextualArguments.params)
+                                            },
+                                            options: {
+                                                ...selectedValues,
+                                                ...asRecord(contextualArguments.options)
+                                            }
+                                        },
+                                        mapHeaderApiKey
+                                    );
+
+                                    if (mapResult.success) {
+                                        await clearMapSelectionState();
+                                        writeSse(controller, 'map', mapResult.payload);
+                                        mapMetadata = toPrismaJsonObject(mapResult.payload);
+
+                                        const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';
+                                        assistantReply += mapSummary;
+                                        writeSse(controller, 'token', { text: mapSummary });
+                                    } else if (mapResult.needsOptions && mapResult.payload) {
+                                        const nextOptionPayload = buildMapOptionsEvent(mapResult.payload);
+                                        await persistMapSelectionState(nextOptionPayload);
+                                        const wroteNextOptionPayload = writeMapOptionsEvent(nextOptionPayload);
+                                        if (wroteNextOptionPayload) {
+                                            const optionSummary = nextOptionPayload.question || 'ขอข้อมูลแผนที่เพิ่มอีกนิดครับ';
+                                            assistantReply += optionSummary;
+                                            writeSse(controller, 'token', { text: optionSummary });
+                                        }
+                                    } else {
+                                        const mapErrorMessage = getToolErrorMessage(mapResult, 'ไม่สามารถดึงข้อมูลแผนที่ได้ครับ');
+                                        writeSse(controller, 'map_error', { message: mapErrorMessage });
+                                        assistantReply += mapErrorMessage;
+                                        writeSse(controller, 'token', { text: mapErrorMessage });
+                                    }
+                                } else {
+                                    const optionSummary = optionResult.success
+                                        ? optionPayload.question || 'ขอข้อมูลแผนที่เพิ่มอีกนิดครับ'
+                                        : optionResult.message || 'ไม่สามารถตรวจข้อมูลแผนที่ที่ขาดได้ครับ';
+                                    if (wroteOptionPayload) {
+                                        assistantReply += optionSummary;
+                                        writeSse(controller, 'token', { text: optionSummary });
+                                    }
+                                }
+                            }
                         }
 
                         if (chunk?.done && typeof chunk?.eval_count === 'number') {

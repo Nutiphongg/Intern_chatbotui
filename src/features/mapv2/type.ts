@@ -1,8 +1,8 @@
 import { t, Static } from 'elysia';
 
-export type MapLayerType = "wms" | "wmts" | "tms" | "vector";
-export type HazardType = "viirs" | "flood" | "dri";
-export type DayRange = 1 | 3 | 7 | 30;
+export type MapLayerType = string;
+export type HazardType = string;
+export type DayRange = number;
 
 export type GetMapLayerCatalogInput = {
   hazard: HazardType; 
@@ -26,30 +26,62 @@ export type MapLayerCatalogResult = {
   tiles?: string[];
 }
 //userconfig map
-// 1. สร้าง Schema ไว้ใช้ดักจับข้อมูลผิดๆ (Runtime Validation)
-export const CreateMapConfigBody = t.Object({
-  intentName: t.String({ description: 'view_map' }),
-  provider: t.Union([ t.Literal('GISTDA'), t.Literal('VALLARIS')]),
-  baseUrl: t.Union([t.Literal('https://api-gateway.gistda.or.th'),t.Literal('https://vallaris.dragonfly.gistda.or.th')]),
-  urlTemplate: t.Union([t.Literal('/api/2.0/resources/maps/{hazard}/{dayPath}/{type}'),t.Literal('/core/api/tiles/1.0-beta/tiles/{layerId}/{z}/{x}/{y}')]),
-  layerConfigTemplate: t.Optional(t.Any())
-});
-
-// 2. [พระเอกอยู่ตรงนี้!] สกัด Type ออกมาให้ Frontend หรือส่วนอื่นๆ เรียกใช้งาน (Static Type)
-// Frontend สามารถ import ตัวนี้ไปดูโครงสร้างได้เลย หน้าตาจะเหมือน Interface 100%
-export type CreateMapConfigDTO = Static<typeof CreateMapConfigBody>;
-
+// 
 //userapikey
 export const CreateApiKeyBody = t.Object({
-  provider: t.Union([
-    t.Literal('GISTDA'), 
-    t.Literal('VALLARIS')
-  ]),
+  provider: t.String({ minLength: 1 }),
   keyName: t.String({ 
-    default: 'Production Key' 
+    minLength: 1,
+    default: 'Production Key'
   }),
-  keyValue: t.String({ }) 
+  keyValue: t.String({ minLength: 1 })
 });
 
 // สกัด Interface ให้ไฟล์อื่นนำไปใช้
 export type CreateApiKeyDTO = Static<typeof CreateApiKeyBody>;
+
+export const apiKeyParamsSchema = t.Object({
+  apiKeyId: t.String({ error: "ต้องระบุ apiKeyId ใน URL" })
+});
+export type ApiKeyParams = Static<typeof apiKeyParamsSchema>;
+
+export const updateApiKeyBodySchema = t.Object({
+  keyName: t.Optional(t.String({ minLength: 1 })),
+  isActive: t.Optional(t.Boolean())
+});
+export type UpdateApiKeyDTO = Static<typeof updateApiKeyBodySchema>;
+
+export const apiKeySummarySchema = t.Object({
+  id: t.String(),
+  provider: t.String(),
+  keyName: t.String(),
+  maskedKey: t.String(),
+  isActive: t.Boolean(),
+  createdAt: t.Any()
+});
+export type ApiKeySummaryDTO = Static<typeof apiKeySummarySchema>;
+
+export const createdApiKeySchema = t.Object({
+  id: t.String(),
+  provider: t.String(),
+  keyName: t.String(),
+  isActive: t.Boolean(),
+  createdAt: t.Any()
+});
+export type CreatedApiKeyDTO = Static<typeof createdApiKeySchema>;
+
+export const apiKeyDetailSchema = t.Object({
+  id: t.String(),
+  provider: t.String(),
+  keyName: t.String(),
+  maskedKey: t.String(),
+  isActive: t.Boolean(),
+  createdAt: t.Any(),
+  apiKey: t.String()
+});
+export type ApiKeyDetailDTO = Static<typeof apiKeyDetailSchema>;
+
+export const deleteApiKeyResponseSchema = t.Object({
+  message: t.String()
+});
+export type DeleteApiKeyDTO = Static<typeof deleteApiKeyResponseSchema>;
