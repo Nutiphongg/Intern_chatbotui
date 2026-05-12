@@ -26,6 +26,7 @@ const OLLAMA_URL = env.OLLAMA_URL;
 const DEFAULT_CHAT_MODEL = 'qwen2.5';
 const MAX_HISTORY = 10; // จำแค่ 10 ประโยคล่าสุด
 const REDIS_TTL = 3600; // ให้ Redis จำไว้ 1 ชั่วโมง
+const DEFAULT_OUTPUT_TOKENS = 512;
 
 const shouldUseMapV2Tool = (message: string): boolean => {
     const normalized = message.toLowerCase();
@@ -378,8 +379,10 @@ export const processChatMessageStream = (
     vectorApiKey?: string
 ) => {
     const rawMessage = body?.message ?? '';
-    const hasMapSelection = Boolean(body?.mapSelection);
+    const mapSelectionPayload = body?.mapselection;
+    const hasMapSelection = Boolean(mapSelectionPayload);
     const hasUserMessage = Boolean(rawMessage.trim());
+    const shouldPersistUserMessage = hasUserMessage && !hasMapSelection;
 
     if (!body || (!hasUserMessage && !hasMapSelection)) {
         throw Errors.badRequest('no message data found');
@@ -399,7 +402,7 @@ export const processChatMessageStream = (
     const userMessageCreatedAt = new Date();
     const redisKey = isGuest? `guest_chat:${convId}`:`chat:${convId}`;
     const mapSelectionStateKey = `${redisKey}:map_selection`;
-    const currentUserHistoryMessage = hasUserMessage
+    const currentUserHistoryMessage = shouldPersistUserMessage
         ? { id: userMessageId, role: 'user', content: message, created_at: userMessageCreatedAt.toISOString(), is_silent_retry: false }
         : undefined;
 
@@ -474,7 +477,7 @@ export const processChatMessageStream = (
                                 data: {
                                     id: convId,
                                     user_id: userId,
-                                    title: hasUserMessage ? message.substring(0, 30) : 'Map selection',
+                                    title: shouldPersistUserMessage ? message.substring(0, 30) : 'Map selection',
                                     last_message_at: userMessageCreatedAt
                                 } as any
                             });
@@ -490,7 +493,7 @@ export const processChatMessageStream = (
                                 return;
                             }
                         }
-                        if (isSilentRetry && !isNewConv && hasUserMessage){
+                        if (isSilentRetry && !isNewConv && shouldPersistUserMessage){
                             const latestVisibleUserMessage = await prisma.messages.findFirst({
                                 where: {
                                     conversation_id: convId,
@@ -681,103 +684,58 @@ export const processChatMessageStream = (
                     const lastMessageForLLM = sanitizedMessagesForLLM.pop();
                     let mapToolContext: { role: string, content: string } | undefined;
                     let mapMetadata: Prisma.InputJsonObject | undefined;
-                    // Old mapv2 tools are disabled while config-map driven tools are being built.
-                    // if (isMapRequest && mapIntent?.type === 'vector' && !hasVectorApiKey) {
-                    //     writeSse(controller, 'map_error', {
-                    //         message: 'missing_vector_api_key',
-                    //         needsApiKey: true,
-                    //         apiKeyHeader: 'X-Vector-API-Key',
-                    //         silentRetrySupported: true
-                    //     });
-                    //     writeSse(controller, 'done', {
-                    //         done: true,
-                    //         tokenUsage: 0,
-                    //         assistantmessage_Id: null,
-                    //         skippedAssistantReply: true,
-                    //         reason: 'missing_vector_api_key'
-                    //     });
-                    //     closeSafely();
-                    //     return;
-                    // }
-                    // if (isMapRequest && mapIntent?.type !== 'vector' && !hasMapApiKey) {
-                    //     writeSse(controller, 'map_error', {
-                    //         message: 'missing_x_api_key',
-                    //         needsApiKey: true,
-                    //         silentRetrySupported: true
-                    //     });
-                    //     writeSse(controller, 'done', {
-                    //         done: true,
-                    //         tokenUsage: 0,
-                    //         assistantmessage_Id: null,
-                    //         skippedAssistantReply: true,
-                    //         reason: 'missing_x_api_key'
-                    //     });
-                    //     closeSafely();
-                    //     return;
-                    // }
-                    // Temporarily disabled old map stream text while testing mapv2 with streamsse.
-                    // try {
-                    //     const mapToolResult = await runHotspotsToolFromMessage(message);
-                    //     if (mapToolResult) {
-                    //         const hotspots = mapToolResult.result.data.features.length;
-                    //         writeSse(controller, 'map', {
-                    //             event: mapToolResult.event,
-                    //             query: mapToolResult.query,
-                    //             geojsonUrl: mapToolResult.geojsonUrl,
-                    //             ...mapToolResult.result
-                    //         });
-                    //         mapMetadata = toPrismaJsonObject({
-                    //             type: 'map',
-                    //             event: mapToolResult.event,
-                    //             layerId: mapToolResult.result.layerId,
-                    //             source: mapToolResult.result.source,
-                    //             query: mapToolResult.query,
-                    //             geojsonUrl: mapToolResult.geojsonUrl,
-                    //             featureCount: hotspots,
-                    //             mapAction: mapToolResult.result.mapAction,
-                    //         });
-                    //         const layerDescription = mapToolResult.event === 'hotspots'
-                    //             ? `VIIRS hotspot (${mapToolResult.query.days} day)`
-                    //             : `${mapToolResult.query.kind} at lat ${mapToolResult.query.lat}, lon ${mapToolResult.query.lon}`;
-                    //         mapToolContext = {
-                    //             role: 'system',
-                    //             content: `Map tool already returned ${hotspots} ${layerDescription} feature(s) to the frontend as GeoJSON. Briefly tell the user that the map layer is ready, and do not paste raw GeoJSON.`
-                    //         };
-                    //     }
-                    // } catch (error) {
-                    //     console.error('Map Tool Error:', error);
-                    //     writeSse(controller, 'map_error', {
-                    //         message: error instanceof Error ? error.message : 'map_tool_failed'
-                    //     });
-                    // }
-                    // Old mapv2 tools are disabled while config-map driven tools are being built.
-                    // if (isMapRequest) {
-                    //     try {
-                    //         const toolResult = await get_map_layer_catalog.execute({ message, apiKey, vectorApiKey });
-                    //
-                    //         writeSse(controller, 'map', toolResult);
-                    //         mapMetadata = toPrismaJsonObject(toolResult);
-                    //         mapToolContext = {
-                    //             role: 'system',
-                    //             content: `MapV2 generated a ${toolResult.layer.type.toUpperCase()} URL for days: ${toolResult.layer.url}. Tell the user the map URL is ready and keep the response brief.`
-                    //         };
-                    //     } catch (error) {
-                    //         console.error('MapV2 Tool Error:', error);
-                    //         const reason = error instanceof Error ? error.message : 'mapv2_tool_failed';
-                    //         writeSse(controller, 'map_error', {
-                    //             message: reason
-                    //         });
-                    //         writeSse(controller, 'done', {
-                    //             done: true,
-                    //             tokenUsage: 0,
-                    //             assistantmessage_Id: null,
-                    //             skippedAssistantReply: true,
-                    //             reason
-                    //         });
-                    //         closeSafely();
-                    //         return;
-                    //     }
-                    // }
+                    let assistantEventMetadata: Prisma.InputJsonObject | undefined;
+                    const createMapOptionsMetadata = (payload: unknown): Prisma.InputJsonObject => {
+                        return toPrismaJsonObject({
+                            event: 'map_options',
+                            payload
+                        });
+                    };
+                    const saveAssistantMessage = async (
+                        content: string,
+                        metadata?: Prisma.InputJsonObject,
+                        responseTimeMs = 0,
+                        tokenUsage = 0
+                    ) => {
+                        if (!content && !metadata) return null;
+
+                        const assistantMessageId = ulid();
+                        const assistantMessageCreatedAt = new Date(Math.max(Date.now(), userMessageCreatedAt.getTime() + 1));
+                        const botMessage = {
+                            id: assistantMessageId,
+                            role: 'assistant',
+                            content,
+                            model: selectedModel,
+                            metadata,
+                            created_at: assistantMessageCreatedAt.toISOString()
+                        };
+
+                        if (!isGuest) {
+                            await prisma.messages.create({
+                                data: {
+                                    id: assistantMessageId,
+                                    conversation_id: convId,
+                                    role: 'assistant',
+                                    content,
+                                    model: selectedModel,
+                                    response_time: responseTimeMs,
+                                    token_usage: tokenUsage,
+                                    metadata,
+                                    created_at: assistantMessageCreatedAt
+                                }
+                            });
+                            await prisma.conversations.updateMany({
+                                where: { id: convId, user_id: userId },
+                                data: { last_message_at: assistantMessageCreatedAt }
+                            });
+                        }
+
+                        await redis.rpush(redisKey, JSON.stringify(botMessage));
+                        await redis.ltrim(redisKey, -MAX_HISTORY, -1);
+                        await redis.expire(redisKey, REDIS_TTL);
+
+                        return assistantMessageId;
+                    };
 
                     if (shouldHandleMap && !hasMapApiKey) {
                         writeSse(controller, 'map_error', {
@@ -826,7 +784,7 @@ export const processChatMessageStream = (
                         }
                     }
 
-                    const mapSelectionArgs = normalizeMapSelectionArgs(body.mapSelection);
+                    const mapSelectionArgs = normalizeMapSelectionArgs(mapSelectionPayload);
                     const buildContextualMapToolArgs = (aiArguments: Record<string, unknown>) => {
                         const latestQueryArgs = hasUserMessage
                             ? { query: message, message }
@@ -887,19 +845,15 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             await persistMapSelectionState(optionPayload);
 
                             if (!optionPayload.complete) {
-                                writeMapOptionsEvent(optionPayload);
-                                const optionSummary = optionResult.success
-                                    ? optionPayload.question || 'ขอข้อมูลแผนที่เพิ่มอีกนิดครับ'
-                                    : optionResult.message || 'ไม่สามารถตรวจข้อมูลแผนที่ที่ขาดได้ครับ';
-
-                                if (optionSummary) {
-                                    writeSse(controller, 'token', { text: optionSummary });
-                                }
+                                const wroteOptionPayload = writeMapOptionsEvent(optionPayload);
+                                const assistantMessageId = wroteOptionPayload
+                                    ? await saveAssistantMessage('', createMapOptionsMetadata(optionPayload))
+                                    : null;
 
                                 writeSse(controller, 'done', {
                                     done: true,
                                     tokenUsage: 0,
-                                    assistantmessage_Id: null,
+                                    assistantmessage_Id: assistantMessageId,
                                     skippedAssistantReply: true,
                                     reason: 'map_options_ready'
                                 });
@@ -930,11 +884,17 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                 if (mapResult.success) {
                                     await clearMapSelectionState();
                                     writeSse(controller, 'map', mapResult.payload);
-                                    writeSse(controller, 'token', { text: 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ' });
+                                    const mapMetadata = toPrismaJsonObject(mapResult.payload);
+                                    const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';
+                                    const assistantMessageId = await saveAssistantMessage(
+                                        mapSummary,
+                                        mapMetadata
+                                    );
+                                    writeSse(controller, 'token', { text: mapSummary });
                                     writeSse(controller, 'done', {
                                         done: true,
                                         tokenUsage: 0,
-                                        assistantmessage_Id: null,
+                                        assistantmessage_Id: assistantMessageId,
                                         skippedAssistantReply: true,
                                         reason: 'map_ready'
                                     });
@@ -945,13 +905,14 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                 if (mapResult.needsOptions && mapResult.payload) {
                                     const nextOptionPayload = buildMapOptionsEvent(mapResult.payload);
                                     await persistMapSelectionState(nextOptionPayload);
-                                    writeMapOptionsEvent(nextOptionPayload);
-                                    const optionSummary = nextOptionPayload.question || 'ขอข้อมูลแผนที่เพิ่มอีกนิดครับ';
-                                    writeSse(controller, 'token', { text: optionSummary });
+                                    const wroteNextOptionPayload = writeMapOptionsEvent(nextOptionPayload);
+                                    const assistantMessageId = wroteNextOptionPayload
+                                        ? await saveAssistantMessage('', createMapOptionsMetadata(nextOptionPayload))
+                                        : null;
                                     writeSse(controller, 'done', {
                                         done: true,
                                         tokenUsage: 0,
-                                        assistantmessage_Id: null,
+                                        assistantmessage_Id: assistantMessageId,
                                         skippedAssistantReply: true,
                                         reason: 'map_options_ready'
                                     });
@@ -961,10 +922,10 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             }
                         }
                     }
-                    const mapSelectionContext = body.mapSelection
+                    const mapSelectionContext = mapSelectionPayload
                         ? {
                             role: 'system',
-                            content: `The user selected these map options in the UI. Treat these as DB-backed params/options for get_map_layer, validate via map_options if uncertain, and call get_map_layer when every required placeholder is present: ${JSON.stringify(body.mapSelection)}`
+                            content: `The user selected these map options in the UI. Treat these as DB-backed params/options for get_map_layer, validate via map_options if uncertain, and call get_map_layer when every required placeholder is present: ${JSON.stringify(mapSelectionPayload)}`
                         }
                         : undefined;
 
@@ -996,6 +957,10 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                     } else if (selectedFeelingKey === 'polite') {
                         ollamaPayload.options = { temperature: 0.45, top_p: 0.85 };
                     }
+                    ollamaPayload.options = {
+                        ...((ollamaPayload.options as Record<string, unknown> | undefined) || {}),
+                        num_predict: shouldHandleMap ? 128 : DEFAULT_OUTPUT_TOKENS
+                    };
                     
                     ollamaAbortController = new AbortController();
                     const ollamaResponse = await fetch(`${env.OLLAMA_URL}/api/chat`, {
@@ -1103,9 +1068,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                         await persistMapSelectionState(nextOptionPayload);
                                         const wroteNextOptionPayload = writeMapOptionsEvent(nextOptionPayload);
                                         if (wroteNextOptionPayload) {
-                                            const optionSummary = nextOptionPayload.question || 'ขอข้อมูลแผนที่เพิ่มอีกนิดครับ';
-                                            assistantReply += optionSummary;
-                                            writeSse(controller, 'token', { text: optionSummary });
+                                            assistantEventMetadata = createMapOptionsMetadata(nextOptionPayload);
                                         }
                                     } else {
                                         const mapErrorMessage = getToolErrorMessage(mapResult, 'ไม่สามารถดึงข้อมูลแผนที่ได้ครับ');
@@ -1116,12 +1079,8 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                     continue;
                                 }
 
-                                const optionSummary = optionResult.success
-                                    ? optionPayload.question || 'ขอข้อมูลแผนที่เพิ่มอีกนิดครับ'
-                                    : optionResult.message || 'ไม่สามารถตรวจข้อมูลแผนที่ที่ขาดได้ครับ';
                                 if (wroteOptionPayload) {
-                                    assistantReply += optionSummary;
-                                    writeSse(controller, 'token', { text: optionSummary });
+                                    assistantEventMetadata = createMapOptionsMetadata(optionPayload);
                                 }
                                 continue;
                             }
@@ -1145,9 +1104,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                 await persistMapSelectionState(optionPayload);
                                 const wroteOptionPayload = writeMapOptionsEvent(optionPayload);
                                 if (wroteOptionPayload) {
-                                    const optionSummary = optionPayload.question || 'ขอข้อมูลแผนที่เพิ่มอีกนิดครับ';
-                                    assistantReply += optionSummary;
-                                    writeSse(controller, 'token', { text: optionSummary });
+                                    assistantEventMetadata = createMapOptionsMetadata(optionPayload);
                                 }
                             } else {
                                 const mapErrorMessage = getToolErrorMessage(mapResult, 'ไม่สามารถดึงข้อมูลแผนที่ได้ครับ');
@@ -1203,9 +1160,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                         await persistMapSelectionState(nextOptionPayload);
                                         const wroteNextOptionPayload = writeMapOptionsEvent(nextOptionPayload);
                                         if (wroteNextOptionPayload) {
-                                            const optionSummary = nextOptionPayload.question || 'ขอข้อมูลแผนที่เพิ่มอีกนิดครับ';
-                                            assistantReply += optionSummary;
-                                            writeSse(controller, 'token', { text: optionSummary });
+                                            assistantEventMetadata = createMapOptionsMetadata(nextOptionPayload);
                                         }
                                     } else {
                                         const mapErrorMessage = getToolErrorMessage(mapResult, 'ไม่สามารถดึงข้อมูลแผนที่ได้ครับ');
@@ -1214,12 +1169,8 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                         writeSse(controller, 'token', { text: mapErrorMessage });
                                     }
                                 } else {
-                                    const optionSummary = optionResult.success
-                                        ? optionPayload.question || 'ขอข้อมูลแผนที่เพิ่มอีกนิดครับ'
-                                        : optionResult.message || 'ไม่สามารถตรวจข้อมูลแผนที่ที่ขาดได้ครับ';
                                     if (wroteOptionPayload) {
-                                        assistantReply += optionSummary;
-                                        writeSse(controller, 'token', { text: optionSummary });
+                                        assistantEventMetadata = createMapOptionsMetadata(optionPayload);
                                     }
                                 }
                             }
@@ -1263,41 +1214,13 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                     // สรุปผลลัพธ์แล้วบันทึกฝั่ง assistant ลง DB/Redis
                     const responseTimeMs = Date.now() - startTime;
-                    const assistantMessageId = ulid();
-                    const assistantMessageCreatedAt = new Date(Math.max(Date.now(), userMessageCreatedAt.getTime() + 1));
-                    if (assistantReply) {
-                        const botMessage = {
-                            id: assistantMessageId,
-                            role: 'assistant',
-                            content: assistantReply,
-                            model: selectedModel,
-                            metadata: mapMetadata,
-                            created_at: assistantMessageCreatedAt.toISOString()
-                        };
-                        if(! isGuest) {
-                            await prisma.messages.create({
-                                data: {
-                                    id: assistantMessageId,
-                                    conversation_id: convId,
-                                    role: 'assistant',
-                                    content: assistantReply,
-                                    model: selectedModel,
-                                    response_time: responseTimeMs,
-                                    token_usage: tokenUsage,
-                                    metadata: mapMetadata,
-                                    created_at: assistantMessageCreatedAt
-                                }
-                           });
-                            await prisma.conversations.updateMany({
-                                where: { id: convId, user_id: userId },
-                                data: { last_message_at: assistantMessageCreatedAt }
-                            });
-                        };
-
-                        await redis.rpush(redisKey, JSON.stringify(botMessage));
-                        await redis.ltrim(redisKey, -MAX_HISTORY, -1);
-                        await redis.expire(redisKey, REDIS_TTL);
-                    }
+                    const assistantMetadata = mapMetadata || assistantEventMetadata;
+                    const assistantMessageId = await saveAssistantMessage(
+                        assistantReply,
+                        assistantMetadata,
+                        responseTimeMs,
+                        tokenUsage
+                    );
 
                     // แจ้งจบ stream ให้ frontend ปิด loading/state
                     writeSse(controller, 'done', {

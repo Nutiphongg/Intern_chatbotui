@@ -85,3 +85,42 @@ export const deleteApiKeyResponseSchema = t.Object({
   message: t.String()
 });
 export type DeleteApiKeyDTO = Static<typeof deleteApiKeyResponseSchema>;
+
+export type MapToolArgs = {
+  intentName?: string;
+  provider?: string;
+  params?: unknown;
+  options?: unknown;
+  selectedOptions?: unknown;
+  variables?: unknown;
+  [key: string]: unknown;
+};
+
+export type MapOptionChoice = {
+  label: string;
+  value: string;
+  description?: string;
+  url?: string;
+  type?: string;
+  styleId?: string;
+  styleTitle?: string;
+  templated?: boolean;
+  mediaType?: string;
+  rel?: string;
+};
+
+export type MapOptionInfo = {
+  key: string;
+  required: boolean;
+  source: "template" | "map_access";
+  label?: string;
+  description?: string;
+  choices?: MapOptionChoice[];
+};
+
+export type MapConfigForTools = {
+  intentName: string;
+  provider: string;
+  urlTemplate: string;
+  layerConfigTemplate: unknown;
+};

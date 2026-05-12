@@ -96,17 +96,17 @@ model mapconfig {
 
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 model user_apikey {
-  id           String   @id(map: "UserApiKey_pkey")
-  userId       String   @map("user_id")
+  id           String    @id(map: "UserApiKey_pkey")
+  userId       String    @map("user_id")
   provider     String
   keyName      String
   encryptedKey String
   iv           String
-  isActive     Boolean  @default(true)
-  createdAt    DateTime @default(now())
-  keyHash      String?  @db.VarChar(64)
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  keyHash      String?   @db.VarChar(64)
   deletedAt    DateTime?
-  users        users    @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_user_apikey_user")
+  users        users     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_user_apikey_user")
 
   @@index([userId], map: "idx_user_apikey_user_id")
   @@index([userId, provider, keyName], map: "idx_user_apikey_user_provider_key_name")

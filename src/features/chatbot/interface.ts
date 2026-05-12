@@ -75,4 +75,5 @@ export interface SendChatRequest {
   model?: string;
   feeling?: string;
   is_silent_retry?: boolean;
+  mapselection?: unknown;
 }

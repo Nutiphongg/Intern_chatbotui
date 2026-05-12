@@ -1,25 +1,13 @@
 import { prisma } from "../setup/prisma";
 import { decrypt, hashApiKey } from "../setup/encryption";
 import { mapLayerService } from "./service";
+import type {
+  MapToolArgs,
+  MapOptionInfo,
+  MapOptionChoice,
+  MapConfigForTools
+} from "./type";
 
-type MapToolArgs = {
-  intentName?: string;
-  provider?: string;
-  params?: unknown;
-  options?: unknown;
-  selectedOptions?: unknown;
-  variables?: unknown;
-  [key: string]: unknown;
-};
-
-type MapOptionInfo = {
-  key: string;
-  required: boolean;
-  source: "template" | "map_access";
-  label?: string;
-  description?: string;
-  choices?: MapOptionChoice[];
-};
 
 type ResolvedUserApiKey = {
   id: string;
@@ -29,25 +17,7 @@ type ResolvedUserApiKey = {
   iv: string;
 };
 
-type MapOptionChoice = {
-  label: string;
-  value: string;
-  description?: string;
-  url?: string;
-  type?: string;
-  styleId?: string;
-  styleTitle?: string;
-  templated?: boolean;
-  mediaType?: string;
-  rel?: string;
-};
 
-type MapConfigForTools = {
-  intentName: string;
-  provider: string;
-  urlTemplate: string;
-  layerConfigTemplate: unknown;
-};
 
 const isRecord = (value: unknown): value is Record<string, unknown> => {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -593,6 +563,38 @@ const buildMapOptionQuestion = (options: MapOptionInfo[]): string | undefined =>
   return `${questionParts.join(" และ")}ครับ`;
 };
 
+type MapQuestionCode =
+  | "select_vallaris_style"
+  | "select_vallaris_type";
+
+const buildMapQuestion = (
+  code: MapQuestionCode,
+  context: Record<string, string | undefined> = {}
+): string => {
+  if (code === "select_vallaris_style") {
+    return context.query
+      ? `ผมเจอหลาย style ที่อาจเกี่ยวกับ "${context.query}" เลือกอันที่ต้องการก่อนครับ`
+      : "ต้องการใช้ style ไหนของ VALLARIS ครับ";
+  }
+
+  return "ต้องการรูปแบบแผนที่แบบไหนครับ";
+};
+
+const buildMapOptionDescription = (
+  code: MapQuestionCode,
+  context: Record<string, string | undefined> = {}
+): string => {
+  if (code === "select_vallaris_style") {
+    return context.query
+      ? `เลือก style ที่ตรงกับ "${context.query}"`
+      : "เลือก style ที่ต้องการใช้";
+  }
+
+  return context.styleTitle
+    ? `เลือก type สำหรับ ${context.styleTitle}`
+    : "เลือก type สำหรับ style ที่เลือก";
+};
+
 type VallarisLink = {
   href: string;
   rel?: string;
@@ -703,6 +705,25 @@ const getSelectedVallarisType = (aiArgs: MapToolArgs): string | undefined => {
   return undefined;
 };
 
+const inferVallarisTypeFromQuery = (
+  query: string | undefined,
+  choices: MapOptionChoice[]
+): string | undefined => {
+  if (!query?.trim()) return undefined;
+
+  const queryTokens = new Set(tokenizeMatchText(query));
+  const matches = choices.filter((choice) => {
+    const candidates = [choice.value, choice.type, choice.label]
+      .map((value) => value?.trim().toLowerCase())
+      .filter((value): value is string => Boolean(value));
+
+    return candidates.some((candidate) => queryTokens.has(candidate));
+  });
+
+  const uniqueMatches = new Set(matches.map((choice) => choice.value));
+  return uniqueMatches.size === 1 ? matches[0]?.value : undefined;
+};
+
 const joinProviderUrl = (baseUrl: string, urlTemplate: string): string => {
   const cleanTemplate = urlTemplate.trim();
   if (/^https?:\/\//i.test(cleanTemplate)) return cleanTemplate;
@@ -717,6 +738,16 @@ const appendApiKeyQuery = (url: string, apiKey: string): string => {
   if (!apiKey || /[?&](api_key|apikey|apiKey)=/i.test(url)) return url;
   const separator = url.includes("?") ? "&" : "?";
   return `${url}${separator}api_key=${encodeURIComponent(apiKey)}`;
+};
+
+const createPublicVallarisMapUrl = (url: string): string => {
+  try {
+    const parsedUrl = new URL(url);
+    parsedUrl.search = "";
+    return parsedUrl.toString();
+  } catch {
+    return url.split("?")[0] || url;
+  }
 };
 
 const buildVallarisCatalogUrl = (
@@ -1049,7 +1080,8 @@ const createVallarisMapOptionValue = (link: VallarisLink): string | undefined =>
 
 const buildVallarisMapChoices = (
   style: EnrichedVallarisStyle,
-  apiKey?: string
+  apiKey?: string,
+  includePublicUrl = false
 ): MapOptionChoice[] => {
   const choicesByValue = new Map<string, MapOptionChoice>();
 
@@ -1062,13 +1094,11 @@ const buildVallarisMapChoices = (
       label: link.title?.trim() || value,
       value,
       type: value,
-      styleId: style.id,
-      styleTitle: style.title,
       templated: link.templated === true || (link.href.includes("{z}") && link.href.includes("{x}") && link.href.includes("{y}")),
       ...(link.type ? { mediaType: link.type } : {}),
       ...(link.rel ? { rel: link.rel } : {}),
-      ...(apiKey ? { url: appendApiKeyQuery(link.href, apiKey) } : {}),
-      description: `${style.title || style.id} (${link.title?.trim() || value})`
+      ...(apiKey ? { url: appendApiKeyQuery(link.href, apiKey) } : includePublicUrl ? { url: createPublicVallarisMapUrl(link.href) } : {}),
+      //description: `${style.title || style.id} (${link.title?.trim() || value})`
     });
   }
 
@@ -1081,8 +1111,6 @@ const buildVallarisStyleChoices = (
   return matches.slice(0, VALLARIS_STYLE_CHOICE_LIMIT).map((match) => ({
     label: match.style.title || match.style.id,
     value: match.style.id,
-    styleId: match.style.id,
-    styleTitle: match.style.title,
     description: [
       match.style.description,
       match.confidence > 0 ? `confidence=${match.confidence.toFixed(2)}` : undefined
@@ -1149,7 +1177,7 @@ const buildVallarisOptionsPayload = async (
   includeSecureUrls = false
 ) => {
   const selection = await resolveVallarisStyleSelection(config, aiArgs, apiKey);
-  const selectedType = getSelectedVallarisType(aiArgs);
+  const explicitSelectedType = getSelectedVallarisType(aiArgs);
 
   if (selection.styles.length === 0) {
     return {
@@ -1170,9 +1198,9 @@ const buildVallarisOptionsPayload = async (
       required: true,
       source: "template",
       label: "Style",
-      description: selection.query
-        ? `เลือก style ที่ตรงกับ "${selection.query}"`
-        : "เลือก style ที่ต้องการใช้",
+      description: buildMapOptionDescription("select_vallaris_style", {
+        query: selection.query
+      }),
       choices: buildVallarisStyleChoices(selection.matches)
     };
 
@@ -1186,14 +1214,21 @@ const buildVallarisOptionsPayload = async (
       complete: false,
       intentName: config.intentName,
       provider: config.provider,
-      question: selection.query
-        ? `ผมเจอหลาย style ที่อาจเกี่ยวกับ "${selection.query}" เลือกอันที่ต้องการก่อนครับ`
-        : "ต้องการใช้ style ไหนของ VALLARIS ครับ",
+      question: buildMapQuestion("select_vallaris_style", {
+        query: selection.query
+      }),
       questionHint: "Ask the user to choose one VALLARIS styleId from these DB/API-backed candidates."
     };
   }
 
-  const publicMapChoices = buildVallarisMapChoices(selection.selectedStyle);
+  const publicMapChoices = buildVallarisMapChoices(
+    selection.selectedStyle,
+    undefined,
+    includeSecureUrls
+
+  );
+  const selectedType = explicitSelectedType
+    || inferVallarisTypeFromQuery(selection.query, publicMapChoices);
   const selectedPublicChoice = selectedType
     ? publicMapChoices.find((choice) => choice.value === selectedType || choice.type === selectedType)
     : undefined;
@@ -1226,7 +1261,9 @@ const buildVallarisOptionsPayload = async (
       required: true,
       source: "template",
       label: "Map type",
-      description: `เลือก type สำหรับ ${selection.selectedStyle.title || selection.selectedStyle.id}`,
+      description: buildMapOptionDescription("select_vallaris_type", {
+        styleTitle: selection.selectedStyle.title || selection.selectedStyle.id
+      }),
       choices: publicMapChoices
     };
 
@@ -1240,25 +1277,38 @@ const buildVallarisOptionsPayload = async (
       complete: false,
       intentName: config.intentName,
       provider: config.provider,
-      question: "ต้องการรูปแบบแผนที่แบบไหนครับ",
+      question: buildMapQuestion("select_vallaris_type"),
       questionHint: "Ask the user to choose one VALLARIS map type from these DB/API-backed choices. Do not expose provider API keys in map_options."
     };
   }
 
-  const shouldIncludeSecureUrls = includeSecureUrls;
-  const mapChoices = shouldIncludeSecureUrls
+  const secureMapChoices = includeSecureUrls
     ? buildVallarisMapChoices(selection.selectedStyle, apiKey)
-    : publicMapChoices;
-  const selectedChoice = shouldIncludeSecureUrls
-    ? mapChoices.find((choice) => choice.value === selectedPublicChoice.value || choice.type === selectedPublicChoice.type) || selectedPublicChoice
-    : selectedPublicChoice;
+    : [];
+  const selectedSecureChoice = includeSecureUrls
+    ? secureMapChoices.find((choice) => choice.value === selectedPublicChoice.value || choice.type === selectedPublicChoice.type)
+    : undefined;
+
+  if (includeSecureUrls && !selectedSecureChoice?.url) {
+    return {
+      success: false,
+      needInfo: false,
+      missingKeys: [],
+      options: [],
+      choices: [],
+      selectedValues: baseSelectedValues,
+      complete: false,
+      intentName: config.intentName,
+      provider: config.provider,
+      message: "ไม่สามารถเตรียม URL ภายในสำหรับแผนที่ VALLARIS ที่เลือกได้ครับ"
+    };
+  }
 
   const selectedValues = {
     ...baseSelectedValues,
-    ...(shouldIncludeSecureUrls ? { mapOptions: mapChoices } : {}),
-    type: selectedChoice.value,
-    ...(shouldIncludeSecureUrls && selectedChoice.url ? { url: selectedChoice.url } : {}),
-    templated: selectedChoice.templated
+    type: selectedPublicChoice.value,
+    ...(includeSecureUrls && selectedPublicChoice.url ? { url: selectedPublicChoice.url } : {}),
+    templated: selectedPublicChoice.templated
   };
 
   return {
@@ -1295,18 +1345,11 @@ const buildVallarisLayerPayload = async (
 
   const selectedValues = pickRecord(optionsPayload.selectedValues);
   const styleId = toStringValue(selectedValues.styleId);
-  const mapOptions = Array.isArray(selectedValues.mapOptions)
-    ? selectedValues.mapOptions.filter(isRecord)
-    : [];
   const selectedType = toStringValue(selectedValues.type);
   const selectedUrl = toStringValue(selectedValues.url);
-  const defaultOption = selectedType
-    ? mapOptions.find((option) => toStringValue(option.value) === selectedType || toStringValue(option.type) === selectedType)
-    : mapOptions[0];
-  const type = selectedType || toStringValue(defaultOption?.type) || toStringValue(defaultOption?.value);
-  const url = selectedUrl || toStringValue(defaultOption?.url);
+  const type = selectedType;
 
-  if (!styleId || mapOptions.length === 0 || !type || !url) {
+  if (!styleId || !type || !selectedUrl) {
     return {
       success: false,
       needsOptions: true,
@@ -1324,16 +1367,9 @@ const buildVallarisLayerPayload = async (
     payload: {
       event: "layer_catalog",
       layer: {
-        provider: config.provider,
-        intentName: config.intentName,
         styleId,
-        title: selectedValues.styleTitle,
-        description: selectedValues.description,
         type,
-        url,
-        mapOptions,
-        templated: selectedValues.templated === true || defaultOption?.templated === true,
-        previewUrl: selectedValues.previewUrl
+        url: selectedUrl,
       }
     }
   };

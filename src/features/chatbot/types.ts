@@ -21,7 +21,7 @@ export const chatRequestSchema = t.Object({
   model: t.Optional(t.String({ minLength: 1, error: "modle is" })),
   feeling: t.Optional(t.String({default:"normal"})),
   is_silent_retry: t.Optional(t.Boolean({default: false})),
-  mapSelection: t.Optional(t.Any())
+  mapselection: t.Optional(t.Any())
 }, {
   // ปิดรับ field อื่นที่ไม่กำหนดใน schema  userId
   additionalProperties: false
