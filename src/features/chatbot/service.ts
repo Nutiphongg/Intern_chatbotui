@@ -8,6 +8,7 @@ import { env } from '../../lib/env';
 import {
     mapToolSchema,
     handleMapTool,
+    buildMapStylePayload,
     checkMapAccessSchema,
     handleCheckMapAccess,
     mapOptionToolSchema,
@@ -317,6 +318,8 @@ const hydrateChatAttachmentUrls = async (metadata: unknown): Promise<unknown> =>
 const getStreamErrorMessage = (error: unknown): string => {
     const message = error instanceof Error ? error.message : '';
     if (message.startsWith('attachment_upload_failed')) return 'attachment_upload_failed';
+    if (message.toLowerCase().includes('map')) return 'map_stream_failed';
+    if (message.toLowerCase().includes('vallaris')) return 'map_stream_failed';
     return 'stream_failed';
 };
 
@@ -1059,6 +1062,13 @@ export const processChatMessageStream = (
                             payload
                         });
                     };
+                    const writeMapResultEvents = async (payload: unknown) => {
+                        writeSse(controller, 'map', payload);
+                        const styleResult = await buildMapStylePayload(payload, {
+                            instruction: hasUserMessage ? message : undefined
+                        });
+                        writeSse(controller, 'map_style', styleResult);
+                    };
                     const saveAssistantMessage = async (
                         content: string,
                         metadata?: Prisma.InputJsonObject,
@@ -1213,7 +1223,7 @@ export const processChatMessageStream = (
 If the user asks for map/layer data and there is no complete mapSelection yet, do not ask a normal text follow-up first. Call the map_options tool immediately so the backend can return DB/API-backed choices.
 DB-backed map choice context for semantic matching: ${JSON.stringify(mapChoiceContext)}
 Inferred params already extracted from the latest user message by the map inference pass: ${JSON.stringify(inferredMapArgs || {})}
-For VALLARIS, always include the latest user message in query/message when calling map_options or get_map_layer. The backend will fetch the configured style endpoint, enrich empty descriptions from metadata/stylesheet links, match the requested topic to styleId, then ask the user to choose from the map links exposed by that style using each link title as the user-facing label. Never expose provider API keys in map_options choices.
+For VALLARIS, always include the latest user message in query/message when calling map_options or get_map_layer. Pick the intentName by matching the user request with each config's intentName, type, handler, itemType, and optionKey from the DB-backed context. If the config handler is collection_detail or has an itemType such as Tile/CoverageTile, call map_options for layerId choices from the collection endpoint. If the config is a style catalog, the backend will match styleId and ask for map type links. Never expose provider API keys in map_options choices.
 Infer params from the user's wording and the DB-backed enum descriptions in the map_options tool schema, including natural day/date wording into the matching dayPath choice value. Include inferred values in map_options.params. Do not call map_options with empty params when the user's wording already matches a choice. If the user already selected values in mapSelection, keep those values and continue with the next missing option.
 For URL/template placeholders, ask the user using only the DB-backed map_options choices. When hazard/dayPath/type or other required placeholders are complete, call get_map_layer with params.`
                         };
@@ -1263,7 +1273,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                                 if (mapResult.success) {
                                     await clearMapSelectionState();
-                                    writeSse(controller, 'map', mapResult.payload);
+                                    await writeMapResultEvents(mapResult.payload);
                                     const mapMetadata = toPrismaJsonObject(mapResult.payload);
                                     const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';
                                     const assistantMessageId = await saveAssistantMessage(
@@ -1444,7 +1454,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                                     if (mapResult.success) {
                                         await clearMapSelectionState();
-                                        writeSse(controller, 'map', mapResult.payload);
+                                        await writeMapResultEvents(mapResult.payload);
                                         mapMetadata = toPrismaJsonObject(mapResult.payload);
 
                                         const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';
@@ -1480,7 +1490,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                             if (mapResult.success) {
                                 await clearMapSelectionState();
-                                writeSse(controller, 'map', mapResult.payload);
+                                await writeMapResultEvents(mapResult.payload);
                                 mapMetadata = toPrismaJsonObject(mapResult.payload);
 
                                 const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';
@@ -1536,7 +1546,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                                     if (mapResult.success) {
                                         await clearMapSelectionState();
-                                        writeSse(controller, 'map', mapResult.payload);
+                                        await writeMapResultEvents(mapResult.payload);
                                         mapMetadata = toPrismaJsonObject(mapResult.payload);
 
                                         const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';

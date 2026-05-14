@@ -1,5 +1,6 @@
 import { prisma } from "../setup/prisma";
 import { decrypt, hashApiKey } from "../setup/encryption";
+import { env } from "../../lib/env";
 import type {
   MapToolArgs,
   MapOptionInfo,
@@ -16,7 +17,18 @@ type ResolvedUserApiKey = {
   iv: string;
 };
 
+type StyleCatalogEntry = {
+  key: string;
+  description?: string;
+  layerType?: string;
+  renderConfig?: unknown;
+};
 
+let styleCatalogCache: {
+  expiresAt: number;
+  sourceUrl: string;
+  entries: StyleCatalogEntry[];
+} | undefined;
 
 const isRecord = (value: unknown): value is Record<string, unknown> => {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -29,6 +41,8 @@ const normalizeProvider = (provider?: string): string => {
 const sameProvider = (left?: string, right?: string): boolean => {
   return normalizeProvider(left) === normalizeProvider(right);
 };
+
+const STYLE_CATALOG_CACHE_TTL_MS = 5 * 60 * 1000;
 
 const getUniqueProviders = (providers: string[]): string[] => {
   return Array.from(new Set(providers.map(normalizeProvider).filter(Boolean)));
@@ -56,6 +70,214 @@ const pickRecord = (value: unknown): Record<string, unknown> => {
   }
 
   return {};
+};
+
+const toRawGithubUrl = (url: string): string => {
+  const trimmedUrl = url.trim();
+  const match = trimmedUrl.match(/^https:\/\/github\.com\/([^/]+)\/([^/]+)\/blob\/([^/]+)\/(.+)$/);
+  if (!match) return trimmedUrl;
+
+  const [, owner, repo, branch, path] = match;
+  return `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}`;
+};
+
+const extractStyleCatalogEntries = (payload: unknown): StyleCatalogEntry[] => {
+  const catalog = pickRecord(payload);
+  return Object.entries(catalog)
+    .map(([key, value]): StyleCatalogEntry | undefined => {
+      const record = pickRecord(value);
+      if (Object.keys(record).length === 0) return undefined;
+      const renderConfig = pickRecord(record.renderConfig);
+      const layerType = toStringValue(renderConfig.layerType);
+
+      return {
+        key,
+        description: toStringValue(record.description),
+        layerType,
+        renderConfig
+      };
+    })
+    .filter((entry): entry is StyleCatalogEntry => Boolean(entry));
+};
+
+export const handleStyleCatalogTool = async () => {
+  const sourceUrl = toRawGithubUrl(env.STYLE_CATALOG_URL);
+  if (!sourceUrl) {
+    return {
+      success: false,
+      styles: [],
+      message: "STYLE_CATALOG_URL is not configured."
+    };
+  }
+
+  if (styleCatalogCache && styleCatalogCache.sourceUrl === sourceUrl && styleCatalogCache.expiresAt > Date.now()) {
+    return {
+      success: true,
+      sourceUrl,
+      styles: styleCatalogCache.entries
+    };
+  }
+
+  try {
+    const response = await fetch(sourceUrl, {
+      headers: {
+        Accept: "application/json"
+      }
+    });
+
+    if (!response.ok) {
+      return {
+        success: false,
+        sourceUrl,
+        styles: [],
+        message: `Style catalog request failed: ${response.status} ${response.statusText}`
+      };
+    }
+
+    const payload = await response.json();
+    const entries = extractStyleCatalogEntries(payload);
+    styleCatalogCache = {
+      sourceUrl,
+      entries,
+      expiresAt: Date.now() + STYLE_CATALOG_CACHE_TTL_MS
+    };
+
+    return {
+      success: true,
+      sourceUrl,
+      styles: entries
+    };
+  } catch (error) {
+    console.error("Style Catalog Tool Error:", error);
+    return {
+      success: false,
+      sourceUrl,
+      styles: [],
+      message: "An error occurred while fetching the style catalog."
+    };
+  }
+};
+
+const normalizeStyleMatchText = (value: unknown): string => {
+  return toCleanString(value)?.toLowerCase().replace(/[\s()[\]{}"'`.,:;|/_-]+/g, "") || "";
+};
+
+const safeMapStyleId = (value: string): string => {
+  return value.replace(/[^a-zA-Z0-9_-]+/g, "-").replace(/^-+|-+$/g, "") || "layer";
+};
+
+const getMapLayerRecord = (payload: unknown): Record<string, unknown> => {
+  const record = pickRecord(payload);
+  return pickRecord(record.layer) || record;
+};
+
+const scoreStyleCatalogEntry = (
+  entry: StyleCatalogEntry,
+  layer: Record<string, unknown>,
+  instruction?: string
+): number => {
+  const layerTerms = [
+    layer.type,
+    layer.title,
+    layer.layerId,
+    instruction
+  ].map(normalizeStyleMatchText).filter(Boolean);
+  const entryTerms = [
+    entry.key,
+    entry.description,
+    entry.layerType
+  ].map(normalizeStyleMatchText).filter(Boolean);
+
+  return entryTerms.reduce((score, entryTerm) => {
+    const matchedLayerTerm = layerTerms.find((layerTerm) => {
+      return layerTerm.includes(entryTerm) || entryTerm.includes(layerTerm);
+    });
+    return score + (matchedLayerTerm ? Math.min(entryTerm.length, matchedLayerTerm.length) : 0);
+  }, 0);
+};
+
+const chooseStyleCatalogEntry = (
+  entries: StyleCatalogEntry[],
+  layer: Record<string, unknown>,
+  presetKey?: string,
+  instruction?: string
+): StyleCatalogEntry | undefined => {
+  if (presetKey) {
+    const explicit = entries.find((entry) => entry.key === presetKey);
+    if (explicit) return explicit;
+  }
+
+  const geometryLayerType = geometryTypeToMapLayerType(layer.geometryType)
+    || geometryTypeToMapLayerType(layer.geometry)
+    || geometryTypeToMapLayerType(layer.geomType);
+  const candidateEntries = geometryLayerType
+    ? entries.filter((entry) => entry.layerType === geometryLayerType)
+    : entries;
+
+  return (candidateEntries.length > 0 ? candidateEntries : entries)
+    .map((entry) => ({
+      entry,
+      score: scoreStyleCatalogEntry(entry, layer, instruction)
+    }))
+    .sort((left, right) => right.score - left.score)[0]?.entry;
+};
+
+export const buildMapStylePayload = async (
+  layerPayload: unknown,
+  options: { presetKey?: string; instruction?: string } = {}
+) => {
+  const catalog = await handleStyleCatalogTool();
+  if (!catalog.success || !catalog.styles?.length) {
+    return {
+      success: false,
+      event: "map_style",
+      message: catalog.message || "ไม่พบ style catalog ที่ใช้งานได้ครับ"
+    };
+  }
+
+  const layer = getMapLayerRecord(layerPayload);
+  const layerId = toStringValue(layer.layerId) || toStringValue(layer.id);
+  const selectedEntry = chooseStyleCatalogEntry(catalog.styles, layer, options.presetKey, options.instruction);
+  const renderConfig = pickRecord(selectedEntry?.renderConfig);
+  const layerType = toStringValue(renderConfig.layerType);
+
+  if (!layerId || !selectedEntry || !layerType) {
+    return {
+      success: false,
+      event: "map_style",
+      layerId,
+      message: "ไม่สามารถเลือก style preset ที่เหมาะกับ layer นี้ได้ครับ"
+    };
+  }
+
+  const cleanLayerId = safeMapStyleId(layerId);
+  const sourceId = `source-${cleanLayerId}`;
+  const sourceType = layerType === "raster" ? "raster" : "vector";
+  const sourceLayer = toStringValue(layer.sourceLayer)
+    || toStringValue(layer.source_layer)
+    || toStringValue(layer.layerName)
+    || toStringValue(layer.name)
+    || layerId;
+
+  const mapLayer: Record<string, unknown> = {
+    id: `layer-${cleanLayerId}-${layerType}`,
+    type: layerType,
+    source: sourceId,
+    ...(sourceType === "vector" ? { "source-layer": sourceLayer } : {}),
+    ...(Object.keys(pickRecord(renderConfig.layout)).length > 0 ? { layout: pickRecord(renderConfig.layout) } : {}),
+    ...(Object.keys(pickRecord(renderConfig.paint)).length > 0 ? { paint: pickRecord(renderConfig.paint) } : {})
+  };
+
+  return {
+    success: true,
+    event: "map_style",
+    layerId,
+    preset: selectedEntry.key,
+    description: selectedEntry.description,
+    sourceId,
+    sourceType,
+    layers: [mapLayer]
+  };
 };
 
 const replaceTemplateVariables = (
@@ -362,7 +584,7 @@ const getTemplateOptionKeys = (config: {
   urlTemplate: string;
   layerConfigTemplate: unknown;
 }): string[] => {
-  if (isVectorTileConfig(config.layerConfigTemplate)) {
+  if (isCollectionDetailConfig(config.layerConfigTemplate)) {
     return [getVectorTileOptionKey(config.layerConfigTemplate)];
   }
 
@@ -536,9 +758,15 @@ const collectConfigMatchTerms = (config: {
   layerConfigTemplate?: unknown;
 }): string[] => {
   const template = pickRecord(config.layerConfigTemplate);
+  const collectionQuery = pickRecord(template.collectionQuery);
+  const itemTypeTerms = collectConfigStringValues(collectionQuery.itemType)
+    .filter((value) => normalizeConfigMatchTerm(value).length > 4);
+
   return Array.from(new Set([
     config.intentName,
     ...collectConfigStringValues(template.type),
+    ...collectConfigStringValues(template.handler),
+    ...itemTypeTerms,
     ...collectConfigStringValues(template.keywords),
     ...collectConfigStringValues(template.aliases),
     ...collectConfigStringValues(template.matchTerms),
@@ -794,12 +1022,20 @@ const buildVallarisCatalogUrl = (
 
 const VECTOR_TILE_CHOICE_LIMIT = 8;
 
-const isVectorTileConfig = (layerConfigTemplate: unknown): boolean => {
-  return toStringValue(pickRecord(layerConfigTemplate).type)?.toLowerCase() === "vector_tile";
+const isCollectionDetailConfig = (layerConfigTemplate: unknown): boolean => {
+  const template = pickRecord(layerConfigTemplate);
+  const handler = toStringValue(template.handler)?.toLowerCase();
+  if (handler === "collection_detail") return true;
+
+  return Boolean(template.collectionQuery && toStringValue(template.detailUrlTemplate));
 };
 
 const getVectorTileOptionKey = (layerConfigTemplate: unknown): string => {
   return toStringValue(pickRecord(layerConfigTemplate).optionKey) || "layerId";
+};
+
+const getCollectionDetailType = (layerConfigTemplate: unknown): string => {
+  return toStringValue(pickRecord(layerConfigTemplate).type) || "collection_detail";
 };
 
 const getVectorTileLayerId = (aiArgs: MapToolArgs, optionKey: string): string | undefined => {
@@ -848,6 +1084,52 @@ type VectorTileCollection = {
   id: string;
   title?: string;
   description?: string;
+  geometryType?: string;
+  sourceLayer?: string;
+};
+
+const normalizeGeometryType = (value: unknown): string | undefined => {
+  const geometry = toStringValue(value)?.toLowerCase();
+  if (!geometry) return undefined;
+  if (geometry.includes("point")) return "point";
+  if (geometry.includes("line")) return "line";
+  if (geometry.includes("polygon")) return "polygon";
+  if (geometry.includes("raster") || geometry.includes("image") || geometry.includes("coverage")) return "raster";
+  return geometry;
+};
+
+const geometryTypeToMapLayerType = (value: unknown): string | undefined => {
+  const geometry = normalizeGeometryType(value);
+  if (geometry === "point") return "circle";
+  if (geometry === "line") return "line";
+  if (geometry === "polygon") return "fill";
+  if (geometry === "raster") return "raster";
+  return undefined;
+};
+
+const getDirectGeometryType = (value: unknown): string | undefined => {
+  const record = pickRecord(value);
+  return normalizeGeometryType(record.geometryType)
+    || normalizeGeometryType(record.geometry)
+    || normalizeGeometryType(record.geomType)
+    || normalizeGeometryType(record.geom_type);
+};
+
+const findSourceLayer = (value: unknown, fallback?: string): string | undefined => {
+  const record = pickRecord(value);
+  const direct = toStringValue(record.sourceLayer)
+    || toStringValue(record.source_layer)
+    || toStringValue(record.layerName)
+    || toStringValue(record.name);
+  if (direct) return direct;
+
+  const vectorLayers = Array.isArray(record.vector_layers)
+    ? record.vector_layers
+    : Array.isArray(record.vectorLayers)
+      ? record.vectorLayers
+      : undefined;
+  const firstVectorLayer = vectorLayers?.find(isRecord);
+  return toStringValue(firstVectorLayer?.id) || fallback;
 };
 
 const extractVectorTileCollections = (payload: unknown): VectorTileCollection[] => {
@@ -870,19 +1152,23 @@ const extractVectorTileCollections = (payload: unknown): VectorTileCollection[] 
       return {
         id,
         title: toStringValue(record.title) || toStringValue(record.name) || id,
-        description: toStringValue(record.description)
+        description: toStringValue(record.description),
+        geometryType: getDirectGeometryType(record),
+        sourceLayer: findSourceLayer(record, id)
       };
     })
     .filter((item): item is VectorTileCollection => Boolean(item));
 };
 
-const buildVectorTileChoices = (collections: VectorTileCollection[]): MapOptionChoice[] => {
+const buildVectorTileChoices = (collections: VectorTileCollection[], layerType: string): MapOptionChoice[] => {
   return collections.slice(0, VECTOR_TILE_CHOICE_LIMIT).map((collection) => ({
     label: collection.title || collection.id,
     value: collection.id,
     layerId: collection.id,
     layerTitle: collection.title,
-    type: "vector_tile",
+    type: layerType,
+    ...(collection.geometryType ? { geometryType: collection.geometryType } : {}),
+    ...(collection.sourceLayer ? { sourceLayer: collection.sourceLayer } : {}),
     ...(collection.description ? { description: collection.description } : {})
   }));
 };
@@ -899,7 +1185,7 @@ const fetchVallarisJson = async (url: string): Promise<unknown> => {
   });
 
   if (!response.ok) {
-    throw new Error(`VALLARIS request failed: ${response.status} ${response.statusText}`);
+    throw new Error(`VALLARIS request failed: ${response.status} ${response.statusText} (${createPublicVallarisMapUrl(url)})`);
   }
 
   return response.json();
@@ -1256,6 +1542,7 @@ const buildVectorTileOptionsPayload = async (
 ) => {
   const template = pickRecord(config.layerConfigTemplate);
   const optionKey = getVectorTileOptionKey(config.layerConfigTemplate);
+  const layerType = getCollectionDetailType(config.layerConfigTemplate);
   const collectionsUrl = buildVectorTileUrl(
     config.baseUrl,
     config.urlTemplate,
@@ -1287,8 +1574,8 @@ const buildVectorTileOptionsPayload = async (
       required: true,
       source: "template",
       label: "Layer",
-      description: "เลือก vector tile layer ที่ต้องการใช้",
-      choices: buildVectorTileChoices(collections)
+      description: `เลือก ${layerType} layer ที่ต้องการใช้`,
+      choices: buildVectorTileChoices(collections, layerType)
     };
     return {
       success: true,
@@ -1316,13 +1603,15 @@ const buildVectorTileOptionsPayload = async (
       layerId: selectedCollection.id,
       layerTitle: selectedCollection.title,
       ...(selectedCollection.description ? { description: selectedCollection.description } : {}),
-      type: "vector_tile"
+      ...(selectedCollection.geometryType ? { geometryType: selectedCollection.geometryType } : {}),
+      ...(selectedCollection.sourceLayer ? { sourceLayer: selectedCollection.sourceLayer } : {}),
+      type: layerType
     },
     complete: true,
     intentName: config.intentName,
     provider: config.provider,
     question: undefined,
-    questionHint: "Vector tile layerId is selected. Call get_map_layer to retrieve tile metadata."
+    questionHint: "LayerId is selected. Call get_map_layer to retrieve layer metadata."
   };
 };
 
@@ -1565,6 +1854,7 @@ const buildVectorTileLayerPayload = async (
   aiArgs: MapToolArgs,
   apiKey: string
 ) => {
+  const layerType = getCollectionDetailType(config.layerConfigTemplate);
   const optionKey = getVectorTileOptionKey(config.layerConfigTemplate);
   const layerId = getVectorTileLayerId(aiArgs, optionKey);
   if (!layerId) {
@@ -1574,7 +1864,7 @@ const buildVectorTileLayerPayload = async (
 
   const detailUrlTemplate = toStringValue(pickRecord(config.layerConfigTemplate).detailUrlTemplate);
   if (!detailUrlTemplate) {
-    return { success: false, error: "layerConfigTemplate.detailUrlTemplate สำหรับ vector tile ยังไม่ได้ตั้งค่าครับ" };
+    return { success: false, error: "layerConfigTemplate.detailUrlTemplate สำหรับ collection detail ยังไม่ได้ตั้งค่าครับ" };
   }
 
   const tileDetailUrl = buildVectorTileUrl(config.baseUrl, detailUrlTemplate, apiKey, { id: layerId, layerId });
@@ -1587,13 +1877,17 @@ const buildVectorTileLayerPayload = async (
   const tiles = toPublicStringArray(tileRecord.tiles)
     || toPublicStringArray(tileRecord.tileUrls)
     || toPublicStringArray(tileRecord.tile_urls);
+  const template = pickRecord(config.layerConfigTemplate);
+  const geometryType = getDirectGeometryType(tileRecord)
+    || getDirectGeometryType(template);
+  const sourceLayer = findSourceLayer(tileRecord, layerId);
 
   return {
     success: true,
     payload: {
       event: "layer_catalog",
       layer: {
-        type: "vector_tile",
+        type: layerType,
         layerId,
         title: toStringValue(tileRecord.title) || toStringValue(tileRecord.name),
         url: createVectorTilePublicUrl(tileDetailUrl),
@@ -1601,7 +1895,9 @@ const buildVectorTileLayerPayload = async (
         ...(minzoom !== undefined ? { minzoom } : {}),
         ...(maxzoom !== undefined ? { maxzoom } : {}),
         ...(center ? { center } : {}),
-        ...(bounds ? { bounds } : {})
+        ...(bounds ? { bounds } : {}),
+        ...(geometryType ? { geometryType } : {}),
+        ...(sourceLayer ? { sourceLayer } : {})
       }
     }
   };
@@ -1770,6 +2066,8 @@ export const buildDynamicMapOptionToolSchema = (
 
 export const buildMapOptionChoiceContext = (configs: MapConfigForTools[]) => {
   return configs.map((config) => {
+    const template = pickRecord(config.layerConfigTemplate);
+    const collectionQuery = pickRecord(template.collectionQuery);
     const options = buildTemplateOptionGroups(config)
       .filter((option) => option.choices?.length)
       .map((option) => ({
@@ -1785,6 +2083,10 @@ export const buildMapOptionChoiceContext = (configs: MapConfigForTools[]) => {
     return {
       intentName: config.intentName,
       provider: config.provider,
+      type: toStringValue(template.type),
+      handler: toStringValue(template.handler),
+      itemType: toStringValue(collectionQuery.itemType),
+      optionKey: toStringValue(template.optionKey),
       options
     };
   });
@@ -1829,6 +2131,19 @@ export const mapToolSchema = {
         }
       },
       required: ["intentName", "provider"]
+    }
+  }
+};
+
+export const styleCatalogToolSchema = {
+  type: "function",
+  function: {
+    name: "style_catalog",
+    description: "ดึง catalog style preset สำหรับแต่งแผนที่จาก STYLE_CATALOG_URL เช่น polygon, line, point, raster คืน key/description/layerType ให้ chatbot เลือกใช้ ห้ามเดา style เองถ้ามี catalog ให้เรียก tool นี้ก่อน",
+    parameters: {
+      type: "object",
+      properties: {},
+      required: []
     }
   }
 };
@@ -1900,14 +2215,18 @@ export const handleMapOptionsTool = async (
       },
       select: {
         intentName: true,
-        provider: true
+        provider: true,
+        layerConfigTemplate: true
       },
       orderBy: [
         { provider: "asc" },
         { intentName: "asc" }
       ]
     });
-    const configs = filterConfigsByProviders(allConfigs, allowedProviders);
+    const configs = filterConfigsByQuery(
+      filterConfigsByProviders(allConfigs, allowedProviders),
+      getMapQuery(aiArgs)
+    );
     let intentName = aiArgs.intentName?.trim();
     let provider = normalizeProvider(aiArgs.provider) || undefined;
 
@@ -1988,7 +2307,7 @@ export const handleMapOptionsTool = async (
       };
     }
 
-    if (isVallarisProvider(config.provider) && isVectorTileConfig(config.layerConfigTemplate)) {
+    if (isVallarisProvider(config.provider) && isCollectionDetailConfig(config.layerConfigTemplate)) {
       const userApiKey = allowedKeys.find((apiKey) => sameProvider(apiKey.provider, config.provider));
       if (!userApiKey) {
         return {
@@ -2136,7 +2455,7 @@ export const handleMapTool = async (
       return { error: "เกิดข้อผิดพลาดในการอ่าน API Key ของคุณ อาจมีการตั้งค่าผิดพลาด" };
     }
 
-    if (isVallarisProvider(config.provider) && isVectorTileConfig(config.layerConfigTemplate)) {
+    if (isVallarisProvider(config.provider) && isCollectionDetailConfig(config.layerConfigTemplate)) {
       return buildVectorTileLayerPayload(config, aiArgs, decryptedApiKey);
     }
 
