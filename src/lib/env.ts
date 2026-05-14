@@ -19,8 +19,9 @@ export const env = {
     REFRESH_SECRET: getRequiredEnv('REFRESH_SECRET'),
     JWT_SECRET: getRequiredEnv("JWT_SECRET"),
     OLLAMA_URL: getRequiredEnv('OLLAMA_URL'),
+    VISION_MODEL: getRequiredEnv('VISION_MODEL'),
     ENCRYPTION_KEY:getRequiredEnv('ENCRYPTION_KEY'),
-    GISTDA_API_BASE_URL: getRequiredEnv('GISTDA_API_BASE_URL'),
-    VALLARIS_URL: getRequiredEnv('VALLARIS_URL')
-
+    SUPABASE_URL: getRequiredEnv('SUPABASE_URL'),
+    SUPABASE_SERVICE_ROLE_KEY: getRequiredEnv('SUPABASE_SERVICE_ROLE_KEY'),
+    SUPABASE_CHAT_ATTACHMENTS_BUCKET: getRequiredEnv('SUPABASE_CHAT_ATTACHMENTS_BUCKET')
 };

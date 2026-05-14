@@ -1,0 +1,17 @@
+
+DATABASE_URL="postgresql://postgres.fjrbowzsgjuxfdjgpkwj:Intern_6636A@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres?pgbouncer=true"
+REDIS_URL="redis://localhost:6379"
+# (เผื่อไว้) ตัวนี้เตรียมไว้ใช้กับ Prisma เผื่อในอนาคตจะใช้แก้ไขตาราง
+DIRECT_URL="postgresql://postgres.fjrbowzsgjuxfdjgpkwj:Intern_6636A@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres"
+ACCESS_SECRET=supersecret123
+REFRESH_SECRET=superrefresh456
+JWT_SECRET=mysupersecret789
+OLLAMA_URL="http://localhost:11434"
+VISION_MODEL =  qwen3-vl:8b
+REDIS_URL='redis://localhost:6379'
+ENCRYPTION_KEY = 9dd8d39aca2b08b272f95d3b1c92fb77
+
+SUPABASE_URL=https://fjrbowzsgjuxfdjgpkwj.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImZqcmJvd3pzZ2p1eGZkamdwa3dqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3NTUyNTQwNSwiZXhwIjoyMDkxMTAxNDA1fQ._ZpEUcC-MCHQV3LgO_o21OIys__O9NAMLKhm7Hxs_BM
+SUPABASE_CHAT_ATTACHMENTS_BUCKET=chat-attachments
+

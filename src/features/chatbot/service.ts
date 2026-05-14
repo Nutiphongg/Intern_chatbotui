@@ -5,8 +5,6 @@ import { Errors } from '../../lib/errors';
 import { ChatRequestBody,EditMessageBody } from './types';
 import { ulid } from 'ulid';
 import { env } from '../../lib/env';
-// Old mapv2 tools are disabled while config-map driven tools are being built.
-// import { get_map_layer_catalog, parseMapIntent } from '../mapv2/tools';
 import {
     mapToolSchema,
     handleMapTool,
@@ -24,26 +22,350 @@ import type { Prisma } from '@prisma/client';
 
 const OLLAMA_URL = env.OLLAMA_URL;
 const DEFAULT_CHAT_MODEL = 'qwen2.5';
+const VISION_MODEL = env.VISION_MODEL;
+const SUPABASE_URL = env.SUPABASE_URL.trim().replace(/\/+$/, '').replace(/\/rest\/v1$/, '');
+const SUPABASE_SERVICE_ROLE_KEY = env.SUPABASE_SERVICE_ROLE_KEY.trim();
+const CHAT_ATTACHMENTS_BUCKET = env.SUPABASE_CHAT_ATTACHMENTS_BUCKET;
 const MAX_HISTORY = 10; // จำแค่ 10 ประโยคล่าสุด
 const REDIS_TTL = 3600; // ให้ Redis จำไว้ 1 ชั่วโมง
 const DEFAULT_OUTPUT_TOKENS = 512;
+const MAP_INTENT_ROUTER_TOKENS = 16;
+const MAP_INTENT_ROUTER_TIMEOUT_MS = 12000;
+const VISION_OUTPUT_TOKENS = 192;
+const VISION_REQUEST_TIMEOUT_MS = 45000;
+const CHAT_ATTACHMENT_SIGNED_URL_TTL_SECONDS = 60 * 60 * 24;
+const MAX_CHAT_IMAGES = 3;
+const MAX_CHAT_IMAGE_BYTES = 5 * 1024 * 1024;
+const ALLOWED_CHAT_IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 
-const shouldUseMapV2Tool = (message: string): boolean => {
-    const normalized = message.toLowerCase();
-    const mapWords = [
-        'map', 'maps', 'แมพ', 'แมป', 'แผนที่', 'layer', 'layers',
-        'url', 'wms', 'wmts', 'tms', 'tile', 'tiles', 'ไทล์',
-        'vector', 'vector tile', 'vector tiles', 'mvt', 'pbf', 'เวกเตอร์'
-    ];
-    const mapDomainWords = [
-        'viirs', 'hotspot', 'hotspots', 'ไฟป่า', 'ไฟไหม้', 'จุดความร้อน',
-        'น้ำท่วม', 'flood', 'ภัยแล้ง', 'drought', 'dri',
-        'pm25', 'pm2.5', 'ฝุ่น', 'rainfall', 'rain', 'ฝน',
-        'แผ่นดินไหว', 'earthquake', 'quake', 'seismic'
-    ];
+type ChatImageAttachment = {
+    type: 'image';
+    mimeType: string;
+    size: number;
+    base64: string;
+};
 
-    return mapWords.some((word) => normalized.includes(word))
-        || mapDomainWords.some((word) => normalized.includes(word));
+type StoredChatImageAttachment = {
+    type: 'image';
+    mimeType: string;
+    size: number;
+    bucket: string;
+    path: string;
+};
+
+type ChatHistoryMessage = {
+    id: string;
+    role: string;
+    content: string;
+    created_at: string;
+    is_silent_retry: boolean;
+    metadata?: Prisma.InputJsonObject;
+};
+
+type OllamaModelInfo = {
+    name: string;
+    model?: string;
+    details?: {
+        parameter_size?: string;
+    };
+};
+
+let resolvedVisionModelPromise: Promise<string> | undefined;
+
+const fetchOllamaModels = async (): Promise<OllamaModelInfo[]> => {
+    const response = await fetch(`${OLLAMA_URL}/api/tags`);
+    if (!response.ok) {
+        return [];
+    }
+
+    const data = await response.json() as { models?: OllamaModelInfo[] };
+    return Array.isArray(data.models) ? data.models : [];
+};
+
+const resolveVisionModelName = async (): Promise<string> => {
+    const configuredModel = VISION_MODEL.trim();
+    const models = await fetchOllamaModels();
+    const exactMatch = models.find((model) => model.name === configuredModel);
+    if (exactMatch) return exactMatch.name;
+
+    if (!configuredModel.includes(':')) {
+        const taggedMatch = models.find((model) => model.name.split(':')[0] === configuredModel);
+        if (taggedMatch) return taggedMatch.name;
+    }
+
+    return configuredModel;
+};
+
+const getResolvedVisionModelName = async (): Promise<string> => {
+    resolvedVisionModelPromise ??= resolveVisionModelName().catch((error) => {
+        resolvedVisionModelPromise = undefined;
+        console.error('[vision] resolve model failed:', error);
+        return VISION_MODEL;
+    });
+
+    return resolvedVisionModelPromise;
+};
+
+const classifyMapAccessIntent = async (
+    message: string,
+    hasImages: boolean,
+    model: string
+): Promise<boolean> => {
+    const trimmedMessage = message.trim();
+    if (!trimmedMessage) return false;
+
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => abortController.abort(), MAP_INTENT_ROUTER_TIMEOUT_MS);
+
+    try {
+        const response = await fetch(`${OLLAMA_URL}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model,
+                stream: false,
+                options: {
+                    temperature: 0,
+                    num_predict: MAP_INTENT_ROUTER_TOKENS
+                },
+                messages: [
+                    {
+                        role: 'system',
+                        content: [
+                            'Classify whether the user is asking to access existing map/layer/tile data from an external map API.',
+                            'Return only JSON: {"intent":"map_access"} or {"intent":"chat"}.',
+                            'Use "map_access" only when the user wants to list, fetch, open, get a URL, get WMS/WMTS/TMS/vector tile, or retrieve map/layer data.',
+                            'Use "chat" for general discussion, explanations, image analysis, or visual/map style advice that does not require fetching existing map data.'
+                        ].join('\n')
+                    },
+                    {
+                        role: 'user',
+                        content: JSON.stringify({
+                            message: trimmedMessage,
+                            hasImages
+                        })
+                    }
+                ]
+            }),
+            signal: abortController.signal
+        }).finally(() => clearTimeout(timeout));
+
+        if (!response.ok) return false;
+
+        const payload = await response.json() as { message?: { content?: string } };
+        const content = payload.message?.content?.trim() || '';
+        const jsonMatch = content.match(/\{[\s\S]*\}/);
+        const parsed = JSON.parse(jsonMatch?.[0] || content) as { intent?: string };
+        return parsed.intent === 'map_access';
+    } catch (error) {
+        console.error('[map-intent] classify failed:', error);
+        return false;
+    }
+};
+
+const collectChatImages = (body: ChatRequestBody): string[] => {
+    return Array.isArray(body.images)
+        ? body.images.filter((image): image is string => typeof image === 'string' && Boolean(image.trim()))
+        : [];
+};
+
+const parseChatImage = (value: string): ChatImageAttachment => {
+    const cleanValue = value.trim();
+    const match = cleanValue.match(/^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=\s]+)$/i);
+    const mimeType = match?.[1]?.toLowerCase();
+    const base64 = (match?.[2] || cleanValue).replace(/\s/g, '');
+
+    if (!mimeType || !ALLOWED_CHAT_IMAGE_MIME_TYPES.has(mimeType)) {
+        throw Errors.badRequest('unsupported image type');
+    }
+
+    const size = Buffer.byteLength(base64, 'base64');
+    if (size <= 0 || size > MAX_CHAT_IMAGE_BYTES) {
+        throw Errors.badRequest('image size is too large');
+    }
+
+    return {
+        type: 'image',
+        mimeType,
+        size,
+        base64
+    };
+};
+
+const getImageExtension = (mimeType: string): string => {
+    if (mimeType === 'image/jpeg') return 'jpg';
+    if (mimeType === 'image/webp') return 'webp';
+    return 'png';
+};
+
+const encodeStoragePath = (path: string): string => {
+    return path.split('/').map(encodeURIComponent).join('/');
+};
+
+const assertSupabaseStorageConfigured = () => {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !CHAT_ATTACHMENTS_BUCKET) {
+        console.error('[chat-attachments] Supabase storage env is not configured');
+        throw Errors.internalServerError();
+    }
+};
+
+const uploadChatImageAttachments = async (
+    images: ChatImageAttachment[],
+    userId: string,
+    conversationId: string,
+    messageId: string
+): Promise<StoredChatImageAttachment[]> => {
+    if (images.length === 0) return [];
+    assertSupabaseStorageConfigured();
+
+    return Promise.all(images.map(async (image, index) => {
+        const extension = getImageExtension(image.mimeType);
+        const fileName = `${String(index + 1).padStart(2, '0')}.${extension}`;
+        const path = `messages/${messageId}/${fileName}`;
+        const response = await fetch(`${SUPABASE_URL}/storage/v1/object/${CHAT_ATTACHMENTS_BUCKET}/${encodeStoragePath(path)}`, {
+            method: 'POST',
+            headers: {
+                apikey: SUPABASE_SERVICE_ROLE_KEY,
+                Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+                'Content-Type': image.mimeType,
+                'Cache-Control': '3600',
+                'x-upsert': 'false'
+            },
+            body: Buffer.from(image.base64, 'base64')
+        });
+
+        if (!response.ok) {
+            const errorText = await response.text().catch(() => '');
+            throw new Error(`attachment_upload_failed: ${response.status} ${response.statusText}${errorText ? ` - ${errorText}` : ''}`);
+        }
+
+        return {
+            type: image.type,
+            mimeType: image.mimeType,
+            size: image.size,
+            bucket: CHAT_ATTACHMENTS_BUCKET,
+            path
+        };
+    }));
+};
+
+const createAttachmentSignedUrl = async (bucket: string, path: string): Promise<string | undefined> => {
+    if (!SUPABASE_URL || !SUPABASE_SERVICE_ROLE_KEY || !bucket || !path) return undefined;
+
+    const response = await fetch(`${SUPABASE_URL}/storage/v1/object/sign/${bucket}/${encodeStoragePath(path)}`, {
+        method: 'POST',
+        headers: {
+            apikey: SUPABASE_SERVICE_ROLE_KEY,
+            Authorization: `Bearer ${SUPABASE_SERVICE_ROLE_KEY}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ expiresIn: CHAT_ATTACHMENT_SIGNED_URL_TTL_SECONDS })
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        console.error(`[chat-attachments] signed url failed: ${response.status} ${response.statusText}${errorText ? ` - ${errorText}` : ''}`);
+        return undefined;
+    }
+
+    const payload = await response.json() as { signedURL?: string; signedUrl?: string };
+    const signedPath = payload.signedURL || payload.signedUrl;
+    if (!signedPath) return undefined;
+
+    if (signedPath.startsWith('http')) return signedPath;
+
+    const normalizedSignedPath = signedPath.startsWith('/storage/v1')
+        ? signedPath
+        : `/storage/v1${signedPath.startsWith('/') ? signedPath : `/${signedPath}`}`;
+    return `${SUPABASE_URL}${normalizedSignedPath}`;
+};
+
+const hydrateChatAttachmentUrls = async (metadata: unknown): Promise<unknown> => {
+    if (!metadata || typeof metadata !== 'object' || Array.isArray(metadata)) {
+        return metadata;
+    }
+
+    const metadataRecord = metadata as Record<string, unknown>;
+    const attachments = Array.isArray(metadataRecord.attachments) ? metadataRecord.attachments : [];
+    if (attachments.length === 0) return metadata;
+
+    const hydratedAttachments = await Promise.all(attachments.map(async (attachment) => {
+        if (!attachment || typeof attachment !== 'object' || Array.isArray(attachment)) {
+            return attachment;
+        }
+
+        const attachmentRecord = attachment as Record<string, unknown>;
+        const bucket = typeof attachmentRecord.bucket === 'string' ? attachmentRecord.bucket : CHAT_ATTACHMENTS_BUCKET;
+        const path = typeof attachmentRecord.path === 'string' ? attachmentRecord.path : undefined;
+        const url = path ? await createAttachmentSignedUrl(bucket, path) : undefined;
+
+        const {
+            dataUrl,
+            base64,
+            url: existingUrl,
+            ...safeAttachment
+        } = attachmentRecord;
+        return url ? { ...safeAttachment, url } : safeAttachment;
+    }));
+
+    return {
+        ...metadataRecord,
+        attachments: hydratedAttachments
+    };
+};
+
+const getStreamErrorMessage = (error: unknown): string => {
+    const message = error instanceof Error ? error.message : '';
+    if (message.startsWith('attachment_upload_failed')) return 'attachment_upload_failed';
+    return 'stream_failed';
+};
+
+const analyzeImagesWithVisionModel = async (
+    images: ChatImageAttachment[],
+    userMessage: string,
+    visionModel: string
+): Promise<string | undefined> => {
+    if (images.length === 0) return undefined;
+
+    const abortController = new AbortController();
+    const timeout = setTimeout(() => abortController.abort(), VISION_REQUEST_TIMEOUT_MS);
+
+    const response = await fetch(`${OLLAMA_URL}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            model: visionModel,
+            stream: false,
+            options: {
+                temperature: 0.1,
+                top_p: 0.8,
+                num_predict: VISION_OUTPUT_TOKENS
+            },
+            messages: [
+                {
+                    role: 'user',
+                    content: [
+                        'You are a vision assistant that summarizes image content for the main chatbot.',
+                        'Return a concise summary based only on visible image evidence. Do not explain your reasoning.',
+                        'Match the user language: answer in Thai when the user asks in Thai, and answer in English when the user asks in English.',
+                        'Include important OCR text if visible.',
+                        'If the user asks about map styling, include colors, visual theme, and practical map style hints.',
+                        `User question: ${userMessage || '(no text question; image only)'}`
+                    ].join('\n'),
+                    images: images.map((image) => image.base64)
+                }
+            ]
+        }),
+        signal: abortController.signal
+    }).finally(() => clearTimeout(timeout));
+
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(`vision model "${visionModel}" request failed: ${response.status} ${response.statusText}${errorText ? ` - ${errorText}` : ''}`);
+    }
+
+    const payload = await response.json() as { message?: { content?: string } };
+    return payload.message?.content?.trim() || undefined;
 };
 
 // const toPrismaJsonObject = (value: unknown): Prisma.InputJsonObject => {
@@ -213,6 +535,8 @@ const compactMapOption = (option: unknown) => {
                     description: typeof choiceRecord.description === 'string' ? choiceRecord.description : undefined,
                     ...(url ? { url } : {}),
                     type: typeof choiceRecord.type === 'string' ? choiceRecord.type : undefined,
+                    layerId: typeof choiceRecord.layerId === 'string' ? choiceRecord.layerId : undefined,
+                    layerTitle: typeof choiceRecord.layerTitle === 'string' ? choiceRecord.layerTitle : undefined,
                     styleId: typeof choiceRecord.styleId === 'string' ? choiceRecord.styleId : undefined,
                     styleTitle: typeof choiceRecord.styleTitle === 'string' ? choiceRecord.styleTitle : undefined,
                     templated: typeof choiceRecord.templated === 'boolean' ? choiceRecord.templated : undefined,
@@ -379,21 +703,21 @@ export const processChatMessageStream = (
     vectorApiKey?: string
 ) => {
     const rawMessage = body?.message ?? '';
+    const rawImages = body ? collectChatImages(body) : [];
+    const hasImages = rawImages.length > 0;
     const mapSelectionPayload = body?.mapselection;
     const hasMapSelection = Boolean(mapSelectionPayload);
     const hasUserMessage = Boolean(rawMessage.trim());
-    const shouldPersistUserMessage = hasUserMessage && !hasMapSelection;
+    const shouldPersistUserMessage = (hasUserMessage || hasImages) && !hasMapSelection;
 
-    if (!body || (!hasUserMessage && !hasMapSelection)) {
+    if (!body || (!hasUserMessage && !hasMapSelection && !hasImages)) {
         throw Errors.badRequest('no message data found');
     }
 
     const isGuest = role === 'guest';
-    const message = rawMessage.trim();
+    const message = rawMessage.trim() || (hasImages ? 'ช่วยดูรูปนี้ให้หน่อย' : '');
     const selectedModel = body.model?.trim() || DEFAULT_CHAT_MODEL;
     const isSilentRetry = body.is_silent_retry === true;
-    const isMapRequest = shouldUseMapV2Tool(message);
-    const shouldHandleMap = isMapRequest || hasMapSelection;
     const mapHeaderApiKey = apiKey?.trim() || vectorApiKey?.trim();
     const hasMapApiKey = Boolean(mapHeaderApiKey);
     const isNewConv = !body.conversationId;
@@ -402,7 +726,7 @@ export const processChatMessageStream = (
     const userMessageCreatedAt = new Date();
     const redisKey = isGuest? `guest_chat:${convId}`:`chat:${convId}`;
     const mapSelectionStateKey = `${redisKey}:map_selection`;
-    const currentUserHistoryMessage = shouldPersistUserMessage
+    const currentUserHistoryMessage: ChatHistoryMessage | undefined = shouldPersistUserMessage
         ? { id: userMessageId, role: 'user', content: message, created_at: userMessageCreatedAt.toISOString(), is_silent_retry: false }
         : undefined;
 
@@ -470,6 +794,49 @@ export const processChatMessageStream = (
                             }
                         }, 10000);
                     }
+                    const imageAttachments = rawImages.slice(0, MAX_CHAT_IMAGES).map(parseChatImage);
+                    if (rawImages.length > MAX_CHAT_IMAGES) {
+                        throw Errors.badRequest(`too many images; max ${MAX_CHAT_IMAGES}`);
+                    }
+                    let visionSummary: string | undefined;
+                    let usedVisionModel = VISION_MODEL;
+                    if (imageAttachments.length > 0) {
+                        usedVisionModel = await getResolvedVisionModelName();
+                        writeSse(controller, 'vision', {
+                            status: 'analyzing',
+                            model: usedVisionModel,
+                            count: imageAttachments.length
+                        });
+                        try {
+                            visionSummary = await analyzeImagesWithVisionModel(imageAttachments, message, usedVisionModel);
+                            writeSse(controller, 'vision', {
+                                status: 'done',
+                                model: usedVisionModel
+                            });
+                        } catch (error) {
+                            console.error('[vision] analyze failed:', error);
+                            writeSse(controller, 'vision', {
+                                status: 'error',
+                                model: usedVisionModel,
+                                message: 'vision_model_failed'
+                            });
+                        }
+                    }
+                    const imageAttachmentMetadata = await uploadChatImageAttachments(
+                        imageAttachments,
+                        userId,
+                        convId,
+                        userMessageId
+                    );
+                    const userMessageMetadata = imageAttachmentMetadata.length > 0
+                        ? toPrismaJsonObject({
+                            attachments: imageAttachmentMetadata,
+                            ...(visionSummary ? { vision: { model: usedVisionModel, summary: visionSummary } } : {})
+                        })
+                        : undefined;
+                    if (currentUserHistoryMessage && userMessageMetadata) {
+                        currentUserHistoryMessage.metadata = userMessageMetadata;
+                    }
                     if (!isGuest) {
                     // จัดการ/ตรวจสอบห้องแชทก่อนบันทึกข้อความ
                         if (isNewConv) {
@@ -527,6 +894,7 @@ export const processChatMessageStream = (
                                     conversation_id: convId,
                                     role: 'user',
                                     content: message,
+                                    metadata: userMessageMetadata,
                                     created_at: userMessageCreatedAt,
                                     is_silent_retry: false
                                 }
@@ -737,7 +1105,15 @@ export const processChatMessageStream = (
                         return assistantMessageId;
                     };
 
-                    if (shouldHandleMap && !hasMapApiKey) {
+                    const wantsMapAccess = hasMapSelection
+                        ? true
+                        : hasUserMessage
+                            ? await classifyMapAccessIntent(message, hasImages, selectedModel)
+                            : false;
+                    const shouldRequireMapApiKey = wantsMapAccess && !hasMapApiKey;
+                    const shouldHandleMap = hasMapSelection || (wantsMapAccess && hasMapApiKey);
+
+                    if (shouldRequireMapApiKey) {
                         writeSse(controller, 'map_error', {
                             message: 'missing_x_api_key',
                             needsApiKey: true,
@@ -813,12 +1189,16 @@ export const processChatMessageStream = (
                     let sentMapAccessEvent = false;
 
                     if (shouldHandleMap) {
-                        const mapAccessResult = await handleCheckMapAccess(userId, mapHeaderApiKey);
+                        const mapAccessResult = await handleCheckMapAccess(
+                            userId,
+                            mapHeaderApiKey,
+                            hasUserMessage ? message : undefined
+                        );
                         writeSse(controller, 'map_access', mapAccessResult);
                         sentMapAccessEvent = true;
 
                         const mapConfigs = mapAccessResult.success
-                            ? await resolveUserMapToolConfigs(userId, mapHeaderApiKey)
+                            ? await resolveUserMapToolConfigs(userId, mapHeaderApiKey, hasUserMessage ? message : undefined)
                             : [];
                         const mapChoiceContext = buildMapOptionChoiceContext(mapConfigs);
                         inferredMapArgs = hasUserMessage && mapChoiceContext.length > 0
@@ -928,11 +1308,18 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             content: `The user selected these map options in the UI. Treat these as DB-backed params/options for get_map_layer, validate via map_options if uncertain, and call get_map_layer when every required placeholder is present: ${JSON.stringify(mapSelectionPayload)}`
                         }
                         : undefined;
+                    const visionContext = visionSummary
+                        ? {
+                            role: 'system',
+                            content: `The user attached image(s). A vision model (${usedVisionModel}) analyzed them before this chat response. Use this analysis as image context; do not claim you directly saw pixels beyond this analysis. If the user asks to style a map from the image, convert visual colors/themes into map styling intent.\n\nVision analysis:\n${visionSummary}`
+                        }
+                        : undefined;
 
                     const messagesForOllama = [
                         systemMessage,
                         ...sanitizedMessagesForLLM,
                         styleReminder,
+                        ...(visionContext ? [visionContext] : []),
                         ...(mapAccessContext ? [mapAccessContext] : []),
                         ...(mapSelectionContext ? [mapSelectionContext] : []),
                         ...(mapToolContext ? [mapToolContext] : []),
@@ -963,7 +1350,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                     };
                     
                     ollamaAbortController = new AbortController();
-                    const ollamaResponse = await fetch(`${env.OLLAMA_URL}/api/chat`, {
+                    const ollamaResponse = await fetch(`${OLLAMA_URL}/api/chat`, {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify(ollamaPayload),
@@ -1011,7 +1398,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             console.log('พร้อมกับแนบข้อมูลมาให้คือ:', toolCall?.function?.arguments ?? toolCall?.arguments);
 
                             if (toolName === 'check_user_map') {
-                                const accessResult = await handleCheckMapAccess(userId, mapHeaderApiKey);
+                                const accessResult = await handleCheckMapAccess(userId, mapHeaderApiKey, message);
                                 if (!sentMapAccessEvent) {
                                     writeSse(controller, 'map_access', accessResult);
                                     sentMapAccessEvent = true;
@@ -1235,7 +1622,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                     }
                     console.error('LLM Stream Error:', error);
                     // ส่ง error event แทนการปล่อย connection ตายเงียบ
-                    writeSse(controller, 'error', { message: 'stream_failed' });
+                    writeSse(controller, 'error', { message: getStreamErrorMessage(error) });
                     closeSafely();
                 } finally {
                     clearHeartbeat();
@@ -1283,17 +1670,17 @@ export const getChatHistory = async (userId: string, role: string, conversationI
     const pageItems = cached.slice(safeStart, safeEnd);
     
     
-    const messages = pageItems.map((msg) => {
+    const messages = await Promise.all(pageItems.map(async (msg) => {
         const parsed = JSON.parse(msg);
         return {
             id:parsed.id,
             role: parsed.role,
             content: parsed.content,
-            metadata: parsed.metadata,
+            metadata: await hydrateChatAttachmentUrls(parsed.metadata),
             is_silent_retry: parsed.is_silent_retry ?? false,
             created_at: parsed.created_at ?? new Date().toISOString(),
         };
-    });
+    }));
        
 
     return {
@@ -1330,7 +1717,10 @@ export const getChatHistory = async (userId: string, role: string, conversationI
     ]);
 
     // reverse ให้ภายใน page เรียง เก่า→ใหม่ (บนลงล่าง)
-    const messages = dbMessages.reverse();
+    const messages = await Promise.all(dbMessages.reverse().map(async (message) => ({
+        ...message,
+        metadata: await hydrateChatAttachmentUrls(message.metadata)
+    })));
 
     return {
         data: messages,
@@ -1603,25 +1993,17 @@ export const editConvTitle = async (
 }
 
 export const getAvailableModels = async () => {
-    const url = `${env.OLLAMA_URL}/api/tags`; 
-    
     try {
-        const response = await fetch(url);
-
-        if (!response.ok) {
-            // ถ้าเชื่อมต่อได้ แต่ Ollama ฟ้อง Error กลับมา (เช่น 404, 400)
-            const errorText = await response.text();
-            console.error(` Ollama Response Error [Status: ${response.status}]:`, errorText);
-            throw new Error(`Ollama responded with status ${response.status}`);
-        }
-
-        const data = await response.json();
-        const availableModels = data.models.map((model: any) => {
+        const resolvedVisionModel = await getResolvedVisionModelName();
+        const models = await fetchOllamaModels();
+        const availableModels = models
+            .filter((model) => model.name !== resolvedVisionModel)
+            .map((model) => {
             const paramSize = model.details?.parameter_size;
           return {
               id: model.name, 
             name: model.name.split(':')[0].toUpperCase(), 
-            size: paramSize 
+            size: paramSize
           };
         });
 

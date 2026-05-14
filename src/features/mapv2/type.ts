@@ -3,28 +3,6 @@ import { t, Static } from 'elysia';
 export type MapLayerType = string;
 export type HazardType = string;
 export type DayRange = number;
-
-export type GetMapLayerCatalogInput = {
-  hazard: HazardType; 
-  days: DayRange;
-  type: MapLayerType;
-  url?: string;
-  apiKey?: string;
-}
-
-export type MapLayerCatalogResult = {
-  hazard: string;
-  days: number;
-  type: MapLayerType;
-  url: string;
-  layerName?: string;
-  basename?: string;
-  minzoom?: number;
-  maxzoom?: number;
-  center?: number[];
-  bounds?: number[];
-  tiles?: string[];
-}
 //userconfig map
 // 
 //userapikey
@@ -102,6 +80,8 @@ export type MapOptionChoice = {
   description?: string;
   url?: string;
   type?: string;
+  layerId?: string;
+  layerTitle?: string;
   styleId?: string;
   styleTitle?: string;
   templated?: boolean;

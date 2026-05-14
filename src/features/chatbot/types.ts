@@ -21,6 +21,10 @@ export const chatRequestSchema = t.Object({
   model: t.Optional(t.String({ minLength: 1, error: "modle is" })),
   feeling: t.Optional(t.String({default:"normal"})),
   is_silent_retry: t.Optional(t.Boolean({default: false})),
+  images: t.Optional(t.Array(t.String(), {
+    default: [],
+    description: "รูปภาพแบบ data URL/base64 เช่น data:image/jpeg;base64,..."
+  })),
   mapselection: t.Optional(t.Any())
 }, {
   // ปิดรับ field อื่นที่ไม่กำหนดใน schema  userId

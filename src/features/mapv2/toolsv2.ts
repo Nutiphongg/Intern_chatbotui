@@ -1,6 +1,5 @@
 import { prisma } from "../setup/prisma";
 import { decrypt, hashApiKey } from "../setup/encryption";
-import { mapLayerService } from "./service";
 import type {
   MapToolArgs,
   MapOptionInfo,
@@ -45,7 +44,18 @@ const isVallarisProvider = (provider?: string): boolean => {
 };
 
 const pickRecord = (value: unknown): Record<string, unknown> => {
-  return isRecord(value) ? value : {};
+  if (isRecord(value)) return value;
+
+  if (typeof value === "string" && value.trim().startsWith("{")) {
+    try {
+      const parsed = JSON.parse(value);
+      return isRecord(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
+  }
+
+  return {};
 };
 
 const replaceTemplateVariables = (
@@ -352,6 +362,10 @@ const getTemplateOptionKeys = (config: {
   urlTemplate: string;
   layerConfigTemplate: unknown;
 }): string[] => {
+  if (isVectorTileConfig(config.layerConfigTemplate)) {
+    return [getVectorTileOptionKey(config.layerConfigTemplate)];
+  }
+
   return [
     ...extractTemplateKeys(config.urlTemplate),
     ...extractTemplateKeysFromValue(config.layerConfigTemplate)
@@ -453,10 +467,8 @@ const createFallbackLayerName = (
   type: string
 ) => `${hazard}_${dayPath}_${type}`;
 
-const resolveLayerCatalogSummary = async (
-  variables: Record<string, unknown>,
-  finalUrl: string,
-  apiKey: string
+const resolveLayerCatalogSummary = (
+  variables: Record<string, unknown>
 ) => {
   const hazard = toCleanString(variables.hazard);
   const dayPath = toCleanString(variables.dayPath || variables.days);
@@ -467,45 +479,13 @@ const resolveLayerCatalogSummary = async (
     return {};
   }
 
-  const fallbackLayerName = createFallbackLayerName(hazard, dayPath, type);
-
-  try {
-    const catalog = await mapLayerService.getLayerCatalog(
-      {
-        hazard: hazard as any,
-        days,
-        type: type as any,
-        url: finalUrl,
-        apiKey
-      },
-      apiKey,
-      apiKey
-    );
-    const layerName = catalog.layerName || catalog.basename || fallbackLayerName;
-
-    return {
-      hazard,
-      dayPath,
-      days,
-      type,
-      layerName,
-      ...(catalog.basename ? { basename: catalog.basename } : {}),
-      ...(catalog.minzoom !== undefined ? { minzoom: catalog.minzoom } : {}),
-      ...(catalog.maxzoom !== undefined ? { maxzoom: catalog.maxzoom } : {}),
-      ...(catalog.center ? { center: catalog.center } : {}),
-      ...(catalog.bounds ? { bounds: catalog.bounds } : {}),
-      ...(catalog.tiles ? { tiles: catalog.tiles } : {})
-    };
-  } catch (error) {
-    console.error("Map layer catalog lookup error:", error);
-    return {
-      hazard,
-      dayPath,
-      days,
-      type,
-      layerName: fallbackLayerName
-    };
-  }
+  return {
+    hazard,
+    dayPath,
+    days,
+    type,
+    layerName: createFallbackLayerName(hazard, dayPath, type)
+  };
 };
 
 const createAccessOption = (
@@ -536,6 +516,57 @@ const findConfigByIntentProvider = <T extends { intentName: string; provider: st
   ));
 };
 
+const normalizeConfigMatchTerm = (value: string): string => {
+  return value.toLowerCase().replace(/[\s()[\]{}"'`.,:;|/_-]+/g, "");
+};
+
+const collectConfigStringValues = (value: unknown): string[] => {
+  const cleanValue = toCleanString(value);
+  if (cleanValue) return [cleanValue];
+
+  if (Array.isArray(value)) {
+    return value.flatMap(collectConfigStringValues);
+  }
+
+  return [];
+};
+
+const collectConfigMatchTerms = (config: {
+  intentName: string;
+  layerConfigTemplate?: unknown;
+}): string[] => {
+  const template = pickRecord(config.layerConfigTemplate);
+  return Array.from(new Set([
+    config.intentName,
+    ...collectConfigStringValues(template.type),
+    ...collectConfigStringValues(template.keywords),
+    ...collectConfigStringValues(template.aliases),
+    ...collectConfigStringValues(template.matchTerms),
+    ...collectConfigStringValues(template.searchTerms),
+    ...collectConfigStringValues(template.intentKeywords)
+  ]))
+    .map(normalizeConfigMatchTerm)
+    .filter((term) => term.length > 0);
+};
+
+const filterConfigsByQuery = <T extends {
+  intentName: string;
+  layerConfigTemplate?: unknown;
+}>(
+  configs: T[],
+  query?: string
+): T[] => {
+  const normalizedQuery = query ? normalizeConfigMatchTerm(query) : "";
+  if (!normalizedQuery) return configs;
+
+  const matchedConfigs = configs.filter((config) => {
+    const terms = collectConfigMatchTerms(config);
+    return terms.some((term) => normalizedQuery.includes(term));
+  });
+
+  return matchedConfigs.length > 0 ? matchedConfigs : configs;
+};
+
 const buildMapOptionQuestion = (options: MapOptionInfo[]): string | undefined => {
   const keys = options
     .filter((option) => option.required)
@@ -555,6 +586,7 @@ const buildMapOptionQuestion = (options: MapOptionInfo[]): string | undefined =>
     if (key === "hazard") return "สนใจข้อมูลประเภทไหน";
     if (key === "dayPath" || key === "days") return "ต้องการย้อนหลังกี่วัน";
     if (key === "type") return "ต้องการรูปแบบแผนที่แบบไหน";
+    if (key === "layerId") return "ต้องการใช้ layer ไหน";
     if (key === "intentName") return "ต้องการแผนที่แบบไหน";
     if (key === "provider") return "ต้องการใช้ provider ไหน";
     return `ขอค่า ${key}`;
@@ -760,6 +792,105 @@ const buildVallarisCatalogUrl = (
   );
 };
 
+const VECTOR_TILE_CHOICE_LIMIT = 8;
+
+const isVectorTileConfig = (layerConfigTemplate: unknown): boolean => {
+  return toStringValue(pickRecord(layerConfigTemplate).type)?.toLowerCase() === "vector_tile";
+};
+
+const getVectorTileOptionKey = (layerConfigTemplate: unknown): string => {
+  return toStringValue(pickRecord(layerConfigTemplate).optionKey) || "layerId";
+};
+
+const getVectorTileLayerId = (aiArgs: MapToolArgs, optionKey: string): string | undefined => {
+  const containers = [
+    aiArgs,
+    pickRecord(aiArgs.params),
+    pickRecord(aiArgs.options),
+    pickRecord(aiArgs.selectedOptions),
+    pickRecord(aiArgs.variables)
+  ];
+
+  for (const container of containers) {
+    const value = toStringValue(container[optionKey]) || toStringValue(container.layerId);
+    if (value) return value;
+  }
+
+  return undefined;
+};
+
+const buildVectorTileUrl = (
+  baseUrl: string,
+  template: string,
+  apiKey: string,
+  params: Record<string, unknown> = {}
+): string => {
+  const usedKeys = new Set<string>();
+  const renderedTemplate = Object.entries(params).reduce((url, [key, value]) => {
+    const cleanValue = toStringValue(value);
+    if (!cleanValue || !url.includes(`{${key}}`)) return url;
+    usedKeys.add(key);
+    return url.replace(new RegExp(`{${key}}`, "g"), encodeURIComponent(cleanValue));
+  }, template);
+  const base = joinProviderUrl(baseUrl, renderedTemplate);
+  const query = Object.entries(params)
+    .filter(([key, value]) => !usedKeys.has(key) && toStringValue(value))
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(toStringValue(value) || "")}`)
+    .join("&");
+  return appendApiKeyQuery(query ? `${base}${base.includes("?") ? "&" : "?"}${query}` : base, apiKey);
+};
+
+const createVectorTilePublicUrl = (url: string): string => {
+  return createPublicVallarisMapUrl(url);
+};
+
+type VectorTileCollection = {
+  id: string;
+  title?: string;
+  description?: string;
+};
+
+const extractVectorTileCollections = (payload: unknown): VectorTileCollection[] => {
+  const source = Array.isArray(payload)
+    ? payload
+    : isRecord(payload)
+      ? (["collections", "features", "items", "data", "results"]
+        .map((key) => payload[key])
+        .find(Array.isArray) || [payload])
+      : [];
+
+  return source
+    .map((item): VectorTileCollection | undefined => {
+      if (!isRecord(item)) return undefined;
+      const properties = pickRecord(item.properties);
+      const record: Record<string, unknown> = { ...item, ...properties, id: item.id ?? properties.id };
+      const id = toStringValue(record.id) || toStringValue(record.layerId);
+      if (!id) return undefined;
+
+      return {
+        id,
+        title: toStringValue(record.title) || toStringValue(record.name) || id,
+        description: toStringValue(record.description)
+      };
+    })
+    .filter((item): item is VectorTileCollection => Boolean(item));
+};
+
+const buildVectorTileChoices = (collections: VectorTileCollection[]): MapOptionChoice[] => {
+  return collections.slice(0, VECTOR_TILE_CHOICE_LIMIT).map((collection) => ({
+    label: collection.title || collection.id,
+    value: collection.id,
+    layerId: collection.id,
+    layerTitle: collection.title,
+    type: "vector_tile",
+    ...(collection.description ? { description: collection.description } : {})
+  }));
+};
+
+const fetchVectorTileJson = async (url: string): Promise<unknown> => {
+  return fetchVallarisJson(url);
+};
+
 const fetchVallarisJson = async (url: string): Promise<unknown> => {
   const response = await fetch(url, {
     headers: {
@@ -778,7 +909,7 @@ const fetchOptionalVallarisJson = async (url: string): Promise<unknown | undefin
   try {
     return await fetchVallarisJson(url);
   } catch (error) {
-    console.error("VALLARIS enrich lookup error:", error);
+    console.warn("VALLARIS enrich lookup skipped:", error instanceof Error ? error.message : error);
     return undefined;
   }
 };
@@ -1118,6 +1249,83 @@ const buildVallarisStyleChoices = (
   }));
 };
 
+const buildVectorTileOptionsPayload = async (
+  config: { intentName: string; provider: string; baseUrl: string; urlTemplate: string; layerConfigTemplate: unknown },
+  aiArgs: MapToolArgs,
+  apiKey: string
+) => {
+  const template = pickRecord(config.layerConfigTemplate);
+  const optionKey = getVectorTileOptionKey(config.layerConfigTemplate);
+  const collectionsUrl = buildVectorTileUrl(
+    config.baseUrl,
+    config.urlTemplate,
+    apiKey,
+    pickRecord(template.collectionQuery)
+  );
+  const collections = extractVectorTileCollections(await fetchVectorTileJson(collectionsUrl));
+  const selectedLayerId = getVectorTileLayerId(aiArgs, optionKey);
+  const selectedCollection = selectedLayerId
+    ? collections.find((collection) => collection.id === selectedLayerId)
+    : undefined;
+
+  if (collections.length === 0) {
+    return {
+      success: false,
+      needInfo: false,
+      missingKeys: [],
+      options: [],
+      complete: false,
+      intentName: config.intentName,
+      provider: config.provider,
+      message: "ไม่พบรายการ vector tile layer จาก VALLARIS ครับ"
+    };
+  }
+
+  if (!selectedCollection) {
+    const layerOption: MapOptionInfo = {
+      key: optionKey,
+      required: true,
+      source: "template",
+      label: "Layer",
+      description: "เลือก vector tile layer ที่ต้องการใช้",
+      choices: buildVectorTileChoices(collections)
+    };
+    return {
+      success: true,
+      needInfo: true,
+      missingKeys: [optionKey],
+      options: [layerOption],
+      choices: [layerOption],
+      selectedValues: {},
+      complete: false,
+      intentName: config.intentName,
+      provider: config.provider,
+      question: buildMapOptionQuestion([layerOption]),
+      questionHint: "Ask the user to choose one vector tile layerId from these DB/API-backed choices."
+    };
+  }
+
+  return {
+    success: true,
+    needInfo: false,
+    missingKeys: [],
+    options: [],
+    choices: [],
+    selectedValues: {
+      [optionKey]: selectedCollection.id,
+      layerId: selectedCollection.id,
+      layerTitle: selectedCollection.title,
+      ...(selectedCollection.description ? { description: selectedCollection.description } : {}),
+      type: "vector_tile"
+    },
+    complete: true,
+    intentName: config.intentName,
+    provider: config.provider,
+    question: undefined,
+    questionHint: "Vector tile layerId is selected. Call get_map_layer to retrieve tile metadata."
+  };
+};
+
 const resolveVallarisStyleSelection = async (
   config: { baseUrl: string; urlTemplate: string },
   aiArgs: MapToolArgs,
@@ -1323,6 +1531,79 @@ const buildVallarisOptionsPayload = async (
     provider: config.provider,
     question: undefined,
     questionHint: "VALLARIS styleId and map type are selected. Call get_map_layer to recompute the secure URL."
+  };
+};
+
+const toNumberValue = (value: unknown): number | undefined => {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.trim()) {
+    const numberValue = Number(value);
+    return Number.isFinite(numberValue) ? numberValue : undefined;
+  }
+  return undefined;
+};
+
+const toNumberArray = (value: unknown): number[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  const values = value
+    .map(toNumberValue)
+    .filter((item): item is number => item !== undefined);
+  return values.length === value.length ? values : undefined;
+};
+
+const toPublicStringArray = (value: unknown): string[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  const values = value
+    .map(toStringValue)
+    .filter((item): item is string => Boolean(item))
+    .map(createVectorTilePublicUrl);
+  return values.length > 0 ? values : undefined;
+};
+
+const buildVectorTileLayerPayload = async (
+  config: { intentName: string; provider: string; baseUrl: string; urlTemplate: string; layerConfigTemplate: unknown },
+  aiArgs: MapToolArgs,
+  apiKey: string
+) => {
+  const optionKey = getVectorTileOptionKey(config.layerConfigTemplate);
+  const layerId = getVectorTileLayerId(aiArgs, optionKey);
+  if (!layerId) {
+    const optionsPayload = await buildVectorTileOptionsPayload(config, aiArgs, apiKey);
+    return { success: false, needsOptions: true, payload: { event: "map_options", ...optionsPayload } };
+  }
+
+  const detailUrlTemplate = toStringValue(pickRecord(config.layerConfigTemplate).detailUrlTemplate);
+  if (!detailUrlTemplate) {
+    return { success: false, error: "layerConfigTemplate.detailUrlTemplate สำหรับ vector tile ยังไม่ได้ตั้งค่าครับ" };
+  }
+
+  const tileDetailUrl = buildVectorTileUrl(config.baseUrl, detailUrlTemplate, apiKey, { id: layerId, layerId });
+  const tilePayload = pickRecord(await fetchVectorTileJson(tileDetailUrl));
+  const tileRecord = isRecord(tilePayload.data) ? tilePayload.data : tilePayload;
+  const minzoom = toNumberValue(tileRecord.minzoom ?? tileRecord.minZoom);
+  const maxzoom = toNumberValue(tileRecord.maxzoom ?? tileRecord.maxZoom);
+  const center = toNumberArray(tileRecord.center);
+  const bounds = toNumberArray(tileRecord.bounds);
+  const tiles = toPublicStringArray(tileRecord.tiles)
+    || toPublicStringArray(tileRecord.tileUrls)
+    || toPublicStringArray(tileRecord.tile_urls);
+
+  return {
+    success: true,
+    payload: {
+      event: "layer_catalog",
+      layer: {
+        type: "vector_tile",
+        layerId,
+        title: toStringValue(tileRecord.title) || toStringValue(tileRecord.name),
+        url: createVectorTilePublicUrl(tileDetailUrl),
+        ...(tiles ? { tiles } : {}),
+        ...(minzoom !== undefined ? { minzoom } : {}),
+        ...(maxzoom !== undefined ? { maxzoom } : {}),
+        ...(center ? { center } : {}),
+        ...(bounds ? { bounds } : {})
+      }
+    }
   };
 };
 
@@ -1707,6 +1988,31 @@ export const handleMapOptionsTool = async (
       };
     }
 
+    if (isVallarisProvider(config.provider) && isVectorTileConfig(config.layerConfigTemplate)) {
+      const userApiKey = allowedKeys.find((apiKey) => sameProvider(apiKey.provider, config.provider));
+      if (!userApiKey) {
+        return {
+          success: false,
+          options: [],
+          message: `ผู้ใช้ไม่มี API Key ที่ใช้งานได้สำหรับ provider ${config.provider} ครับ`
+        };
+      }
+
+      let decryptedApiKey = "";
+      try {
+        decryptedApiKey = decryptUserApiKey(userApiKey);
+      } catch (error) {
+        console.error("Decrypt VALLARIS API key error:", error);
+        return {
+          success: false,
+          options: [],
+          message: "เกิดข้อผิดพลาดในการอ่าน API Key ของ VALLARIS"
+        };
+      }
+
+      return buildVectorTileOptionsPayload(config, aiArgs, decryptedApiKey);
+    }
+
     if (isVallarisProvider(config.provider)) {
       const userApiKey = allowedKeys.find((apiKey) => sameProvider(apiKey.provider, config.provider));
       if (!userApiKey) {
@@ -1830,6 +2136,10 @@ export const handleMapTool = async (
       return { error: "เกิดข้อผิดพลาดในการอ่าน API Key ของคุณ อาจมีการตั้งค่าผิดพลาด" };
     }
 
+    if (isVallarisProvider(config.provider) && isVectorTileConfig(config.layerConfigTemplate)) {
+      return buildVectorTileLayerPayload(config, aiArgs, decryptedApiKey);
+    }
+
     if (isVallarisProvider(config.provider)) {
       return buildVallarisLayerPayload(config, aiArgs, decryptedApiKey);
     }
@@ -1917,11 +2227,7 @@ export const handleMapTool = async (
       return { error: "layerConfigTemplate ของ mapconfig ไม่ใช่ JSON ที่ใช้งานได้หลังแทนค่าครับ" };
     }
     const publicLayerConfig = stripLayerConfigMetadata(finalLayerConfig);
-    const catalogSummary = await resolveLayerCatalogSummary(
-      templateVariables,
-      finalUrl,
-      decryptedApiKey
-    );
+    const catalogSummary = resolveLayerCatalogSummary(templateVariables);
 
     return {
       success: true,
@@ -1955,7 +2261,8 @@ export const checkMapAccessSchema = {
 
 export const resolveUserMapToolConfigs = async (
   userId: string,
-  headerApiKey?: string
+  headerApiKey?: string,
+  query?: string
 ): Promise<MapConfigForTools[]> => {
   const userKeys = await resolveUserMapApiKeys(userId, headerApiKey);
   if (userKeys.length === 0) return [];
@@ -1978,10 +2285,13 @@ export const resolveUserMapToolConfigs = async (
     ]
   });
 
-  return filterConfigsByProviders(configs, allowedProviders);
+  return filterConfigsByQuery(
+    filterConfigsByProviders(configs, allowedProviders),
+    query
+  );
 };
 
-export const handleCheckMapAccess = async (userId: string, headerApiKey?: string) => {
+export const handleCheckMapAccess = async (userId: string, headerApiKey?: string, query?: string) => {
   try {
     const userKeys = await resolveUserMapApiKeys(userId, headerApiKey);
 
@@ -2006,14 +2316,18 @@ export const handleCheckMapAccess = async (userId: string, headerApiKey?: string
         intentName: true,
         provider: true,
         baseUrl: true,
-        urlTemplate: true
+        urlTemplate: true,
+        layerConfigTemplate: true
       },
       orderBy: [
         { provider: "asc" },
         { intentName: "asc" }
       ]
     });
-    const configs = filterConfigsByProviders(allConfigs, allowedProviders);
+    const configs = filterConfigsByQuery(
+      filterConfigsByProviders(allConfigs, allowedProviders),
+      query
+    );
 
     if (configs.length === 0) {
       return {
@@ -2027,7 +2341,7 @@ export const handleCheckMapAccess = async (userId: string, headerApiKey?: string
     return {
       success: true,
       allowedProviders,
-      configs
+      configs: configs.map(({ layerConfigTemplate, ...config }) => config)
     };
   } catch (error) {
     console.error("Check Map Access Error:", error);
@@ -2039,3 +2353,6 @@ export const handleCheckMapAccess = async (userId: string, headerApiKey?: string
     };
   }
 };
+
+
+
