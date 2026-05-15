@@ -7,8 +7,8 @@ datasource db {
 }
 
 model sessions {
-  id            String    @id 
-  user_id       String    
+  id            String    @id
+  user_id       String
   refresh_token String    @unique
   user_agent    String?
   ip_address    String?   @db.VarChar(50)
@@ -21,7 +21,7 @@ model sessions {
 }
 
 model users {
-  id            String          @id 
+  id            String          @id
   email         String          @unique @db.VarChar(255)
   username      String          @unique @db.VarChar(100)
   password_hash String
@@ -29,19 +29,21 @@ model users {
   updated_at    DateTime?       @default(now()) @db.Timestamp(6)
   conversations conversations[]
   sessions      sessions[]
+  user_apikey   user_apikey[]
 
   @@index([email], map: "idx_users_email")
   @@index([username], map: "idx_users_username")
 }
 
 model conversations {
-  id              String     @id 
-  user_id         String?    
+  id              String     @id
+  user_id         String?
   title           String?
-  is_deleted      Boolean    @default(false)
   created_at      DateTime?  @default(now()) @db.Timestamp(6)
   updated_at      DateTime?  @default(now()) @db.Timestamp(6)
   last_message_at DateTime?  @db.Timestamp(6)
+  is_deleted      Boolean    @default(false)
+  is_from_guest   Boolean    @default(false)
   users           users?     @relation(fields: [user_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_conversation_user")
   messages        messages[]
 
@@ -50,8 +52,8 @@ model conversations {
 }
 
 model messages {
-  id              String        @id 
-  conversation_id String        
+  id              String        @id
+  conversation_id String
   role            String        @db.VarChar(20)
   content         String
   created_at      DateTime?     @default(now()) @db.Timestamp(6)
@@ -59,8 +61,55 @@ model messages {
   token_usage     Int?
   response_time   Int?
   metadata        Json?
+  deleted_at      DateTime?
+  is_generate     Boolean       @default(false)
+  is_silent_retry Boolean       @default(false)
   conversations   conversations @relation(fields: [conversation_id], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_message_conversation")
 
   @@index([conversation_id], map: "idx_messages_conversation_id")
   @@index([created_at(sort: Desc)], map: "idx_messages_created_at")
+  @@index([deleted_at])
+}
+
+model SystemSettings {
+  id                Int    @id @default(1)
+  userAccessExpiry  String @default("10m") @map("user_access_expiry")
+  guestAccessExpiry String @default("1h") @map("guest_access_expiry")
+  refreshExpiry     String @default("7d") @map("refresh_expiry")
+
+  @@map("system_settings")
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model mapconfig {
+  id                  String   @id(map: "UserMapConfig_pkey")
+  intentName          String
+  provider            String
+  baseUrl             String
+  urlTemplate         String
+  layerConfigTemplate Json?
+  isActive            Boolean  @default(true)
+  createdAt           DateTime @default(now())
+
+  @@unique([intentName, provider])
+}
+
+/// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
+model user_apikey {
+  id           String    @id(map: "UserApiKey_pkey")
+  userId       String    @map("user_id")
+  provider     String
+  keyName      String
+  encryptedKey String
+  iv           String
+  isActive     Boolean   @default(true)
+  createdAt    DateTime  @default(now())
+  keyHash      String?   @db.VarChar(64)
+  deletedAt    DateTime?
+  users        users     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_user_apikey_user")
+
+  @@index([userId], map: "idx_user_apikey_user_id")
+  @@index([userId, provider, keyName], map: "idx_user_apikey_user_provider_key_name")
+  @@index([keyHash], map: "idx_user_apikey_key_hash")
+  @@index([deletedAt], map: "idx_user_apikey_deleted_at")
 }

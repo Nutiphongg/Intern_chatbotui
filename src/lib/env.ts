@@ -19,5 +19,10 @@ export const env = {
     REFRESH_SECRET: getRequiredEnv('REFRESH_SECRET'),
     JWT_SECRET: getRequiredEnv("JWT_SECRET"),
     OLLAMA_URL: getRequiredEnv('OLLAMA_URL'),
+    VISION_MODEL: getRequiredEnv('VISION_MODEL'),
+    ENCRYPTION_KEY:getRequiredEnv('ENCRYPTION_KEY'),
+    SUPABASE_URL: getRequiredEnv('SUPABASE_URL'),
+    SUPABASE_SERVICE_ROLE_KEY: getRequiredEnv('SUPABASE_SERVICE_ROLE_KEY'),
+    SUPABASE_CHAT_ATTACHMENTS_BUCKET: getRequiredEnv('SUPABASE_CHAT_ATTACHMENTS_BUCKET'),
+    STYLE_CATALOG_URL:getRequiredEnv('STYLE_CATALOG_URL')
 };
-

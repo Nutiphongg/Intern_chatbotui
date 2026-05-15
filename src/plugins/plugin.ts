@@ -17,15 +17,17 @@ export const authPlugin =  (app: Elysia) =>
 
         try {
             // 2. ถอดรหัส Token 
-            const payload = verifyAccessToken(token) as { userId: string };
+            const payload = verifyAccessToken(token) as { userId: string,role: string };
 
           
             return {
                 user: {
-                    id: payload.userId
+                    id: payload.userId,
+                    role: payload.role
+                    
                 }
             };
         } catch (error) {
             throw Errors.invalidToken();
         }
-    });
+    })

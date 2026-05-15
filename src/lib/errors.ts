@@ -5,46 +5,46 @@ import { HttpError } from "./problem";
 export const Errors = {
   userAlreadyExists: () =>
     new HttpError(
-      'email หรือ username นี้มีในระบบแล้ว',
+      'Email or username already exists in the system',
       400,
       'user-already-exists'
     ),
   invalidCredentials: () =>
     new HttpError(
-      'Email หรือ password ไม่ถูกต้อง',
+      'Email or password is incorrect',
       401,
       'invalid-credentials'
     ),
 
   missingToken: () =>
     new HttpError(
-      'ไม่พบ token',
+      'Token not found',
       401,
       'missing-token'
     ),
 
   invalidToken: () =>
     new HttpError(
-      'Token ไม่ถูกต้องหรือหมดอายุ',
+      'Token is invalid or expired',
       401,
       'invalid-token'
     ),
 
   sessionNotFound: () =>
     new HttpError(
-      'Session หมดอายุหรือถูกยกเลิก',
+      'Session has expired or been cancelled',
       401,
       'session-not-found'
     ),
 
-  badRequest: (message = 'คำขอไม่ถูกต้อง') =>
+  badRequest: (message = 'Request is invalid') =>
     new HttpError(
       message,
       400,
       'bad-request'
     ),
 
-  forbidden: (message = 'ไม่มีสิทธิ์เข้าถึงข้อมูลนี้') =>
+  forbidden: (message = 'No permission to access this data') =>
     new HttpError(
       message,
       403,
@@ -53,7 +53,7 @@ export const Errors = {
 
   internalServerError: () =>
     new HttpError(
-      'เกิดข้อผิดพลาดภายในระบบ',
+      'An internal system error occurred',
       500,
       'internal-server-error'
     )

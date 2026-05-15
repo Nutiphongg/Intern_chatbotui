@@ -1,20 +1,46 @@
 import { Elysia } from "elysia";
 import { authRoutes } from "./features/auth/route";
-import { chatRoutes } from "./features/chatbot/route";
+import { chatRoutes } from "./features/chatbot/route"
+import { mapConfigRoutes } from "./features/mapv2/route";
 import { swagger } from "@elysiajs/swagger";
 import { cookie } from "@elysiajs/cookie";
 import { cors } from "@elysiajs/cors";
 import { problem,HttpError } from "./lib/problem";
 import { env } from "./lib/env";
+import { loadJwtConfig } from "./features/auth/jwt";
 
+
+await loadJwtConfig();
 const app = new Elysia()
+
 //ใช้ test
 .use(cors({
   origin:'http://localhost:3000',
   methods: "GET,HEAD,PUT,POST,DELETE,OPTIONS",
-  credentials:true //ส่ง cookie
+  credentials:true, //ส่ง cookie
+  allowedHeaders: ['Content-Type', 'Authorization','ngrok-skip-browser-warning', 'X-API-Key'],
+  exposeHeaders: ['X-Conversation-Id', 'conversation_id']
 }))
-.use(swagger())
+app.use(
+  swagger({
+    documentation: {
+      components: {
+        securitySchemes: {
+          bearerAuth: {
+            type: 'http',
+            scheme: 'bearer',
+            bearerFormat: 'JWT'
+          }
+        }
+      },
+      security: [
+        {
+          bearerAuth: []
+        }
+      ]
+    }
+  })
+)
 .use(cookie())
 app.onError(({ error, set, request }) => {
   set.headers['Content-Type'] = 'application/json'
@@ -45,13 +71,16 @@ app.onError(({ error, set, request }) => {
     instance: request.url
   })
 })
+
 .get("/", () => "welcome to auth api")
+//.use(authRoutes)
 .use(authRoutes)
+//.use(chatRoutes)
 .use(chatRoutes)
+.use(mapConfigRoutes)
 .listen(3000);
 
 
 console.log(
   `🦊 Elysia is running at ${app.server?.hostname}:${app.server?.port}/swagger`
 );
-

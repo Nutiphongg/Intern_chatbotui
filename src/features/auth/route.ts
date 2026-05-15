@@ -1,23 +1,33 @@
 import {Elysia, t} from "elysia";
 import { registerSchema,loginSchema } from "./types";
-import { Register,Login,Refresh,getActiveDevices,Logout } from "./service";
-import { getUserIdFromToken } from "./jwt";
+import { Register,Login,Refresh,getActiveDevices,Logout,createGuestUser } from "./service";
+import { getUserIdFromToken,signAccessToken } from "./jwt";
 import { success } from "../../lib/response";
 import { Errors } from "../../lib/errors";
+import { env } from "../../lib/env";
+import { migrateGuestChatToUser } from "../chatbot/service";
+
 
 export const authRoutes = new Elysia({prefix: '/auth'})
 
   .post('/register',async ({body,set}) => {
-      const user = await Register(body);
+      const {guest_id, ...registerData } = body;
+      const user = await Register(registerData);
+
+      let redirecConversationId = null;
+
+      if(guest_id) {
+        redirecConversationId = await migrateGuestChatToUser(user.id, guest_id);
+      }
       set.status = 201;
-      return success(user,"สมัครสมาชิกสำเร็จ")
+      return success({user,redirecConversationId:redirecConversationId},"สมัครสมาชิกสำเร็จ")
 
   },{
     body: registerSchema
   })
 
-  .post('/login', async ({ body, cookie: { refresh_token },headers,request, set }) => {
-    
+  .post('/sessions', async ({ body, cookie: { refresh_token },headers,request, set }) => {
+      const {guest_id, ...loginData } = body;
       //ดึง  user-agent
       const userAgent = headers['user-agent'] || 'unknown';
       //ngrok proxy แก้ไขถ้าใช้ตัวอื่น
@@ -37,12 +47,18 @@ export const authRoutes = new Elysia({prefix: '/auth'})
         secure: true,//ยิงผ่าน api https
       });
 
+      let redirectConversationId = null;
+
+      if(guest_id) {
+        redirectConversationId = await migrateGuestChatToUser(user.id, guest_id);
+      }
+
       
-      return success({user,accessToken}, "เข้าสู่ระบบสำเร็จ")
+      return success({user,accessToken,redirectConversationId})
   }, {
     body: loginSchema
   })
-  .post('/refresh', async ({ cookie: { refresh_token },headers,request, set }) => {
+  .put('/sessions', async ({ cookie: { refresh_token },headers,request, set }) => {
 
       const userAgent = headers['user-agent'] || 'unknown';
     //ngrok proxy แก้ไขถ้าใช้ตัวอื่น
@@ -67,11 +83,10 @@ export const authRoutes = new Elysia({prefix: '/auth'})
       set.status = 200;
       return success(
       { accessToken: newAccessToken },
-      "refresh สำเร็จ"
     )
   })
 
-  .get('/sessions/devices', async({cookie: {refresh_token} }) => {
+  .get('/sessions', async({cookie: {refresh_token} }) => {
     
       if (!refresh_token.value) {
         throw Errors.missingToken();
@@ -81,9 +96,9 @@ export const authRoutes = new Elysia({prefix: '/auth'})
       // 3. ส่ง userId ไปให้ Service นับจำนวนจาก Database
       const devices = await getActiveDevices(userId);
 
-      return success(devices, "ดึงข้อมูลสำเร็จ") 
+      return success(devices) 
   })
-  .post('/logout', async ({ cookie: { refresh_token }, set }) => {
+  .delete('/sessions', async ({ cookie: { refresh_token }, set }) => {
     
       // 1. ส่งแค่ string ไปให้ Service ลบข้อมูลใน Database
       const result = await Logout(refresh_token.value as string | undefined);
@@ -99,5 +114,25 @@ export const authRoutes = new Elysia({prefix: '/auth'})
       });
 
       return success(null, result.message);
+  })
+  
+  .post('/guests', async ({  set }) => {
+      // 1. สร้าง Guest ID ใน Redis
+      const guest = await createGuestUser();
+      
+      // 2. เอา Guest ID มา Sign เป็น JWT
+      const token = signAccessToken({
+        userId: guest.id,
+        role: 'guest'
+        
+      });
+
+      set.status = 201;
+      return success(
+        { 
+          accessToken: token, 
+          guestId: guest.id 
+        }, 
+      );
   })
     
