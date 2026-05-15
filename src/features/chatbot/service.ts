@@ -1062,12 +1062,20 @@ export const processChatMessageStream = (
                             payload
                         });
                     };
+                    const createMapMetadata = (payload: unknown, mapStylePayload?: unknown): Prisma.InputJsonObject => {
+                        const mapPayload = asRecord(payload);
+                        return toPrismaJsonObject({
+                            ...(Object.keys(mapPayload).length > 0 ? mapPayload : { event: 'layer_catalog', payload }),
+                            ...(mapStylePayload ? { mapStyle: mapStylePayload } : {})
+                        });
+                    };
                     const writeMapResultEvents = async (payload: unknown) => {
                         writeSse(controller, 'map', payload);
                         const styleResult = await buildMapStylePayload(payload, {
                             instruction: hasUserMessage ? message : undefined
                         });
                         writeSse(controller, 'map_style', styleResult);
+                        return styleResult;
                     };
                     const saveAssistantMessage = async (
                         content: string,
@@ -1273,8 +1281,8 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                                 if (mapResult.success) {
                                     await clearMapSelectionState();
-                                    await writeMapResultEvents(mapResult.payload);
-                                    const mapMetadata = toPrismaJsonObject(mapResult.payload);
+                                    const mapStylePayload = await writeMapResultEvents(mapResult.payload);
+                                    const mapMetadata = createMapMetadata(mapResult.payload, mapStylePayload);
                                     const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';
                                     const assistantMessageId = await saveAssistantMessage(
                                         mapSummary,
@@ -1454,8 +1462,8 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                                     if (mapResult.success) {
                                         await clearMapSelectionState();
-                                        await writeMapResultEvents(mapResult.payload);
-                                        mapMetadata = toPrismaJsonObject(mapResult.payload);
+                                        const mapStylePayload = await writeMapResultEvents(mapResult.payload);
+                                        mapMetadata = createMapMetadata(mapResult.payload, mapStylePayload);
 
                                         const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';
                                         assistantReply += mapSummary;
@@ -1490,8 +1498,8 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                             if (mapResult.success) {
                                 await clearMapSelectionState();
-                                await writeMapResultEvents(mapResult.payload);
-                                mapMetadata = toPrismaJsonObject(mapResult.payload);
+                                const mapStylePayload = await writeMapResultEvents(mapResult.payload);
+                                mapMetadata = createMapMetadata(mapResult.payload, mapStylePayload);
 
                                 const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';
                                 assistantReply += mapSummary;
@@ -1546,8 +1554,8 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                                     if (mapResult.success) {
                                         await clearMapSelectionState();
-                                        await writeMapResultEvents(mapResult.payload);
-                                        mapMetadata = toPrismaJsonObject(mapResult.payload);
+                                        const mapStylePayload = await writeMapResultEvents(mapResult.payload);
+                                        mapMetadata = createMapMetadata(mapResult.payload, mapStylePayload);
 
                                         const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';
                                         assistantReply += mapSummary;

@@ -251,7 +251,7 @@ export const buildMapStylePayload = async (
   }
 
   const cleanLayerId = safeMapStyleId(layerId);
-  const sourceId = `source-${cleanLayerId}`;
+  const sourceId = `${cleanLayerId}`;
   const sourceType = layerType === "raster" ? "raster" : "vector";
   const sourceLayer = toStringValue(layer.sourceLayer)
     || toStringValue(layer.source_layer)
@@ -260,7 +260,7 @@ export const buildMapStylePayload = async (
     || layerId;
 
   const mapLayer: Record<string, unknown> = {
-    id: `layer-${cleanLayerId}-${layerType}`,
+    id: `${cleanLayerId}-${layerType}`,
     type: layerType,
     source: sourceId,
     ...(sourceType === "vector" ? { "source-layer": sourceLayer } : {}),
@@ -1021,6 +1021,13 @@ const buildVallarisCatalogUrl = (
 };
 
 const VECTOR_TILE_CHOICE_LIMIT = 8;
+const VECTOR_TILE_GEOMETRY_INFER_TIMEOUT_MS = 2000;
+const VECTOR_TILE_GEOMETRY_CACHE_TTL_MS = 60 * 60 * 1000;
+
+const vectorTileGeometryCache = new Map<string, {
+  expiresAt: number;
+  geometryType: string;
+}>();
 
 const isCollectionDetailConfig = (layerConfigTemplate: unknown): boolean => {
   const template = pickRecord(layerConfigTemplate);
@@ -1849,6 +1856,188 @@ const toPublicStringArray = (value: unknown): string[] | undefined => {
   return values.length > 0 ? values : undefined;
 };
 
+const toStringArray = (value: unknown): string[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  const values = value
+    .map(toStringValue)
+    .filter((item): item is string => Boolean(item));
+  return values.length > 0 ? values : undefined;
+};
+
+const clampTileLatitude = (lat: number): number => {
+  return Math.max(Math.min(lat, 85.05112878), -85.05112878);
+};
+
+const lonLatToTile = (lon: number, lat: number, zoom: number): { x: number; y: number } => {
+  const latRad = clampTileLatitude(lat) * Math.PI / 180;
+  const scale = 2 ** zoom;
+  const x = Math.floor(((lon + 180) / 360) * scale);
+  const y = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * scale);
+  const maxIndex = scale - 1;
+  return {
+    x: Math.max(0, Math.min(maxIndex, x)),
+    y: Math.max(0, Math.min(maxIndex, y))
+  };
+};
+
+const buildVectorTileSampleUrl = (
+  tileTemplates: string[] | undefined,
+  center: number[] | undefined,
+  minzoom: number | undefined,
+  maxzoom: number | undefined
+): string | undefined => {
+  const template = tileTemplates?.[0];
+  const lon = center?.[0];
+  const lat = center?.[1];
+  const centerZoom = center?.[2];
+  if (!template || lon === undefined || lat === undefined) return undefined;
+
+  const rawZoom = Number.isFinite(centerZoom) ? centerZoom as number : maxzoom ?? minzoom ?? 0;
+  const upperZoom = maxzoom ?? rawZoom;
+  const zoom = Math.max(minzoom ?? 0, Math.min(upperZoom, Math.floor(rawZoom)));
+  const { x, y } = lonLatToTile(lon, lat, zoom);
+
+  return template
+    .replace(/%7Bz%7D/gi, "{z}")
+    .replace(/%7Bx%7D/gi, "{x}")
+    .replace(/%7By%7D/gi, "{y}")
+    .replace(/{z}/g, String(zoom))
+    .replace(/{x}/g, String(x))
+    .replace(/{y}/g, String(y));
+};
+
+const fetchVectorTileBytes = async (url: string): Promise<Uint8Array> => {
+  const abortController = new AbortController();
+  const timeout = setTimeout(() => abortController.abort(), VECTOR_TILE_GEOMETRY_INFER_TIMEOUT_MS);
+
+  try {
+    const response = await fetch(url, {
+      headers: {
+        Accept: "application/vnd.mapbox-vector-tile, application/x-protobuf, application/octet-stream"
+      },
+      signal: abortController.signal
+    });
+
+    if (!response.ok) {
+      throw new Error(`tile sample request failed: ${response.status} ${response.statusText}`);
+    }
+
+    return new Uint8Array(await response.arrayBuffer());
+  } finally {
+    clearTimeout(timeout);
+  }
+};
+
+const readPbfVarint = (bytes: Uint8Array, offset: number): { value: number; offset: number } => {
+  let value = 0;
+  let shift = 0;
+  let currentOffset = offset;
+
+  while (currentOffset < bytes.length) {
+    const byte = bytes[currentOffset++] || 0;
+    value += (byte & 0x7f) * (2 ** shift);
+    if ((byte & 0x80) === 0) return { value, offset: currentOffset };
+    shift += 7;
+  }
+
+  return { value, offset: currentOffset };
+};
+
+const skipPbfField = (bytes: Uint8Array, offset: number, wireType: number): number => {
+  if (wireType === 0) return readPbfVarint(bytes, offset).offset;
+  if (wireType === 1) return Math.min(bytes.length, offset + 8);
+  if (wireType === 2) {
+    const length = readPbfVarint(bytes, offset);
+    return Math.min(bytes.length, length.offset + length.value);
+  }
+  if (wireType === 5) return Math.min(bytes.length, offset + 4);
+  return bytes.length;
+};
+
+const readFirstVectorTileFeatureType = (bytes: Uint8Array): number | undefined => {
+  let offset = 0;
+  while (offset < bytes.length) {
+    const tag = readPbfVarint(bytes, offset);
+    offset = tag.offset;
+    const fieldNumber = tag.value >> 3;
+    const wireType = tag.value & 7;
+
+    if (fieldNumber === 3 && wireType === 2) {
+      const layerLength = readPbfVarint(bytes, offset);
+      const layerEnd = Math.min(bytes.length, layerLength.offset + layerLength.value);
+      let layerOffset = layerLength.offset;
+
+      while (layerOffset < layerEnd) {
+        const layerTag = readPbfVarint(bytes, layerOffset);
+        layerOffset = layerTag.offset;
+        const layerFieldNumber = layerTag.value >> 3;
+        const layerWireType = layerTag.value & 7;
+
+        if (layerFieldNumber === 2 && layerWireType === 2) {
+          const featureLength = readPbfVarint(bytes, layerOffset);
+          const featureEnd = Math.min(layerEnd, featureLength.offset + featureLength.value);
+          let featureOffset = featureLength.offset;
+
+          while (featureOffset < featureEnd) {
+            const featureTag = readPbfVarint(bytes, featureOffset);
+            featureOffset = featureTag.offset;
+            const featureFieldNumber = featureTag.value >> 3;
+            const featureWireType = featureTag.value & 7;
+
+            if (featureFieldNumber === 3 && featureWireType === 0) {
+              return readPbfVarint(bytes, featureOffset).value;
+            }
+
+            featureOffset = skipPbfField(bytes, featureOffset, featureWireType);
+          }
+        } else {
+          layerOffset = skipPbfField(bytes, layerOffset, layerWireType);
+        }
+      }
+    } else {
+      offset = skipPbfField(bytes, offset, wireType);
+    }
+  }
+
+  return undefined;
+};
+
+const vectorTileFeatureTypeToGeometryType = (featureType: number | undefined): string | undefined => {
+  if (featureType === 1) return "point";
+  if (featureType === 2) return "line";
+  if (featureType === 3) return "polygon";
+  return undefined;
+};
+
+const inferVectorTileGeometryType = async (
+  layerId: string,
+  tileTemplates: string[] | undefined,
+  center: number[] | undefined,
+  minzoom: number | undefined,
+  maxzoom: number | undefined
+): Promise<string | undefined> => {
+  const cached = vectorTileGeometryCache.get(layerId);
+  if (cached && cached.expiresAt > Date.now()) return cached.geometryType;
+
+  const sampleUrl = buildVectorTileSampleUrl(tileTemplates, center, minzoom, maxzoom);
+  if (!sampleUrl) return undefined;
+
+  try {
+    const bytes = await fetchVectorTileBytes(sampleUrl);
+    const geometryType = vectorTileFeatureTypeToGeometryType(readFirstVectorTileFeatureType(bytes));
+    if (geometryType) {
+      vectorTileGeometryCache.set(layerId, {
+        geometryType,
+        expiresAt: Date.now() + VECTOR_TILE_GEOMETRY_CACHE_TTL_MS
+      });
+    }
+    return geometryType;
+  } catch (error) {
+    console.warn("Vector tile geometry inference skipped:", error instanceof Error ? error.message : error);
+    return undefined;
+  }
+};
+
 const buildVectorTileLayerPayload = async (
   config: { intentName: string; provider: string; baseUrl: string; urlTemplate: string; layerConfigTemplate: unknown },
   aiArgs: MapToolArgs,
@@ -1874,12 +2063,14 @@ const buildVectorTileLayerPayload = async (
   const maxzoom = toNumberValue(tileRecord.maxzoom ?? tileRecord.maxZoom);
   const center = toNumberArray(tileRecord.center);
   const bounds = toNumberArray(tileRecord.bounds);
-  const tiles = toPublicStringArray(tileRecord.tiles)
-    || toPublicStringArray(tileRecord.tileUrls)
-    || toPublicStringArray(tileRecord.tile_urls);
+  const secureTiles = toStringArray(tileRecord.tiles)
+    || toStringArray(tileRecord.tileUrls)
+    || toStringArray(tileRecord.tile_urls);
+  const tiles = secureTiles?.map(createVectorTilePublicUrl);
   const template = pickRecord(config.layerConfigTemplate);
   const geometryType = getDirectGeometryType(tileRecord)
-    || getDirectGeometryType(template);
+    || getDirectGeometryType(template)
+    || await inferVectorTileGeometryType(layerId, secureTiles, center, minzoom, maxzoom);
   const sourceLayer = findSourceLayer(tileRecord, layerId);
 
   return {
@@ -2672,6 +2863,3 @@ export const handleCheckMapAccess = async (userId: string, headerApiKey?: string
     };
   }
 };
-
-
-
