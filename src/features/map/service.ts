@@ -8,7 +8,7 @@ import {
   EncryptedApiKeyRecord,
   CreateApiKeyPayload,
   UpdateApiKeyPayload
-} from '../mapv2/interface';
+} from './interface';
 import { decrypt, encrypt, hashApiKey } from "../setup/encryption";
 import { ulid } from "ulid";
 import { Errors } from "../../lib/errors";

@@ -1,7 +1,7 @@
 import { Elysia } from "elysia";
 import { authRoutes } from "./features/auth/route";
 import { chatRoutes } from "./features/chatbot/route"
-import { mapConfigRoutes } from "./features/mapv2/route";
+import { mapConfigRoutes } from "./features/map/route";
 import { swagger } from "@elysiajs/swagger";
 import { cookie } from "@elysiajs/cookie";
 import { cors } from "@elysiajs/cors";

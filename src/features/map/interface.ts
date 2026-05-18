@@ -1,5 +1,5 @@
 // src/interfaces/mapConfig.interface.ts
-import { CreateApiKeyDTO, UpdateApiKeyDTO } from '../mapv2/type';
+import { CreateApiKeyDTO, UpdateApiKeyDTO } from './type';
 
 export interface CreateApiKeyPayload extends CreateApiKeyDTO {
   userId: string;
