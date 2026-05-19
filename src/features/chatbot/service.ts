@@ -5,6 +5,7 @@ import { Errors } from '../../lib/errors';
 import { ChatRequestBody,EditMessageBody } from './types';
 import { ulid } from 'ulid';
 import { env } from '../../lib/env';
+import { decrypt, hashApiKey } from '../setup/encryption';
 import {
     mapToolSchema,
     handleMapTool,
@@ -74,7 +75,78 @@ type OllamaModelInfo = {
     };
 };
 
+type ConversationApiKeyRecord = {
+    id: string;
+    encryptedKey: string;
+    iv: string;
+};
+
 let resolvedVisionModelPromise: Promise<string> | undefined;
+
+const findConversationApiKey = async (
+    userId: string,
+    conversationId: string
+): Promise<ConversationApiKeyRecord | undefined> => {
+    const rows = await prisma.$queryRaw<ConversationApiKeyRecord[]>`
+        SELECT api_key."id", api_key."encryptedKey", api_key."iv"
+        FROM "conversation_api_keys" conversation_key
+        INNER JOIN "conversations" conversation
+            ON conversation."id" = conversation_key."conversationId"
+        INNER JOIN "user_apikey" api_key
+            ON api_key."id" = conversation_key."userApiKeyId"
+        WHERE conversation_key."conversationId" = ${conversationId}
+            AND conversation."user_id" = ${userId}
+            AND conversation."is_deleted" = false
+            AND api_key."user_id" = ${userId}
+            AND api_key."isActive" = true
+            AND api_key."deletedAt" IS NULL
+        LIMIT 1
+    `;
+
+    return rows[0];
+};
+
+const getConversationXApiKey = async (
+    userId: string,
+    conversationId: string
+): Promise<string | undefined> => {
+    const apiKey = await findConversationApiKey(userId, conversationId);
+    if (!apiKey) return undefined;
+
+    return decrypt(apiKey.encryptedKey, apiKey.iv);
+};
+
+const findUserApiKeyFromHeader = async (
+    userId: string,
+    headerApiKey: string
+): Promise<string | undefined> => {
+    const cleanApiKey = headerApiKey.trim();
+    const keyHash = hashApiKey(cleanApiKey);
+    const existingKey = await prisma.user_apikey.findFirst({
+        where: {
+            userId,
+            keyHash,
+            isActive: true,
+            deletedAt: null
+        },
+        select: { id: true },
+        orderBy: { createdAt: 'desc' }
+    });
+
+    return existingKey?.id;
+};
+
+const linkConversationApiKey = async (
+    conversationId: string,
+    userApiKeyId: string
+): Promise<void> => {
+    await prisma.$executeRaw`
+        INSERT INTO "conversation_api_keys" ("id", "conversationId", "userApiKeyId")
+        VALUES (${ulid()}, ${conversationId}, ${userApiKeyId})
+        ON CONFLICT ("conversationId")
+        DO UPDATE SET "userApiKeyId" = EXCLUDED."userApiKeyId"
+    `;
+};
 
 const fetchOllamaModels = async (): Promise<OllamaModelInfo[]> => {
     const response = await fetch(`${OLLAMA_URL}/api/tags`);
@@ -480,6 +552,123 @@ const resolveRequestedMapStyleKey = (
     return matches[0]?.styleKey;
 };
 
+const toSuggestionString = (value: unknown): string | undefined => {
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+};
+
+const normalizeSuggestionGeometryType = (value: unknown): string | undefined => {
+    const normalized = toSuggestionString(value)?.toLowerCase();
+    if (!normalized) return undefined;
+    if (['point', 'multipoint'].includes(normalized)) return 'point';
+    if (['line', 'linestring', 'multilinestring'].includes(normalized)) return 'line';
+    if (['polygon', 'multipolygon'].includes(normalized)) return 'polygon';
+    if (['raster', 'image'].includes(normalized)) return 'raster';
+    return normalized;
+};
+
+const getSuggestionLayerRecord = (mapPayload: unknown): Record<string, unknown> => {
+    const payloadRecord = asRecord(mapPayload);
+    return asRecord(payloadRecord.layer) || payloadRecord;
+};
+
+const getSuggestionStyleGeometryTypes = (style: unknown): string[] => {
+    const record = asRecord(style);
+    if (!Array.isArray(record.geometryTypes)) return [];
+
+    return Array.from(new Set(
+        record.geometryTypes
+            .map(normalizeSuggestionGeometryType)
+            .filter((value): value is string => Boolean(value))
+    ));
+};
+
+const hasEditableColorPaint = (mapStyle: unknown): boolean => {
+    const layers = asRecord(mapStyle).layers;
+    if (!Array.isArray(layers)) return false;
+
+    return layers.some((layer) => {
+        const paint = asRecord(asRecord(layer).paint);
+        return Object.keys(paint).some((key) => {
+            return key.endsWith('-color') && key !== 'heatmap-color';
+        });
+    });
+};
+
+const buildMapSuggestionsPayload = (
+    mapPayload: unknown,
+    mapStyle: unknown,
+    styleCatalog: unknown
+): Record<string, unknown> | undefined => {
+    const layer = getSuggestionLayerRecord(mapPayload);
+    const styleRecord = asRecord(mapStyle);
+    const catalogRecord = asRecord(styleCatalog);
+    const geometryType = normalizeSuggestionGeometryType(layer.geometryType || styleRecord.geometryType);
+    const activeStyle = toSuggestionString(styleRecord.activeStyle) || toSuggestionString(styleRecord.styleKey);
+    const styles = Array.isArray(catalogRecord.styles) ? catalogRecord.styles : [];
+    const colors = Array.isArray(catalogRecord.colors) ? catalogRecord.colors : [];
+
+    if (!styleRecord.success) return undefined;
+
+    const styleOptions = styles
+        .filter((style) => {
+            if (!geometryType) return true;
+            const styleGeometryTypes = getSuggestionStyleGeometryTypes(style);
+            return styleGeometryTypes.length === 0 || styleGeometryTypes.includes(geometryType);
+        })
+        .map((style) => {
+            const record = asRecord(style);
+            const value = toSuggestionString(record.styleKey) || toSuggestionString(record.key);
+            if (!value) return undefined;
+
+            return {
+                label: toSuggestionString(record.styleName) || value,
+                value
+            };
+        })
+        .filter((option): option is { label: string; value: string } => Boolean(option))
+        .filter((option, index, allOptions) => {
+            return allOptions.findIndex((item) => item.value === option.value) === index;
+        });
+    const nextStyleOption = styleOptions.find((option) => option.value !== activeStyle) || styleOptions[0];
+
+    const colorOptions = colors
+        .map((color) => {
+            const record = asRecord(color);
+            const value = toSuggestionString(record.key);
+            if (!value) return undefined;
+
+            return {
+                label: value,
+                value
+            };
+        })
+        .filter((option): option is { label: string; value: string } => Boolean(option))
+        .slice(0, 6);
+
+    const items = [
+        ...(styleOptions.length > 1
+            ? [{
+                key: 'change_style',
+                label: 'Change style',
+                promptTemplate: `Change the current map layer style to ${nextStyleOption?.value}`
+            }]
+            : []),
+        ...(colorOptions.length > 0 && hasEditableColorPaint(mapStyle)
+            ? [{
+                key: 'change_color',
+                label: 'Change color',
+                promptTemplate: `Change the current map layer primary color to ${colorOptions[3]?.value || colorOptions[0]?.value}`
+            }]
+            : [])
+    ];
+
+    if (items.length === 0) return undefined;
+
+    return {
+        items
+    };
+};
+
 const mergeMapToolArgs = (...argsList: Array<Record<string, unknown> | undefined>) => {
     const merged: Record<string, unknown> = {};
     const mergedParams: Record<string, unknown> = {};
@@ -816,8 +1005,8 @@ export const processChatMessageStream = (
     const message = rawMessage.trim() || (hasImages ? 'ช่วยดูรูปนี้ให้หน่อย' : '');
     const selectedModel = body.model?.trim() || DEFAULT_CHAT_MODEL;
     const isSilentRetry = body.is_silent_retry === true;
-    const mapHeaderApiKey = apiKey?.trim() || vectorApiKey?.trim();
-    const hasMapApiKey = Boolean(mapHeaderApiKey);
+    let mapHeaderApiKey = apiKey?.trim() || vectorApiKey?.trim();
+    let hasMapApiKey = Boolean(mapHeaderApiKey);
     const isNewConv = !body.conversationId;
     const convId = body.conversationId || ulid();
     const userMessageId = ulid();
@@ -958,6 +1147,20 @@ export const processChatMessageStream = (
                                 return;
                             }
                         }
+
+                        if (mapHeaderApiKey) {
+                            const userApiKeyId = await findUserApiKeyFromHeader(userId, mapHeaderApiKey);
+                            if (userApiKeyId) {
+                                await linkConversationApiKey(convId, userApiKeyId);
+                            }
+                        } else {
+                            const conversationApiKey = await getConversationXApiKey(userId, convId);
+                            if (conversationApiKey) {
+                                mapHeaderApiKey = conversationApiKey;
+                                hasMapApiKey = true;
+                            }
+                        }
+
                         if (isSilentRetry && !isNewConv && shouldPersistUserMessage){
                             const latestVisibleUserMessage = await prisma.messages.findFirst({
                                 where: {
@@ -1173,6 +1376,11 @@ export const processChatMessageStream = (
                             instruction: hasUserMessage ? message : undefined
                         });
                         writeSse(controller, 'map_style', styleResult);
+                        const styleCatalog = await handleStyleCatalogTool();
+                        const suggestionsPayload = buildMapSuggestionsPayload(payload, styleResult, styleCatalog);
+                        if (suggestionsPayload) {
+                            writeSse(controller, 'suggestions', suggestionsPayload);
+                        }
                         return styleResult;
                     };
                     const saveAssistantMessage = async (
@@ -1448,6 +1656,10 @@ export const processChatMessageStream = (
 
                             if (styleResult.success) {
                                 writeSse(controller, 'map_style', styleResult);
+                                const suggestionsPayload = buildMapSuggestionsPayload(latestMapPayload, styleResult, styleCatalog);
+                                if (suggestionsPayload) {
+                                    writeSse(controller, 'suggestions', suggestionsPayload);
+                                }
                                 const styleMetadata = createMapMetadata(latestMapPayload, styleResult);
                                 const postReply = await streamPostMapEventReply('map_style', styleResult);
                                 const assistantMessageId = await saveAssistantMessage(
@@ -1807,6 +2019,11 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                                 if (editResult.success) {
                                     writeSse(controller, 'map_style', editResult);
+                                    const styleCatalog = await handleStyleCatalogTool();
+                                    const suggestionsPayload = buildMapSuggestionsPayload(latestMapPayload, editResult, styleCatalog);
+                                    if (suggestionsPayload) {
+                                        writeSse(controller, 'suggestions', suggestionsPayload);
+                                    }
                                     mapMetadata = toPrismaJsonObject({
                                         ...(asRecord(latestMapPayload)),
                                         event: asRecord(latestMapPayload).event || 'map_style',
@@ -2149,9 +2366,11 @@ export const getChatHistory = async (userId: string, role: string, conversationI
         ...message,
         metadata: await hydrateChatAttachmentUrls(message.metadata)
     })));
+    const xApiKey = await getConversationXApiKey(userId, conversationId);
 
     return {
         data: messages,
+        ...(xApiKey ? { xApiKey } : {}),
         pagination: {
             currentPage: page,
             pageSize: limit,
