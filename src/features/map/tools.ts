@@ -21,13 +21,42 @@ type StyleCatalogEntry = {
   key: string;
   description?: string;
   layerType?: string;
+  styleKey?: string;
+  styleName?: string;
+  isDefaultStyle?: boolean;
+  geometryTypes?: string[];
   renderConfig?: unknown;
+};
+
+type StyleColorEntry = {
+  key: string;
+  value: string;
+  role?: string;
+  family?: string;
+  description?: string;
+};
+
+type EditMapStyleArgs = MapToolArgs & {
+  layerId?: string;
+  instruction?: string;
+  target?: string;
+  colorKey?: string;
+  colorKeys?: unknown;
+  colorValue?: string;
+  mix?: unknown;
+  opacity?: number | string;
+  radius?: number | string;
+  size?: number | string;
+  width?: number | string;
+  paint?: unknown;
+  layout?: unknown;
 };
 
 let styleCatalogCache: {
   expiresAt: number;
   sourceUrl: string;
   entries: StyleCatalogEntry[];
+  colors: StyleColorEntry[];
 } | undefined;
 
 const isRecord = (value: unknown): value is Record<string, unknown> => {
@@ -81,23 +110,147 @@ const toRawGithubUrl = (url: string): string => {
   return `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${path}`;
 };
 
-const extractStyleCatalogEntries = (payload: unknown): StyleCatalogEntry[] => {
-  const catalog = pickRecord(payload);
-  return Object.entries(catalog)
-    .map(([key, value]): StyleCatalogEntry | undefined => {
-      const record = pickRecord(value);
-      if (Object.keys(record).length === 0) return undefined;
-      const renderConfig = pickRecord(record.renderConfig);
-      const layerType = toStringValue(renderConfig.layerType);
+const inferGeometryTypesFromStyleGroupKey = (key: string): string[] => {
+  const normalized = key.toLowerCase();
+  const geometryTypes = [
+    normalized.includes("point") ? "point" : undefined,
+    normalized.includes("line") ? "line" : undefined,
+    normalized.includes("polygon") ? "polygon" : undefined,
+    normalized.includes("raster") ? "raster" : undefined
+  ].filter((item): item is string => Boolean(item));
 
-      return {
-        key,
-        description: toStringValue(record.description),
+  return Array.from(new Set(geometryTypes));
+};
+
+const getGeometryTypesFromRecord = (
+  record: Record<string, unknown>,
+  fallbackKey?: string
+): string[] | undefined => {
+  const explicitGeometryTypes = Array.isArray(record.geometryTypes)
+    ? record.geometryTypes.map(normalizeGeometryType).filter((item): item is string => Boolean(item))
+    : [];
+  if (explicitGeometryTypes.length > 0) return explicitGeometryTypes;
+
+  const inferredGeometryTypes = fallbackKey ? inferGeometryTypesFromStyleGroupKey(fallbackKey) : [];
+  return inferredGeometryTypes.length > 0 ? inferredGeometryTypes : undefined;
+};
+
+const parseStyleCatalogMetadata = (block: string): Record<string, string> => {
+  const metadata: Record<string, string> = {};
+  for (const line of block.split(/\r?\n/)) {
+    const match = line.match(/^\s*([A-Za-z][\w-]*)\s*:\s*(.+?)\s*$/);
+    if (!match) continue;
+
+    metadata[match[1]] = match[2];
+  }
+
+  return metadata;
+};
+
+const extractJsonObjectFromText = (text: string, startIndex = 0): unknown => {
+  const objectStart = text.indexOf("{", startIndex);
+  if (objectStart < 0) return undefined;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = objectStart; index < text.length; index++) {
+    const char = text[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+
+    if (char === "{") depth += 1;
+    if (char === "}") depth -= 1;
+
+    if (depth === 0) {
+      try {
+        return JSON.parse(text.slice(objectStart, index + 1));
+      } catch {
+        return undefined;
+      }
+    }
+  }
+
+  return undefined;
+};
+
+const parseStyleCatalogTextColors = (text: string): StyleColorEntry[] => {
+  const colors: StyleColorEntry[] = [];
+  const colorPattern = /^\s*-\s*([A-Za-z][\w-]*)\s*:\s*(#[0-9A-Fa-f]{3,8})\s*$/gm;
+
+  for (const match of text.matchAll(colorPattern)) {
+    colors.push({
+      key: match[1],
+      value: match[2].toUpperCase(),
+      role: "base"
+    });
+  }
+
+  return colors;
+};
+
+const parseStyleCatalogTextEntries = (text: string): StyleCatalogEntry[] => {
+  const entries: StyleCatalogEntry[] = [];
+  const sectionPattern = /---\s*([\s\S]*?)\s*---\s*([\s\S]*?)(?=\n---|$)/g;
+
+  for (const sectionMatch of text.matchAll(sectionPattern)) {
+    const metadata = parseStyleCatalogMetadata(sectionMatch[1]);
+    const groupKey = metadata.title?.trim();
+    if (!groupKey) continue;
+
+    const groupDescription = metadata.description?.trim();
+    const defaultStyle = metadata.defaultStyle?.trim();
+    const groupGeometryTypes = getGeometryTypesFromRecord({}, groupKey);
+    const body = sectionMatch[2];
+    const stylePattern = /###\s*Style Key:\s*([^\r\n]+)([\s\S]*?)(?=\n###\s*Style Key:|\n---|$)/g;
+
+    for (const styleMatch of body.matchAll(stylePattern)) {
+      const styleKey = styleMatch[1].trim();
+      const styleBlock = styleMatch[2];
+      const styleName = styleBlock.match(/\*\*Style Name:\*\*\s*([^\r\n]+)/)?.[1]?.trim();
+      const layerType = styleBlock.match(/\*\*Layer Type:\*\*\s*([^\r\n]+)/)?.[1]?.trim();
+      const paintLabelIndex = styleBlock.search(/\*\*Paint:\*\*/);
+      const paint = paintLabelIndex >= 0
+        ? extractJsonObjectFromText(styleBlock, paintLabelIndex)
+        : undefined;
+
+      if (!styleKey || !layerType || !isRecord(paint)) continue;
+
+      entries.push({
+        key: `${groupKey}:${styleKey}`,
+        description: [
+          styleName,
+          groupDescription
+        ].filter(Boolean).join(" | "),
         layerType,
-        renderConfig
-      };
-    })
-    .filter((entry): entry is StyleCatalogEntry => Boolean(entry));
+        styleKey,
+        styleName,
+        isDefaultStyle: styleKey === defaultStyle,
+        geometryTypes: groupGeometryTypes,
+        renderConfig: {
+          layerType,
+          paint
+        }
+      });
+    }
+  }
+
+  return entries;
 };
 
 export const handleStyleCatalogTool = async () => {
@@ -114,14 +267,15 @@ export const handleStyleCatalogTool = async () => {
     return {
       success: true,
       sourceUrl,
-      styles: styleCatalogCache.entries
+      styles: styleCatalogCache.entries,
+      colors: styleCatalogCache.colors
     };
   }
 
   try {
     const response = await fetch(sourceUrl, {
       headers: {
-        Accept: "application/json"
+        Accept: "text/plain"
       }
     });
 
@@ -134,18 +288,31 @@ export const handleStyleCatalogTool = async () => {
       };
     }
 
-    const payload = await response.json();
-    const entries = extractStyleCatalogEntries(payload);
+    const catalogText = await response.text();
+    const entries = parseStyleCatalogTextEntries(catalogText);
+    const colors = parseStyleCatalogTextColors(catalogText);
+    if (entries.length === 0) {
+      return {
+        success: false,
+        sourceUrl,
+        styles: [],
+        colors,
+        message: "Style catalog text did not contain any valid render styles."
+      };
+    }
+
     styleCatalogCache = {
       sourceUrl,
       entries,
+      colors,
       expiresAt: Date.now() + STYLE_CATALOG_CACHE_TTL_MS
     };
 
     return {
       success: true,
       sourceUrl,
-      styles: entries
+      styles: entries,
+      colors
     };
   } catch (error) {
     console.error("Style Catalog Tool Error:", error);
@@ -160,6 +327,14 @@ export const handleStyleCatalogTool = async () => {
 
 const normalizeStyleMatchText = (value: unknown): string => {
   return toCleanString(value)?.toLowerCase().replace(/[\s()[\]{}"'`.,:;|/_-]+/g, "") || "";
+};
+
+const tokenizeStyleMatchText = (value: unknown): string[] => {
+  const text = toCleanString(value)?.toLowerCase() || "";
+  return text
+    .split(/[\s()[\]{}"'`.,:;|/_-]+/g)
+    .map((item) => item.trim())
+    .filter((item) => item.length >= 2);
 };
 
 const safeMapStyleId = (value: string): string => {
@@ -185,41 +360,54 @@ const scoreStyleCatalogEntry = (
   const entryTerms = [
     entry.key,
     entry.description,
-    entry.layerType
+    entry.layerType,
+    entry.styleKey,
+    entry.styleName
   ].map(normalizeStyleMatchText).filter(Boolean);
 
-  return entryTerms.reduce((score, entryTerm) => {
+  const textScore = entryTerms.reduce((score, entryTerm) => {
     const matchedLayerTerm = layerTerms.find((layerTerm) => {
       return layerTerm.includes(entryTerm) || entryTerm.includes(layerTerm);
     });
     return score + (matchedLayerTerm ? Math.min(entryTerm.length, matchedLayerTerm.length) : 0);
   }, 0);
+  const instructionTerm = normalizeStyleMatchText(instruction);
+  const layerTypeTerm = normalizeStyleMatchText(entry.layerType);
+  const layerTypeScore = instructionTerm && layerTypeTerm && instructionTerm.includes(layerTypeTerm)
+    ? 100
+    : 0;
+  const instructionTokens = new Set(tokenizeStyleMatchText(instruction));
+  const entryTokens = [
+    entry.key,
+    entry.description,
+    entry.layerType,
+    entry.styleKey,
+    entry.styleName
+  ].flatMap(tokenizeStyleMatchText);
+  const tokenScore = entryTokens.reduce((score, token) => {
+    return score + (instructionTokens.has(token) ? 50 : 0);
+  }, 0);
+  const defaultScore = entry.isDefaultStyle ? 1 : 0;
+
+  return textScore + layerTypeScore + tokenScore + defaultScore;
 };
 
-const chooseStyleCatalogEntry = (
+const getCandidateStyleCatalogEntries = (
   entries: StyleCatalogEntry[],
-  layer: Record<string, unknown>,
-  presetKey?: string,
-  instruction?: string
-): StyleCatalogEntry | undefined => {
-  if (presetKey) {
-    const explicit = entries.find((entry) => entry.key === presetKey);
-    if (explicit) return explicit;
-  }
-
-  const geometryLayerType = geometryTypeToMapLayerType(layer.geometryType)
-    || geometryTypeToMapLayerType(layer.geometry)
-    || geometryTypeToMapLayerType(layer.geomType);
-  const candidateEntries = geometryLayerType
-    ? entries.filter((entry) => entry.layerType === geometryLayerType)
+  layer: Record<string, unknown>
+): StyleCatalogEntry[] => {
+  const geometryTypes = [
+    normalizeGeometryType(layer.geometryType),
+    normalizeGeometryType(layer.geometry),
+    normalizeGeometryType(layer.geomType)
+  ].filter((item): item is string => Boolean(item));
+  const uniqueGeometryTypes = new Set(geometryTypes);
+  const geometryAwareEntries = entries.filter((entry) => entry.geometryTypes?.length);
+  const candidateEntries = uniqueGeometryTypes.size > 0 && geometryAwareEntries.length > 0
+    ? geometryAwareEntries.filter((entry) => entry.geometryTypes?.some((geometryType) => uniqueGeometryTypes.has(geometryType)))
     : entries;
 
-  return (candidateEntries.length > 0 ? candidateEntries : entries)
-    .map((entry) => ({
-      entry,
-      score: scoreStyleCatalogEntry(entry, layer, instruction)
-    }))
-    .sort((left, right) => right.score - left.score)[0]?.entry;
+  return candidateEntries.length > 0 ? candidateEntries : entries;
 };
 
 export const buildMapStylePayload = async (
@@ -231,52 +419,355 @@ export const buildMapStylePayload = async (
     return {
       success: false,
       event: "map_style",
-      message: catalog.message || "ไม่พบ style catalog ที่ใช้งานได้ครับ"
+      message: catalog.message || "No usable style catalog was found."
     };
   }
 
   const layer = getMapLayerRecord(layerPayload);
   const layerId = toStringValue(layer.layerId) || toStringValue(layer.id);
-  const selectedEntry = chooseStyleCatalogEntry(catalog.styles, layer, options.presetKey, options.instruction);
-  const renderConfig = pickRecord(selectedEntry?.renderConfig);
-  const layerType = toStringValue(renderConfig.layerType);
+  const candidateEntries = getCandidateStyleCatalogEntries(catalog.styles, layer);
+  const selectedEntry = options.presetKey
+    ? candidateEntries.find((entry) => entry.key === options.presetKey || entry.styleKey === options.presetKey)
+    : candidateEntries[0];
 
-  if (!layerId || !selectedEntry || !layerType) {
+  if (!layerId || !selectedEntry) {
     return {
       success: false,
       event: "map_style",
       layerId,
-      message: "ไม่สามารถเลือก style preset ที่เหมาะกับ layer นี้ได้ครับ"
+      message: "No style matches this layer geometry."
     };
   }
 
-  const cleanLayerId = safeMapStyleId(layerId);
-  const sourceId = `${cleanLayerId}`;
-  const sourceType = layerType === "raster" ? "raster" : "vector";
-  const sourceLayer = toStringValue(layer.sourceLayer)
-    || toStringValue(layer.source_layer)
-    || toStringValue(layer.layerName)
-    || toStringValue(layer.name)
-    || layerId;
-
+  const renderConfig = pickRecord(selectedEntry.renderConfig);
+  const layerType = toStringValue(renderConfig.layerType);
   const mapLayer: Record<string, unknown> = {
-    id: `${cleanLayerId}-${layerType}`,
     type: layerType,
-    source: sourceId,
-    ...(sourceType === "vector" ? { "source-layer": sourceLayer } : {}),
     ...(Object.keys(pickRecord(renderConfig.layout)).length > 0 ? { layout: pickRecord(renderConfig.layout) } : {}),
     ...(Object.keys(pickRecord(renderConfig.paint)).length > 0 ? { paint: pickRecord(renderConfig.paint) } : {})
   };
+  const styleKey = selectedEntry.styleKey || selectedEntry.key;
 
   return {
     success: true,
     event: "map_style",
     layerId,
-    preset: selectedEntry.key,
-    description: selectedEntry.description,
-    sourceId,
-    sourceType,
+    geometryType: toStringValue(layer.geometryType),
+    styleKey,
+    styleName: selectedEntry.styleName,
+    activeStyle: styleKey,
+    defaultStyle: candidateEntries[0]?.styleKey || candidateEntries[0]?.key || styleKey,
     layers: [mapLayer]
+  };
+};
+
+const refreshStyleCatalogTool = async () => {
+  styleCatalogCache = undefined;
+  return handleStyleCatalogTool();
+};
+
+const normalizeColorHex = (value: unknown): string | undefined => {
+  const color = toStringValue(value);
+  if (!color) return undefined;
+  if (/^#[0-9a-f]{3}$/i.test(color)) {
+    const [, r = "", g = "", b = ""] = color;
+    return `#${r}${r}${g}${g}${b}${b}`.toUpperCase();
+  }
+  return /^#[0-9a-f]{6}$/i.test(color) ? color.toUpperCase() : undefined;
+};
+
+const hexToRgb = (hex: string): [number, number, number] | undefined => {
+  const normalized = normalizeColorHex(hex);
+  if (!normalized) return undefined;
+  return [
+    Number.parseInt(normalized.slice(1, 3), 16),
+    Number.parseInt(normalized.slice(3, 5), 16),
+    Number.parseInt(normalized.slice(5, 7), 16)
+  ];
+};
+
+const rgbToHex = ([red, green, blue]: [number, number, number]): string => {
+  return `#${[red, green, blue]
+    .map((value) => Math.max(0, Math.min(255, Math.round(value))).toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase()}`;
+};
+
+const toStringList = (value: unknown): string[] => {
+  if (Array.isArray(value)) {
+    return value.map(toStringValue).filter((item): item is string => Boolean(item));
+  }
+  const stringValue = toStringValue(value);
+  return stringValue ? [stringValue] : [];
+};
+
+const toNumberList = (value: unknown, length: number): number[] => {
+  const values = Array.isArray(value)
+    ? value.map(toNumberValue).filter((item): item is number => item !== undefined)
+    : [];
+  if (values.length !== length) return Array.from({ length }, () => 1 / Math.max(1, length));
+
+  const total = values.reduce((sum, item) => sum + item, 0);
+  if (total <= 0) return Array.from({ length }, () => 1 / Math.max(1, length));
+  return values.map((item) => item / total);
+};
+
+const resolveCatalogColor = (
+  colorKeys: string[],
+  colors: StyleColorEntry[],
+  mix?: unknown
+): string | undefined => {
+  const palette = new Map(colors.map((color) => [color.key.toLowerCase(), color.value]));
+  const resolvedColors = colorKeys
+    .map((key) => normalizeColorHex(palette.get(key.toLowerCase())))
+    .filter((value): value is string => Boolean(value));
+
+  if (resolvedColors.length === 0) return undefined;
+  if (resolvedColors.length === 1) return resolvedColors[0];
+
+  const weights = toNumberList(mix, resolvedColors.length);
+  const mixed = resolvedColors.reduce<[number, number, number]>((sum, color, index) => {
+    const rgb = hexToRgb(color);
+    if (!rgb) return sum;
+    const weight = weights[index] ?? 0;
+    return [
+      sum[0] + rgb[0] * weight,
+      sum[1] + rgb[1] * weight,
+      sum[2] + rgb[2] * weight
+    ];
+  }, [0, 0, 0]);
+
+  return rgbToHex(mixed);
+};
+
+const getEditInstruction = (args: EditMapStyleArgs): string => {
+  return [
+    args.instruction,
+    args.message,
+    args.query,
+    args.request
+  ].map(toStringValue).filter(Boolean).join(" ");
+};
+
+const getEditNumber = (
+  args: EditMapStyleArgs,
+  keys: Array<keyof EditMapStyleArgs>
+): number | undefined => {
+  for (const key of keys) {
+    const value = toNumberValue(args[key]);
+    if (value !== undefined) return value;
+  }
+
+  return undefined;
+};
+
+const buildHeatmapColorRamp = (color: string): unknown[] => {
+  return [
+    "interpolate",
+    ["linear"],
+    ["heatmap-density"],
+    0,
+    "rgba(255,255,255,0)",
+    0.35,
+    color,
+    0.7,
+    color,
+    1,
+    "#ffffff"
+  ];
+};
+
+const shouldPatchPaintColorKey = (key: string): boolean => {
+  return key.endsWith("-color")
+    && !key.includes("stroke")
+    && !key.includes("outline");
+};
+
+const buildColorPatchFromPaint = (
+  paint: Record<string, unknown>,
+  layerType: string,
+  color?: string
+): Record<string, unknown> => {
+  if (!color) return {};
+
+  const patch = Object.fromEntries(
+    Object.keys(paint)
+      .filter(shouldPatchPaintColorKey)
+      .map((key) => [
+        key,
+        key === "heatmap-color" ? buildHeatmapColorRamp(color) : color
+      ])
+  );
+
+  if (Object.keys(patch).length > 0) return patch;
+
+  if (layerType === "circle") return { "circle-color": color };
+  if (layerType === "line") return { "line-color": color };
+  if (layerType === "fill") return { "fill-color": color };
+  if (layerType === "fill-extrusion") return { "fill-extrusion-color": color };
+  if (layerType === "symbol") return { "icon-color": color, "text-color": color };
+  if (layerType === "background") return { "background-color": color };
+  if (layerType === "heatmap") return { "heatmap-color": buildHeatmapColorRamp(color) };
+
+  return {};
+};
+
+const getPaintPatchForLayerType = (
+  layerType: string,
+  args: EditMapStyleArgs,
+  color?: string,
+  existingPaint: Record<string, unknown> = {}
+): Record<string, unknown> => {
+  const explicitPaint = pickRecord(args.paint);
+  const opacity = getEditNumber(args, ["opacity"]);
+  const normalizedOpacity = opacity !== undefined && opacity > 1 ? opacity / 100 : opacity;
+  const colorPatch = buildColorPatchFromPaint(existingPaint, layerType, color);
+
+  if (layerType === "circle") {
+    const radius = getEditNumber(args, ["radius", "size"]);
+    return {
+      ...explicitPaint,
+      ...colorPatch,
+      ...(radius !== undefined ? { "circle-radius": radius } : {}),
+      ...(normalizedOpacity !== undefined ? { "circle-opacity": normalizedOpacity } : {})
+    };
+  }
+
+  if (layerType === "line") {
+    const width = getEditNumber(args, ["width", "size"]);
+    return {
+      ...explicitPaint,
+      ...colorPatch,
+      ...(width !== undefined ? { "line-width": width } : {}),
+      ...(normalizedOpacity !== undefined ? { "line-opacity": normalizedOpacity } : {})
+    };
+  }
+
+  if (layerType === "fill") {
+    return {
+      ...explicitPaint,
+      ...colorPatch,
+      ...(normalizedOpacity !== undefined ? { "fill-opacity": normalizedOpacity } : {})
+    };
+  }
+
+  if (layerType === "fill-extrusion") {
+    return {
+      ...explicitPaint,
+      ...colorPatch,
+      ...(normalizedOpacity !== undefined ? { "fill-extrusion-opacity": normalizedOpacity } : {})
+    };
+  }
+
+  if (layerType === "symbol") {
+    return {
+      ...explicitPaint,
+      ...colorPatch,
+      ...(normalizedOpacity !== undefined ? { "icon-opacity": normalizedOpacity, "text-opacity": normalizedOpacity } : {})
+    };
+  }
+
+  if (layerType === "heatmap") {
+    return {
+      ...explicitPaint,
+      ...colorPatch,
+      ...(normalizedOpacity !== undefined ? { "heatmap-opacity": normalizedOpacity } : {})
+    };
+  }
+
+  if (layerType === "raster") {
+    return {
+      ...explicitPaint,
+      ...colorPatch,
+      ...(normalizedOpacity !== undefined ? { "raster-opacity": normalizedOpacity } : {})
+    };
+  }
+
+  return {
+    ...explicitPaint,
+    ...colorPatch
+  };
+};
+
+export const handleEditMapStyleTool = async (
+  aiArgs: EditMapStyleArgs,
+  currentMapStyle?: unknown
+) => {
+  const currentStyle = pickRecord(currentMapStyle);
+  const currentLayers = Array.isArray(currentStyle.layers) ? currentStyle.layers : [];
+  if (Object.keys(currentStyle).length === 0 || currentLayers.length === 0) {
+    return {
+      success: false,
+      event: "map_style",
+      message: "No recent map_style is available to edit. Please select or display a layer first."
+    };
+  }
+
+  const colorKeys = [
+    ...toStringList(aiArgs.colorKeys),
+    ...toStringList(aiArgs.colorKey)
+  ];
+  const requestedColorValue = normalizeColorHex(aiArgs.colorValue);
+  let catalog = await handleStyleCatalogTool();
+  let colors = catalog.success && Array.isArray(catalog.colors) ? catalog.colors : [];
+  let resolvedColor = requestedColorValue || resolveCatalogColor(colorKeys, colors, aiArgs.mix);
+
+  if (!resolvedColor && colorKeys.length > 0) {
+    catalog = await refreshStyleCatalogTool();
+    colors = catalog.success && Array.isArray(catalog.colors) ? catalog.colors : [];
+    resolvedColor = resolveCatalogColor(colorKeys, colors, aiArgs.mix);
+  }
+
+  if (!resolvedColor && colorKeys.length > 0) {
+    return {
+      success: false,
+      event: "map_style",
+      colorKeys,
+      message: `Color ${colorKeys.join(", ")} was not found in the style catalog colors.`
+    };
+  }
+
+  const requestedLayerId = toStringValue(aiArgs.layerId) || toStringValue(pickRecord(aiArgs.params).layerId);
+  const currentMapLayerId = toStringValue(currentStyle.layerId);
+  const target = toStringValue(aiArgs.target)?.toLowerCase();
+
+  const patchLayer = (layer: unknown) => {
+    const layerRecord = pickRecord(layer);
+    const layerType = toStringValue(layerRecord.type) || "";
+    const targetMatches = !target
+      || target === layerType
+      || (target === "point" && layerType === "circle")
+      || (target === "polygon" && layerType === "fill");
+
+    if (!targetMatches) return layerRecord;
+
+    const paintPatch = getPaintPatchForLayerType(layerType, aiArgs, resolvedColor, pickRecord(layerRecord.paint));
+    const layoutPatch = pickRecord(aiArgs.layout);
+
+    return {
+      ...layerRecord,
+      ...(Object.keys(layoutPatch).length > 0 ? { layout: { ...pickRecord(layerRecord.layout), ...layoutPatch } } : {}),
+      ...(Object.keys(paintPatch).length > 0 ? { paint: { ...pickRecord(layerRecord.paint), ...paintPatch } } : {})
+    };
+  };
+  const layers = currentLayers.map((layer) => {
+    const layerRecord = pickRecord(layer);
+    const layerIdMatches = !requestedLayerId
+      || requestedLayerId === currentMapLayerId
+      || requestedLayerId === toStringValue(layerRecord.id);
+
+    return layerIdMatches ? patchLayer(layerRecord) : layerRecord;
+  });
+
+  return {
+    ...currentStyle,
+    success: true,
+    event: "map_style",
+    layerId: currentMapLayerId,
+    layers,
+    styleInstruction: getEditInstruction(aiArgs),
+    ...(resolvedColor ? { appliedColor: resolvedColor } : {}),
+    ...(colorKeys.length > 0 ? { colorKeys } : {})
   };
 };
 
@@ -807,20 +1298,20 @@ const buildMapOptionQuestion = (options: MapOptionInfo[]): string | undefined =>
   const hasType = keys.includes("type");
 
   if (hasHazard && hasDayPath && hasType) {
-    return "สนใจข้อมูลประเภทไหน ย้อนหลังกี่วัน และต้องการรูปแบบแผนที่แบบไหนครับ";
+    return "Which data type, date range, and map format do you want?";
   }
 
   const questionParts = keys.map((key) => {
-    if (key === "hazard") return "สนใจข้อมูลประเภทไหน";
-    if (key === "dayPath" || key === "days") return "ต้องการย้อนหลังกี่วัน";
-    if (key === "type") return "ต้องการรูปแบบแผนที่แบบไหน";
-    if (key === "layerId") return "ต้องการใช้ layer ไหน";
-    if (key === "intentName") return "ต้องการแผนที่แบบไหน";
-    if (key === "provider") return "ต้องการใช้ provider ไหน";
-    return `ขอค่า ${key}`;
+    if (key === "hazard") return "which data type";
+    if (key === "dayPath" || key === "days") return "how many days back";
+    if (key === "type") return "which map format";
+    if (key === "layerId") return "which layer";
+    if (key === "intentName") return "which map type";
+    if (key === "provider") return "which provider";
+    return `the value for ${key}`;
   });
 
-  return `${questionParts.join(" และ")}ครับ`;
+  return `Please choose ${questionParts.join(" and ")}.`;
 };
 
 type MapQuestionCode =
@@ -833,11 +1324,11 @@ const buildMapQuestion = (
 ): string => {
   if (code === "select_vallaris_style") {
     return context.query
-      ? `ผมเจอหลาย style ที่อาจเกี่ยวกับ "${context.query}" เลือกอันที่ต้องการก่อนครับ`
-      : "ต้องการใช้ style ไหนของ VALLARIS ครับ";
+      ? `I found multiple styles that may match "${context.query}". Please choose one first.`
+      : "Which VALLARIS style do you want to use?";
   }
 
-  return "ต้องการรูปแบบแผนที่แบบไหนครับ";
+  return "Which map format do you want?";
 };
 
 const buildMapOptionDescription = (
@@ -846,13 +1337,13 @@ const buildMapOptionDescription = (
 ): string => {
   if (code === "select_vallaris_style") {
     return context.query
-      ? `เลือก style ที่ตรงกับ "${context.query}"`
-      : "เลือก style ที่ต้องการใช้";
+      ? `Choose the style that matches "${context.query}"`
+      : "Choose the style to use";
   }
 
   return context.styleTitle
-    ? `เลือก type สำหรับ ${context.styleTitle}`
-    : "เลือก type สำหรับ style ที่เลือก";
+    ? `Choose the type for ${context.styleTitle}`
+    : "Choose the type for the selected style";
 };
 
 type VallarisLink = {
@@ -1020,7 +1511,7 @@ const buildVallarisCatalogUrl = (
   );
 };
 
-const VECTOR_TILE_CHOICE_LIMIT = 8;
+const VECTOR_TILE_CHOICE_LIMIT = 15;
 const VECTOR_TILE_GEOMETRY_INFER_TIMEOUT_MS = 2000;
 const VECTOR_TILE_GEOMETRY_CACHE_TTL_MS = 60 * 60 * 1000;
 
@@ -1062,7 +1553,7 @@ const getVectorTileLayerId = (aiArgs: MapToolArgs, optionKey: string): string | 
   return undefined;
 };
 
-const buildVectorTileUrl = (
+const buildMapOptionUrl = (
   baseUrl: string,
   template: string,
   apiKey: string,
@@ -1095,6 +1586,28 @@ type VectorTileCollection = {
   sourceLayer?: string;
 };
 
+type MapOptionPaginationRequest = {
+  enabled: boolean;
+  limit?: number;
+  offset?: number;
+};
+
+type MapOptionPaginationResult = {
+  public?: {
+    numberMatched?: number;
+    numberReturned: number;
+    hasNext: boolean;
+    hasBack: boolean;
+  };
+  state?: {
+    enabled: true;
+    limit: number;
+    offset: number;
+    hasNext: boolean;
+    nextOffset?: number;
+  };
+};
+
 const normalizeGeometryType = (value: unknown): string | undefined => {
   const geometry = toStringValue(value)?.toLowerCase();
   if (!geometry) return undefined;
@@ -1103,15 +1616,6 @@ const normalizeGeometryType = (value: unknown): string | undefined => {
   if (geometry.includes("polygon")) return "polygon";
   if (geometry.includes("raster") || geometry.includes("image") || geometry.includes("coverage")) return "raster";
   return geometry;
-};
-
-const geometryTypeToMapLayerType = (value: unknown): string | undefined => {
-  const geometry = normalizeGeometryType(value);
-  if (geometry === "point") return "circle";
-  if (geometry === "line") return "line";
-  if (geometry === "polygon") return "fill";
-  if (geometry === "raster") return "raster";
-  return undefined;
 };
 
 const getDirectGeometryType = (value: unknown): string | undefined => {
@@ -1165,6 +1669,105 @@ const extractVectorTileCollections = (payload: unknown): VectorTileCollection[] 
       };
     })
     .filter((item): item is VectorTileCollection => Boolean(item));
+};
+
+const getMapArgsContainers = (aiArgs: MapToolArgs): Record<string, unknown>[] => {
+  return [
+    aiArgs,
+    pickRecord(aiArgs.params),
+    pickRecord(aiArgs.options),
+    pickRecord(aiArgs.selectedOptions),
+    pickRecord(aiArgs.variables)
+  ];
+};
+
+const getNestedContainers = (
+  containers: Record<string, unknown>[],
+  key: string
+): Record<string, unknown>[] => {
+  return containers.flatMap((container) => [
+    container,
+    pickRecord(container[key])
+  ]);
+};
+
+const firstNumberFromContainers = (
+  containers: Record<string, unknown>[],
+  keys: string[],
+  validate: (value: number) => boolean
+): number | undefined => {
+  for (const container of containers) {
+    for (const key of keys) {
+      const value = toNumberValue(container[key]);
+      if (value !== undefined && validate(value)) return Math.floor(value);
+    }
+  }
+
+  return undefined;
+};
+
+const getMapOptionPaginationRequest = (
+  aiArgs: MapToolArgs,
+  template: Record<string, unknown>,
+  fallbackLimit: number
+): MapOptionPaginationRequest => {
+  const config = pickRecord(template.pagination);
+  const enabled = config.enabled === true || toNumberValue(config.limit) !== undefined;
+  if (!enabled) return { enabled: false };
+
+  const containers = getNestedContainers(getMapArgsContainers(aiArgs), "pagination");
+  const configuredLimit = toNumberValue(config.limit);
+  const requestedLimit = firstNumberFromContainers(containers, ["limit"], (value) => value > 0);
+  const requestedOffset = firstNumberFromContainers(containers, ["offset"], (value) => value >= 0);
+  const nextOffset = firstNumberFromContainers(containers, ["nextOffset"], (value) => value >= 0);
+  const currentOffset = firstNumberFromContainers(containers, ["currentOffset"], (value) => value >= 0);
+  const action = containers
+    .map((container) => toStringValue(container.action)?.toLowerCase())
+    .find(Boolean);
+  const limit = Math.max(1, Math.min(50, requestedLimit ?? configuredLimit ?? fallbackLimit));
+  let offset = requestedOffset ?? 0;
+
+  if ((action === "next" || action === "next_page" || action === "load_more") && requestedOffset === undefined) {
+    offset = nextOffset ?? ((currentOffset ?? 0) + limit);
+  }
+
+  return {
+    enabled: true,
+    limit,
+    offset: Math.max(0, offset)
+  };
+};
+
+const buildMapOptionPaginationResult = (
+  payload: unknown,
+  request: MapOptionPaginationRequest,
+  returnedCount: number
+): MapOptionPaginationResult => {
+  if (!request.enabled || request.limit === undefined || request.offset === undefined) return {};
+
+  const record = pickRecord(payload);
+  const numberMatched = toNumberValue(record.numberMatched ?? record.totalMatched ?? record.total ?? record.count);
+  const numberReturned = toNumberValue(record.numberReturned ?? record.returned) ?? returnedCount;
+  const hasNext = numberMatched !== undefined
+    ? request.offset + numberReturned < numberMatched
+    : numberReturned >= request.limit;
+  const hasBack = request.offset > 0;
+
+  return {
+    public: {
+      numberMatched,
+      numberReturned,
+      hasNext,
+      hasBack
+    },
+    state: {
+      enabled: true,
+      limit: request.limit,
+      offset: request.offset,
+      hasNext,
+      ...(hasNext ? { nextOffset: request.offset + numberReturned } : {})
+    }
+  };
 };
 
 const buildVectorTileChoices = (collections: VectorTileCollection[], layerType: string): MapOptionChoice[] => {
@@ -1371,6 +1974,34 @@ const getVallarisStyles = async (
   );
 };
 
+const getVallarisStylesPage = async (
+  config: { baseUrl: string; urlTemplate: string; layerConfigTemplate?: unknown },
+  aiArgs: MapToolArgs,
+  apiKey: string
+): Promise<{
+  styles: EnrichedVallarisStyle[];
+  pagination: MapOptionPaginationResult;
+}> => {
+  const template = pickRecord(config.layerConfigTemplate);
+  const paginationRequest = getMapOptionPaginationRequest(aiArgs, template, VALLARIS_STYLE_CHOICE_LIMIT);
+  const catalogUrl = paginationRequest.enabled
+    ? buildMapOptionUrl(config.baseUrl, config.urlTemplate, apiKey, {
+      limit: paginationRequest.limit,
+      offset: paginationRequest.offset
+    })
+    : buildVallarisCatalogUrl(config, apiKey);
+  const catalogPayload = await fetchVallarisJson(catalogUrl);
+  const styles = extractVallarisStyles(catalogPayload);
+  const enrichedStyles = await Promise.all(
+    styles.map((style, index) => enrichVallarisStyle(style, apiKey, index < VALLARIS_ENRICH_LIMIT))
+  );
+
+  return {
+    styles: enrichedStyles,
+    pagination: buildMapOptionPaginationResult(catalogPayload, paginationRequest, enrichedStyles.length)
+  };
+};
+
 const normalizeMatchText = (value: string): string => {
   return value.toLowerCase().replace(/[\s()[\]{}"'`.,:;|/_-]+/g, "");
 };
@@ -1550,17 +2181,46 @@ const buildVectorTileOptionsPayload = async (
   const template = pickRecord(config.layerConfigTemplate);
   const optionKey = getVectorTileOptionKey(config.layerConfigTemplate);
   const layerType = getCollectionDetailType(config.layerConfigTemplate);
-  const collectionsUrl = buildVectorTileUrl(
+  const collectionQuery = pickRecord(template.collectionQuery);
+  const paginationRequest = getMapOptionPaginationRequest(aiArgs, template,VECTOR_TILE_CHOICE_LIMIT);
+  const collectionsUrl = buildMapOptionUrl(
     config.baseUrl,
     config.urlTemplate,
     apiKey,
-    pickRecord(template.collectionQuery)
+    paginationRequest.enabled
+      ? {
+        ...collectionQuery,
+        limit: paginationRequest.limit,
+        offset: paginationRequest.offset
+      }
+      : collectionQuery
   );
-  const collections = extractVectorTileCollections(await fetchVectorTileJson(collectionsUrl));
+  const collectionsPayload = await fetchVectorTileJson(collectionsUrl);
+  const collections = extractVectorTileCollections(collectionsPayload);
+  const pagination = buildMapOptionPaginationResult(collectionsPayload, paginationRequest, collections.length);
   const selectedLayerId = getVectorTileLayerId(aiArgs, optionKey);
   const selectedCollection = selectedLayerId
     ? collections.find((collection) => collection.id === selectedLayerId)
     : undefined;
+
+  if (selectedLayerId && !selectedCollection) {
+    return {
+      success: true,
+      needInfo: false,
+      missingKeys: [],
+      options: [],
+      choices: [],
+      selectedValues: {
+        [optionKey]: selectedLayerId,
+        layerId: selectedLayerId
+      },
+      complete: true,
+      intentName: config.intentName,
+      provider: config.provider,
+      question: undefined,
+      questionHint: "A vector tile layerId is already selected. Call get_map_layer with this layerId."
+    };
+  }
 
   if (collections.length === 0) {
     return {
@@ -1571,7 +2231,9 @@ const buildVectorTileOptionsPayload = async (
       complete: false,
       intentName: config.intentName,
       provider: config.provider,
-      message: "ไม่พบรายการ vector tile layer จาก VALLARIS ครับ"
+      ...(pagination.public ? { pagination: pagination.public } : {}),
+      ...(pagination.state ? { paginationState: pagination.state } : {}),
+      message: "No VALLARIS vector tile layers were found."
     };
   }
 
@@ -1581,7 +2243,7 @@ const buildVectorTileOptionsPayload = async (
       required: true,
       source: "template",
       label: "Layer",
-      description: `เลือก ${layerType} layer ที่ต้องการใช้`,
+      description: `Choose the ${layerType} layer to use`,
       choices: buildVectorTileChoices(collections, layerType)
     };
     return {
@@ -1594,6 +2256,8 @@ const buildVectorTileOptionsPayload = async (
       complete: false,
       intentName: config.intentName,
       provider: config.provider,
+      ...(pagination.public ? { pagination: pagination.public } : {}),
+      ...(pagination.state ? { paginationState: pagination.state } : {}),
       question: buildMapOptionQuestion([layerOption]),
       questionHint: "Ask the user to choose one vector tile layerId from these DB/API-backed choices."
     };
@@ -1623,7 +2287,7 @@ const buildVectorTileOptionsPayload = async (
 };
 
 const resolveVallarisStyleSelection = async (
-  config: { baseUrl: string; urlTemplate: string },
+  config: { baseUrl: string; urlTemplate: string; layerConfigTemplate?: unknown },
   aiArgs: MapToolArgs,
   apiKey: string
 ): Promise<{
@@ -1632,11 +2296,13 @@ const resolveVallarisStyleSelection = async (
   selectedStyle?: EnrichedVallarisStyle;
   selectedMatch?: VallarisStyleMatch;
   query?: string;
+  pagination: MapOptionPaginationResult;
 }> => {
-  const styles = await getVallarisStyles(config, apiKey);
+  const { styles, pagination } = await getVallarisStylesPage(config, aiArgs, apiKey);
   const selectedStyleId = getSelectedVallarisStyleId(aiArgs);
   const query = getMapQuery(aiArgs);
   const matches = rankVallarisStyles(styles, query);
+  const shouldRequireExplicitStyleSelection = pickRecord(pickRecord(config.layerConfigTemplate).pagination).enabled === true;
   const selectedStyle = selectedStyleId
     ? styles.find((style) => style.id === selectedStyleId)
     : undefined;
@@ -1647,7 +2313,17 @@ const resolveVallarisStyleSelection = async (
       matches,
       selectedStyle,
       selectedMatch: matches.find((match) => match.style.id === selectedStyle.id),
-      query
+      query,
+      pagination
+    };
+  }
+
+  if (shouldRequireExplicitStyleSelection) {
+    return {
+      styles,
+      matches,
+      query,
+      pagination
     };
   }
 
@@ -1667,15 +2343,16 @@ const resolveVallarisStyleSelection = async (
       matches,
       selectedStyle: bestMatch.style,
       selectedMatch: bestMatch,
-      query
+      query,
+      pagination
     };
   }
 
-  return { styles, matches, query };
+  return { styles, matches, query, pagination };
 };
 
 const buildVallarisOptionsPayload = async (
-  config: { intentName: string; provider: string; baseUrl: string; urlTemplate: string },
+  config: { intentName: string; provider: string; baseUrl: string; urlTemplate: string; layerConfigTemplate?: unknown },
   aiArgs: MapToolArgs,
   apiKey: string,
   includeSecureUrls = false
@@ -1692,7 +2369,9 @@ const buildVallarisOptionsPayload = async (
       complete: false,
       intentName: config.intentName,
       provider: config.provider,
-      message: "ไม่พบรายการ style จาก VALLARIS ครับ"
+      ...(selection.pagination.public ?{ pagination: selection.pagination.public } : {}),
+      ...(selection.pagination.state ? { paginationState: selection.pagination.state } : {}),
+      message: "Can't find style from vallaris."
     };
   }
 
@@ -1718,6 +2397,8 @@ const buildVallarisOptionsPayload = async (
       complete: false,
       intentName: config.intentName,
       provider: config.provider,
+      ...(selection.pagination.public ? { pagination: selection.pagination.public } : {}),
+      ...(selection.pagination.state ? { paginationState: selection.pagination.state } : {}),
       question: buildMapQuestion("select_vallaris_style", {
         query: selection.query
       }),
@@ -1755,7 +2436,7 @@ const buildVallarisOptionsPayload = async (
       complete: false,
       intentName: config.intentName,
       provider: config.provider,
-      message: "ไม่พบ link แผนที่ใน style ที่เลือกจาก VALLARIS ครับ"
+      message: "No map links were found for the selected VALLARIS style."
     };
   }
 
@@ -1804,7 +2485,7 @@ const buildVallarisOptionsPayload = async (
       complete: false,
       intentName: config.intentName,
       provider: config.provider,
-      message: "ไม่สามารถเตรียม URL ภายในสำหรับแผนที่ VALLARIS ที่เลือกได้ครับ"
+      message: "Unable to prepare the internal URL for the selected VALLARIS map."
     };
   }
 
@@ -2053,10 +2734,10 @@ const buildVectorTileLayerPayload = async (
 
   const detailUrlTemplate = toStringValue(pickRecord(config.layerConfigTemplate).detailUrlTemplate);
   if (!detailUrlTemplate) {
-    return { success: false, error: "layerConfigTemplate.detailUrlTemplate สำหรับ collection detail ยังไม่ได้ตั้งค่าครับ" };
+    return { success: false, error: "layerConfigTemplate.detailUrlTemplate is not configured for collection detail." };
   }
 
-  const tileDetailUrl = buildVectorTileUrl(config.baseUrl, detailUrlTemplate, apiKey, { id: layerId, layerId });
+  const tileDetailUrl = buildMapOptionUrl(config.baseUrl, detailUrlTemplate, apiKey, { id: layerId, layerId });
   const tilePayload = pickRecord(await fetchVectorTileJson(tileDetailUrl));
   const tileRecord = isRecord(tilePayload.data) ? tilePayload.data : tilePayload;
   const minzoom = toNumberValue(tileRecord.minzoom ?? tileRecord.minZoom);
@@ -2204,7 +2885,7 @@ export const buildDynamicMapOptionToolSchema = (
         key,
         createChoiceEnumProperty(
           mapChoicesForKey(optionGroups, key),
-          `ค่าของ ${key} ที่ต้องใช้เติม map URL/template`
+          `The ${key} value used to fill the map URL/template`
         )
       ])
   );
@@ -2213,40 +2894,40 @@ export const buildDynamicMapOptionToolSchema = (
     type: "function",
     function: {
       name: "map_options",
-      description: "ใช้ทันทีเมื่อ user ขอแผนที่ เพื่อดึง/ตรวจตัวเลือกจาก mapconfig ใน DB ห้ามเดา choice เอง ถ้า provider เป็น VALLARIS ให้ส่งคำขอ user ใน query/message เพื่อให้ backend ดึง style list, enrich metadata/stylesheet, match styleId แล้วคืน map type links",
+      description: "Use immediately when the user asks for a map. Fetch and validate map choices from DB-backed mapconfig. Do not guess choices. For VALLARIS, pass the user's request in query/message so the backend can fetch the style list, enrich metadata/stylesheet, match styleId, and return map type links.",
       parameters: {
         type: "object",
         properties: {
           query: {
             type: "string",
-            description: "ข้อความล่าสุดของ user ที่ใช้อธิบายข้อมูลแผนที่ที่ต้องการ เช่น แผ่นดินไหว น้ำท่วม หรือชื่อ layer โดยเฉพาะสำหรับ VALLARIS style matching"
+            description: "The latest user message describing the requested map data, such as earthquakes, floods, or a layer name. Especially useful for VALLARIS style matching."
           },
           message: {
             type: "string",
-            description: "alias ของ query"
+            description: "Alias of query"
           },
           intentName: createStringEnumProperty(
             configs.map((config) => config.intentName),
-            "ชื่อ intent จาก mapconfig ที่ตรงกับคำขอแผนที่"
+            "The mapconfig intent name matching the map request"
           ),
           provider: createStringEnumProperty(
             getUniqueProviders(configs.map((config) => config.provider)),
-            "provider ที่ user มีสิทธิ์ใช้งาน"
+            "The provider the user is allowed to use"
           ),
           params: {
             type: "object",
             properties: paramsProperties,
-            description: "ค่าที่ infer ได้จากคำพูด user หรือค่าที่ user เลือกจาก UI ต้องใส่ค่าที่รู้แล้วมาที่นี่ก่อนถาม user ต่อ โดยเลือกจาก enum/description ที่มาจาก DB เท่านั้น"
+            description: "Values inferred from the user's message or selected from the UI. Put known values here before asking the user for more. Use only DB-backed enums/descriptions."
           },
           options: {
             type: "object",
             properties: paramsProperties,
-            description: "alias ของ params"
+            description: "Alias of params"
           },
           variables: {
             type: "object",
             properties: paramsProperties,
-            description: "ตัวแปรเพิ่มเติมสำหรับเติม template"
+            description: "Additional variables used to fill templates"
           }
         },
         required: []
@@ -2287,38 +2968,38 @@ export const mapToolSchema = {
   type: "function",
   function: {
     name: "get_map_layer",
-    description: "สร้าง URL และ layer payload จาก mapconfig กลางและ option values ที่เลือกแล้ว",
+    description: "Build the map URL and layer payload from the central mapconfig and the selected option values.",
     parameters: {
       type: "object",
         properties: {
         query: {
           type: "string",
-          description: "ข้อความล่าสุดของ user สำหรับค้นหา/เลือก style โดยเฉพาะ provider VALLARIS"
+          description: "The latest user message used to search/select a style, especially for provider VALLARIS."
         },
         message: {
           type: "string",
-          description: "alias ของ query"
+          description: "Alias of query"
         },
         intentName: {
           type: "string",
-          description: "ชื่อ intent จาก mapconfig ที่ได้จาก map_access"
+          description: "The intent name from mapconfig returned by map_access"
         },
         provider: {
           type: "string",
           enum: ["GISTDA", "VALLARIS"],
-          description: "provider จาก map_access ที่ user มีสิทธิ์ใช้งาน"
+          description: "The provider from map_access that the user is allowed to use"
         },
         params: {
           type: "object",
-          description: "ค่าที่ chatbot infer เพื่อแทน placeholder ใน urlTemplate/layerConfigTemplate"
+          description: "Values inferred by the chatbot to replace placeholders in urlTemplate/layerConfigTemplate"
         },
         options: {
           type: "object",
-          description: "alias ของ params สำหรับค่าที่ chatbot infer"
+          description: "Alias of params for chatbot-inferred values"
         },
         variables: {
           type: "object",
-          description: "ตัวแปรเพิ่มเติมสำหรับแทน placeholder ใน template"
+          description: "Additional variables used to replace placeholders in templates"
         }
       },
       required: ["intentName", "provider"]
@@ -2330,10 +3011,79 @@ export const styleCatalogToolSchema = {
   type: "function",
   function: {
     name: "style_catalog",
-    description: "ดึง catalog style preset สำหรับแต่งแผนที่จาก STYLE_CATALOG_URL เช่น polygon, line, point, raster คืน key/description/layerType ให้ chatbot เลือกใช้ ห้ามเดา style เองถ้ามี catalog ให้เรียก tool นี้ก่อน",
+    description: "Fetch map style presets from STYLE_CATALOG_URL, such as polygon, line, point, and raster styles. Return keys/descriptions/layer types for the chatbot to choose from. Do not guess styles when a catalog is available; call this tool first.",
     parameters: {
       type: "object",
       properties: {},
+      required: []
+    }
+  }
+};
+
+export const editMapStyleToolSchema = {
+  type: "function",
+  function: {
+    name: "edit_map_style",
+    description: "Edit the latest map style using the existing map_style as the base. Use this when the user wants to change color, size, width, opacity, paint, or layout without calling get_map_layer again. Colors should be provided as catalog colorKeys or a hex colorValue.",
+    parameters: {
+      type: "object",
+      properties: {
+        layerId: {
+          type: "string",
+          description: "The layerId to edit. If omitted, the latest layer is used."
+        },
+        target: {
+          type: "string",
+          enum: ["point", "circle", "line", "polygon", "fill", "symbol", "heatmap", "raster"],
+          description: "The layer type to edit. If omitted, layers from the latest map_style are used."
+        },
+        instruction: {
+          type: "string",
+          description: "The original user instruction"
+        },
+        colorKey: {
+          type: "string",
+          description: "Primary color from the catalog, such as black, red, or gray"
+        },
+        colorKeys: {
+          type: "array",
+          items: { type: "string" },
+          description: "Multiple catalog colors for mixing, such as [black, gray]"
+        },
+        mix: {
+          type: "array",
+          items: { type: "number" },
+          description: "Color mixing weights, such as [0.75, 0.25]"
+        },
+        colorValue: {
+          type: "string",
+          description: "A validated hex color, such as #1F2937. Use when the user gives a specific color or the chatbot chooses a mixed color."
+        },
+        radius: {
+          type: "number",
+          description: "Circle radius for point/circle layers"
+        },
+        size: {
+          type: "number",
+          description: "Size value, used as circle radius or line width"
+        },
+        width: {
+          type: "number",
+          description: "line width"
+        },
+        opacity: {
+          type: "number",
+          description: "Opacity from 0-1 or 0-100"
+        },
+        paint: {
+          type: "object",
+          description: "MapLibre paint properties to merge directly"
+        },
+        layout: {
+          type: "object",
+          description: "MapLibre layout properties to merge directly"
+        }
+      },
       required: []
     }
   }
@@ -2343,38 +3093,38 @@ export const mapOptionToolSchema = {
   type: "function",
   function: {
     name: "map_options",
-    description: "ตรวจและคืนตัวเลือกแผนที่จาก layerConfigTemplate ใน DB เพื่อให้ user เลือกก่อนเรียก get_map_layer",
+    description: "Validate and return map choices from DB-backed layerConfigTemplate so the user can choose before get_map_layer is called.",
     parameters: {
       type: "object",
         properties: {
         query: {
           type: "string",
-          description: "ข้อความล่าสุดของ user สำหรับค้นหา style/layer โดยเฉพาะ provider VALLARIS"
+          description: "The latest user message used to search for a style/layer, especially for provider VALLARIS."
         },
         message: {
           type: "string",
-          description: "alias ของ query"
+          description: "Alias of query"
         },
         intentName: {
           type: "string",
-          description: "ชื่อ intent จาก mapconfig ถ้ารู้แล้ว"
+          description: "The mapconfig intent name, if known"
         },
         provider: {
           type: "string",
           enum: ["GISTDA", "VALLARIS"],
-          description: "provider จาก map_access ถ้ารู้แล้ว"
+          description: "The provider from map_access, if known"
         },
         params: {
           type: "object",
-          description: "ค่าที่ chatbot infer จากคำตอบ user แล้ว"
+          description: "Values the chatbot inferred from the user's answer"
         },
         options: {
           type: "object",
-          description: "alias ของ params สำหรับค่าที่ chatbot infer จากคำตอบ user แล้ว"
+          description: "Alias of params for values inferred from the user's answer"
         },
         variables: {
           type: "object",
-          description: "ตัวแปรเพิ่มเติมที่มีอยู่แล้ว"
+          description: "Additional variables that are already available"
         }
       },
       required: []
@@ -2478,7 +3228,7 @@ export const handleMapOptionsTool = async (
       return {
         success: false,
         options: [],
-        message: `ผู้ใช้ไม่มีสิทธิ์ใช้งาน provider ${provider} ครับ`
+        message: `The user is not allowed to use provider ${provider}.`
       };
     }
 
@@ -2494,7 +3244,7 @@ export const handleMapOptionsTool = async (
       return {
         success: false,
         options: [],
-        message: `ไม่พบ mapconfig ที่เปิดใช้งานสำหรับ ${provider}:${intentName}`
+        message: `No active mapconfig was found for ${provider}:${intentName}.`
       };
     }
 
@@ -2504,7 +3254,7 @@ export const handleMapOptionsTool = async (
         return {
           success: false,
           options: [],
-          message: `ผู้ใช้ไม่มี API Key ที่ใช้งานได้สำหรับ provider ${config.provider} ครับ`
+          message: `The user has no usable API key for provider ${config.provider}.`
         };
       }
 
@@ -2516,7 +3266,7 @@ export const handleMapOptionsTool = async (
         return {
           success: false,
           options: [],
-          message: "เกิดข้อผิดพลาดในการอ่าน API Key ของ VALLARIS"
+          message: "An error occurred while reading the VALLARIS API key."
         };
       }
 
@@ -2529,7 +3279,7 @@ export const handleMapOptionsTool = async (
         return {
           success: false,
           options: [],
-          message: `ผู้ใช้ไม่มี API Key ที่ใช้งานได้สำหรับ provider ${config.provider} ครับ`
+          message: `The user has no usable API key for provider ${config.provider}.`
         };
       }
 
@@ -2541,7 +3291,7 @@ export const handleMapOptionsTool = async (
         return {
           success: false,
           options: [],
-          message: "เกิดข้อผิดพลาดในการอ่าน API Key ของ VALLARIS"
+          message: "An error occurred while reading the VALLARIS API key."
         };
       }
 
@@ -2600,7 +3350,7 @@ export const handleMapTool = async (
     const provider = normalizeProvider(aiArgs.provider);
 
     if (!intentName || !provider) {
-      return { error: "AI ส่งข้อมูล map tool ไม่ครบ ต้องมี intentName และ provider ครับ" };
+      return { error: "The AI sent incomplete map tool arguments. intentName and provider are required." };
     }
 
     const configMatches = await prisma.mapconfig.findMany({
@@ -2617,13 +3367,13 @@ export const handleMapTool = async (
 
     if (!config) {
       return {
-        error: `ไม่พบ mapconfig สำหรับคำสั่ง ${intentName} ของผู้ให้บริการ ${provider} ครับ`
+        error: `No mapconfig was found for intent ${intentName} and provider ${provider}.`
       };
     }
 
     if (!config.isActive) {
       return {
-        error: `mapconfig ${config.intentName} ของ ${config.provider} ถูกปิดใช้งานครับ`
+        error: `mapconfig ${config.intentName} for ${config.provider} is disabled.`
       };
     }
 
@@ -2633,8 +3383,8 @@ export const handleMapTool = async (
     if (!userApiKey) {
       return {
         error: headerApiKey?.trim()
-          ? `API Key ที่ส่งมาทาง header ไม่ตรงกับ provider ${config.provider} หรือไม่มีสิทธิ์ใช้งานครับ`
-          : `ผู้ใช้ยังไม่ได้ผูก API Key สำหรับ ${config.provider} กรุณาตั้งค่า API Key ก่อนครับ`
+          ? `The API key sent in the header does not match provider ${config.provider}, or it is not authorized.`
+          : `The user has not linked an API key for ${config.provider}. Please configure an API key first.`
       };
     }
 
@@ -2643,7 +3393,7 @@ export const handleMapTool = async (
       decryptedApiKey = decryptUserApiKey(userApiKey);
     } catch (error) {
       console.error("Decrypt map API key error:", error);
-      return { error: "เกิดข้อผิดพลาดในการอ่าน API Key ของคุณ อาจมีการตั้งค่าผิดพลาด" };
+      return { error: "An error occurred while reading your API key. The API key configuration may be invalid." };
     }
 
     if (isVallarisProvider(config.provider) && isCollectionDetailConfig(config.layerConfigTemplate)) {
@@ -2725,7 +3475,7 @@ export const handleMapTool = async (
       }
 
       return {
-        error: `ข้อมูลสำหรับสร้าง URL แผนที่ยังไม่ครบครับ URL/template ยังมีตัวแปรที่ไม่ได้แทนค่า: ${finalUrl}`
+        error: `The map URL cannot be built yet. The URL/template still contains unresolved variables: ${finalUrl}`
       };
     }
 
@@ -2734,7 +3484,7 @@ export const handleMapTool = async (
       finalLayerConfig = JSON.parse(configString);
     } catch (error) {
       console.error("Map layerConfigTemplate parse error:", error);
-      return { error: "layerConfigTemplate ของ mapconfig ไม่ใช่ JSON ที่ใช้งานได้หลังแทนค่าครับ" };
+      return { error: "The mapconfig layerConfigTemplate is not valid JSON after variable replacement." };
     }
     const publicLayerConfig = stripLayerConfigMetadata(finalLayerConfig);
     const catalogSummary = resolveLayerCatalogSummary(templateVariables);
@@ -2752,7 +3502,7 @@ export const handleMapTool = async (
     };
   } catch (error) {
     console.error("Map Tool Handler Error:", error);
-    return { error: "ระบบฐานข้อมูลแผนที่ขัดข้องชั่วคราวครับ" };
+    return { error: "The map database is temporarily unavailable." };
   }
 };
 
@@ -2760,7 +3510,7 @@ export const checkMapAccessSchema = {
   type: "function",
   function: {
     name: "check_user_map",
-    description: "ตรวจสอบ provider API keys ของ user และดึง mapconfig กลางที่ user มีสิทธิ์ใช้งาน",
+    description: "Check the user's provider API keys and fetch the central mapconfig entries the user is allowed to use.",
     parameters: {
       type: "object",
       properties: {},

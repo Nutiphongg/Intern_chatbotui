@@ -5,10 +5,14 @@ import { Errors } from '../../lib/errors';
 import { ChatRequestBody,EditMessageBody } from './types';
 import { ulid } from 'ulid';
 import { env } from '../../lib/env';
+import { decrypt, hashApiKey } from '../setup/encryption';
 import {
     mapToolSchema,
     handleMapTool,
     buildMapStylePayload,
+    editMapStyleToolSchema,
+    handleEditMapStyleTool,
+    handleStyleCatalogTool,
     checkMapAccessSchema,
     handleCheckMapAccess,
     mapOptionToolSchema,
@@ -16,7 +20,7 @@ import {
     buildDynamicMapOptionToolSchema,
     resolveUserMapToolConfigs,
     buildMapOptionChoiceContext
-} from '../mapv2/toolsv2';
+} from '../map/tools';
 import type { Prisma } from '@prisma/client';
 
 
@@ -71,7 +75,78 @@ type OllamaModelInfo = {
     };
 };
 
+type ConversationApiKeyRecord = {
+    id: string;
+    encryptedKey: string;
+    iv: string;
+};
+
 let resolvedVisionModelPromise: Promise<string> | undefined;
+
+const findConversationApiKey = async (
+    userId: string,
+    conversationId: string
+): Promise<ConversationApiKeyRecord | undefined> => {
+    const rows = await prisma.$queryRaw<ConversationApiKeyRecord[]>`
+        SELECT api_key."id", api_key."encryptedKey", api_key."iv"
+        FROM "conversation_api_keys" conversation_key
+        INNER JOIN "conversations" conversation
+            ON conversation."id" = conversation_key."conversationId"
+        INNER JOIN "user_apikey" api_key
+            ON api_key."id" = conversation_key."userApiKeyId"
+        WHERE conversation_key."conversationId" = ${conversationId}
+            AND conversation."user_id" = ${userId}
+            AND conversation."is_deleted" = false
+            AND api_key."user_id" = ${userId}
+            AND api_key."isActive" = true
+            AND api_key."deletedAt" IS NULL
+        LIMIT 1
+    `;
+
+    return rows[0];
+};
+
+const getConversationXApiKey = async (
+    userId: string,
+    conversationId: string
+): Promise<string | undefined> => {
+    const apiKey = await findConversationApiKey(userId, conversationId);
+    if (!apiKey) return undefined;
+
+    return decrypt(apiKey.encryptedKey, apiKey.iv);
+};
+
+const findUserApiKeyFromHeader = async (
+    userId: string,
+    headerApiKey: string
+): Promise<string | undefined> => {
+    const cleanApiKey = headerApiKey.trim();
+    const keyHash = hashApiKey(cleanApiKey);
+    const existingKey = await prisma.user_apikey.findFirst({
+        where: {
+            userId,
+            keyHash,
+            isActive: true,
+            deletedAt: null
+        },
+        select: { id: true },
+        orderBy: { createdAt: 'desc' }
+    });
+
+    return existingKey?.id;
+};
+
+const linkConversationApiKey = async (
+    conversationId: string,
+    userApiKeyId: string
+): Promise<void> => {
+    await prisma.$executeRaw`
+        INSERT INTO "conversation_api_keys" ("id", "conversationId", "userApiKeyId")
+        VALUES (${ulid()}, ${conversationId}, ${userApiKeyId})
+        ON CONFLICT ("conversationId")
+        DO UPDATE SET "userApiKeyId" = EXCLUDED."userApiKeyId"
+    `;
+};
 
 const fetchOllamaModels = async (): Promise<OllamaModelInfo[]> => {
     const response = await fetch(`${OLLAMA_URL}/api/tags`);
@@ -136,7 +211,8 @@ const classifyMapAccessIntent = async (
                             'Classify whether the user is asking to access existing map/layer/tile data from an external map API.',
                             'Return only JSON: {"intent":"map_access"} or {"intent":"chat"}.',
                             'Use "map_access" only when the user wants to list, fetch, open, get a URL, get WMS/WMTS/TMS/vector tile, or retrieve map/layer data.',
-                            'Use "chat" for general discussion, explanations, image analysis, or visual/map style advice that does not require fetching existing map data.'
+                            'Use "map_access" when the user asks to list, search, fetch, or choose existing provider map styles/style records/style catalog from the map API.',
+                            'Use "chat" for general discussion, explanations, image analysis, or visual/map style advice that does not require fetching existing provider data.'
                         ].join('\n')
                     },
                     {
@@ -408,6 +484,191 @@ const getToolErrorMessage = (value: unknown, fallback: string): string => {
         : fallback;
 };
 
+const getLatestMapStyleFromMessages = (messages: Array<{ role: string; content: string }>): unknown | undefined => {
+    for (const message of [...messages].reverse()) {
+        const metadata = asRecord((message as Record<string, unknown>).metadata);
+        if (metadata.mapStyle) return metadata.mapStyle;
+        if (metadata.event === 'map_style') return metadata;
+    }
+
+    return undefined;
+};
+
+const getLatestMapPayloadFromMessages = (messages: Array<{ role: string; content: string }>): unknown | undefined => {
+    for (const message of [...messages].reverse()) {
+        const metadata = asRecord((message as Record<string, unknown>).metadata);
+        if (metadata.event === 'layer_catalog' && metadata.layer) return metadata;
+    }
+
+    return undefined;
+};
+
+const normalizeStyleSwitchText = (value: unknown): string => {
+    return typeof value === 'string'
+        ? value.toLowerCase().replace(/[\s()[\]{}"'`.,:;|/_-]+/g, '')
+        : '';
+};
+
+const resolveRequestedMapStyleKey = (
+    message: string,
+    styles: unknown[],
+    currentMapStyle?: unknown
+): string | undefined => {
+    const normalizedMessage = normalizeStyleSwitchText(message);
+    if (!normalizedMessage) return undefined;
+
+    const currentStyleKey = normalizeStyleSwitchText(asRecord(currentMapStyle).styleKey || asRecord(currentMapStyle).activeStyle);
+    const matches = styles
+        .map((style) => {
+            const record = asRecord(style);
+            const styleKey = typeof record.styleKey === 'string'
+                ? record.styleKey
+                : typeof record.key === 'string'
+                    ? record.key
+                    : undefined;
+            if (!styleKey) return undefined;
+
+            const terms = [
+                record.styleKey,
+                record.key,
+                record.styleName,
+                record.description,
+                record.layerType
+            ]
+                .map(normalizeStyleSwitchText)
+                .filter((term, index, allTerms) => term.length >= 3 && allTerms.indexOf(term) === index);
+            const matchedTerm = terms.find((term) => normalizedMessage.includes(term));
+            if (!matchedTerm) return undefined;
+
+            return {
+                styleKey,
+                score: matchedTerm.length,
+                isCurrent: normalizeStyleSwitchText(styleKey) === currentStyleKey
+            };
+        })
+        .filter((item): item is { styleKey: string; score: number; isCurrent: boolean } => Boolean(item))
+        .sort((left, right) => Number(left.isCurrent) - Number(right.isCurrent) || right.score - left.score);
+
+    return matches[0]?.styleKey;
+};
+
+const toSuggestionString = (value: unknown): string | undefined => {
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+};
+
+const normalizeSuggestionGeometryType = (value: unknown): string | undefined => {
+    const normalized = toSuggestionString(value)?.toLowerCase();
+    if (!normalized) return undefined;
+    if (['point', 'multipoint'].includes(normalized)) return 'point';
+    if (['line', 'linestring', 'multilinestring'].includes(normalized)) return 'line';
+    if (['polygon', 'multipolygon'].includes(normalized)) return 'polygon';
+    if (['raster', 'image'].includes(normalized)) return 'raster';
+    return normalized;
+};
+
+const getSuggestionLayerRecord = (mapPayload: unknown): Record<string, unknown> => {
+    const payloadRecord = asRecord(mapPayload);
+    return asRecord(payloadRecord.layer) || payloadRecord;
+};
+
+const getSuggestionStyleGeometryTypes = (style: unknown): string[] => {
+    const record = asRecord(style);
+    if (!Array.isArray(record.geometryTypes)) return [];
+
+    return Array.from(new Set(
+        record.geometryTypes
+            .map(normalizeSuggestionGeometryType)
+            .filter((value): value is string => Boolean(value))
+    ));
+};
+
+const hasEditableColorPaint = (mapStyle: unknown): boolean => {
+    const layers = asRecord(mapStyle).layers;
+    if (!Array.isArray(layers)) return false;
+
+    return layers.some((layer) => {
+        const paint = asRecord(asRecord(layer).paint);
+        return Object.keys(paint).some((key) => {
+            return key.endsWith('-color') && key !== 'heatmap-color';
+        });
+    });
+};
+
+const buildMapSuggestionsPayload = (
+    mapPayload: unknown,
+    mapStyle: unknown,
+    styleCatalog: unknown
+): Record<string, unknown> | undefined => {
+    const layer = getSuggestionLayerRecord(mapPayload);
+    const styleRecord = asRecord(mapStyle);
+    const catalogRecord = asRecord(styleCatalog);
+    const geometryType = normalizeSuggestionGeometryType(layer.geometryType || styleRecord.geometryType);
+    const activeStyle = toSuggestionString(styleRecord.activeStyle) || toSuggestionString(styleRecord.styleKey);
+    const styles = Array.isArray(catalogRecord.styles) ? catalogRecord.styles : [];
+    const colors = Array.isArray(catalogRecord.colors) ? catalogRecord.colors : [];
+
+    if (!styleRecord.success) return undefined;
+
+    const styleOptions = styles
+        .filter((style) => {
+            if (!geometryType) return true;
+            const styleGeometryTypes = getSuggestionStyleGeometryTypes(style);
+            return styleGeometryTypes.length === 0 || styleGeometryTypes.includes(geometryType);
+        })
+        .map((style) => {
+            const record = asRecord(style);
+            const value = toSuggestionString(record.styleKey) || toSuggestionString(record.key);
+            if (!value) return undefined;
+
+            return {
+                label: toSuggestionString(record.styleName) || value,
+                value
+            };
+        })
+        .filter((option): option is { label: string; value: string } => Boolean(option))
+        .filter((option, index, allOptions) => {
+            return allOptions.findIndex((item) => item.value === option.value) === index;
+        });
+    const nextStyleOption = styleOptions.find((option) => option.value !== activeStyle) || styleOptions[0];
+
+    const colorOptions = colors
+        .map((color) => {
+            const record = asRecord(color);
+            const value = toSuggestionString(record.key);
+            if (!value) return undefined;
+
+            return {
+                label: value,
+                value
+            };
+        })
+        .filter((option): option is { label: string; value: string } => Boolean(option))
+        .slice(0, 6);
+
+    const items = [
+        ...(styleOptions.length > 1
+            ? [{
+                key: 'change_style',
+                label: 'Change style',
+                promptTemplate: `Change the current map layer style to ${nextStyleOption?.value}`
+            }]
+            : []),
+        ...(colorOptions.length > 0 && hasEditableColorPaint(mapStyle)
+            ? [{
+                key: 'change_color',
+                label: 'Change color',
+                promptTemplate: `Change the current map layer primary color to ${colorOptions[3]?.value || colorOptions[0]?.value}`
+            }]
+            : [])
+    ];
+
+    if (items.length === 0) return undefined;
+
+    return {
+        items
+    };
+};
+
 const mergeMapToolArgs = (...argsList: Array<Record<string, unknown> | undefined>) => {
     const merged: Record<string, unknown> = {};
     const mergedParams: Record<string, unknown> = {};
@@ -616,9 +877,20 @@ const buildMapOptionsEvent = (result: any) => {
         complete,
         intentName: typeof result.intentName === 'string' ? result.intentName : undefined,
         provider: typeof result.provider === 'string' ? result.provider : undefined,
+        pagination: result.pagination && typeof result.pagination === 'object'
+            ? result.pagination
+            : undefined,
+        paginationState: result.paginationState && typeof result.paginationState === 'object'
+            ? result.paginationState
+            : undefined,
         question: typeof result.question === 'string' ? result.question : undefined,
         message: typeof result.message === 'string' ? result.message : undefined
     };
+};
+
+const toPublicMapOptionsEvent = (payload: ReturnType<typeof buildMapOptionsEvent>) => {
+    const { paginationState, ...publicPayload } = payload;
+    return publicPayload;
 };
 
 const buildMapOptionsFingerprint = (payload: ReturnType<typeof buildMapOptionsEvent>) => {
@@ -628,6 +900,8 @@ const buildMapOptionsFingerprint = (payload: ReturnType<typeof buildMapOptionsEv
         complete: payload.complete,
         intentName: payload.intentName,
         provider: payload.provider,
+        choiceValues: payload.choices.map((choice) => choice.value),
+        pagination: payload.pagination,
         question: payload.question,
         message: payload.message
     });
@@ -711,6 +985,16 @@ export const processChatMessageStream = (
     const mapSelectionPayload = body?.mapselection;
     const hasMapSelection = Boolean(mapSelectionPayload);
     const hasUserMessage = Boolean(rawMessage.trim());
+    const mapSelectionRecord = asRecord(mapSelectionPayload);
+    const hasMapSelectionPagination = Object.keys(asRecord(mapSelectionRecord.pagination)).length > 0;
+    const hasMapSelectionValue = mapSelectionRecord.value !== undefined
+        || mapSelectionRecord.selectedValue !== undefined
+        || typeof mapSelectionRecord.layerId === 'string'
+        || typeof mapSelectionRecord.styleId === 'string'
+        || typeof mapSelectionRecord.type === 'string';
+    const isMapOptionPaginationAction = hasMapSelection
+        && !hasMapSelectionValue
+        && hasMapSelectionPagination;
     const shouldPersistUserMessage = (hasUserMessage || hasImages) && !hasMapSelection;
 
     if (!body || (!hasUserMessage && !hasMapSelection && !hasImages)) {
@@ -721,8 +1005,8 @@ export const processChatMessageStream = (
     const message = rawMessage.trim() || (hasImages ? 'ช่วยดูรูปนี้ให้หน่อย' : '');
     const selectedModel = body.model?.trim() || DEFAULT_CHAT_MODEL;
     const isSilentRetry = body.is_silent_retry === true;
-    const mapHeaderApiKey = apiKey?.trim() || vectorApiKey?.trim();
-    const hasMapApiKey = Boolean(mapHeaderApiKey);
+    let mapHeaderApiKey = apiKey?.trim() || vectorApiKey?.trim();
+    let hasMapApiKey = Boolean(mapHeaderApiKey);
     const isNewConv = !body.conversationId;
     const convId = body.conversationId || ulid();
     const userMessageId = ulid();
@@ -863,6 +1147,20 @@ export const processChatMessageStream = (
                                 return;
                             }
                         }
+
+                        if (mapHeaderApiKey) {
+                            const userApiKeyId = await findUserApiKeyFromHeader(userId, mapHeaderApiKey);
+                            if (userApiKeyId) {
+                                await linkConversationApiKey(convId, userApiKeyId);
+                            }
+                        } else {
+                            const conversationApiKey = await getConversationXApiKey(userId, convId);
+                            if (conversationApiKey) {
+                                mapHeaderApiKey = conversationApiKey;
+                                hasMapApiKey = true;
+                            }
+                        }
+
                         if (isSilentRetry && !isNewConv && shouldPersistUserMessage){
                             const latestVisibleUserMessage = await prisma.messages.findFirst({
                                 where: {
@@ -1053,13 +1351,16 @@ export const processChatMessageStream = (
                         .filter((msg) => msg.role !== 'system')
                         .map((msg) => ({ role: msg.role, content: msg.content }));
                     const lastMessageForLLM = sanitizedMessagesForLLM.pop();
+                    const latestMapStyle = getLatestMapStyleFromMessages(messagesForLLM);
+                    const latestMapPayload = getLatestMapPayloadFromMessages(messagesForLLM);
                     let mapToolContext: { role: string, content: string } | undefined;
+                    let mapStyleContext: { role: string, content: string } | undefined;
                     let mapMetadata: Prisma.InputJsonObject | undefined;
                     let assistantEventMetadata: Prisma.InputJsonObject | undefined;
                     const createMapOptionsMetadata = (payload: unknown): Prisma.InputJsonObject => {
                         return toPrismaJsonObject({
                             event: 'map_options',
-                            payload
+                            payload: toPublicMapOptionsEvent(payload as ReturnType<typeof buildMapOptionsEvent>)
                         });
                     };
                     const createMapMetadata = (payload: unknown, mapStylePayload?: unknown): Prisma.InputJsonObject => {
@@ -1075,6 +1376,11 @@ export const processChatMessageStream = (
                             instruction: hasUserMessage ? message : undefined
                         });
                         writeSse(controller, 'map_style', styleResult);
+                        const styleCatalog = await handleStyleCatalogTool();
+                        const suggestionsPayload = buildMapSuggestionsPayload(payload, styleResult, styleCatalog);
+                        if (suggestionsPayload) {
+                            writeSse(controller, 'suggestions', suggestionsPayload);
+                        }
                         return styleResult;
                     };
                     const saveAssistantMessage = async (
@@ -1123,13 +1429,282 @@ export const processChatMessageStream = (
                         return assistantMessageId;
                     };
 
+                    const streamPostMapEventReply = async (
+                        eventName: 'map' | 'map_style',
+                        eventPayload: unknown
+                    ) => {
+                        const replyMessages = [
+                            systemMessage,
+                            styleReminder,
+                            {
+                                role: 'system',
+                                content: [
+                                    `A "${eventName}" result is already ready and visible in the map UI.`,
+                                    'Reply briefly and naturally to the user in the same language as the user.',
+                                    'Do not call tools.',
+                                    'Do not repeat raw JSON.',
+                                    'Do not mention backend events, emitted events, payloads, APIs, coordinates, bounds, or zoom levels unless the user explicitly asks.',
+                                    'Do not claim that you still need to fetch or prepare the map.',
+                                    eventName === 'map'
+                                        ? 'Say that the requested map layer is ready/displayed. Keep it to one short sentence.'
+                                        : 'Say that the requested map style has been applied. Keep it to one short sentence.',
+                                    `Internal context for grounding only, not for direct quotation: ${JSON.stringify(eventPayload).slice(0, 600)}`
+                                ].join('\n')
+                            },
+                            ...(lastMessageForLLM ? [lastMessageForLLM] : [])
+                        ];
+
+                        const response = await fetch(`${OLLAMA_URL}/api/chat`, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({
+                                model: selectedModel,
+                                messages: replyMessages,
+                                stream: true,
+                                options: {
+                                    temperature: selectedFeelingKey === 'aggressive' ? 0.7 : selectedFeelingKey === 'polite' ? 0.45 : 0.5,
+                                    top_p: selectedFeelingKey === 'aggressive' ? 0.9 : 0.85,
+                                    num_predict: 96
+                                }
+                            })
+                        });
+
+                        if (!response.ok || !response.body) {
+                            return { reply: '', tokenUsage: 0 };
+                        }
+
+                        const reader = response.body.getReader();
+                        const decoder = new TextDecoder();
+                        let buffer = '';
+                        let reply = '';
+                        let tokenUsage = 0;
+
+                        while (true) {
+                            const { done, value } = await reader.read();
+
+                            if (done) {
+                                const lastLine = buffer.trim();
+                                if (lastLine) {
+                                    const chunk = JSON.parse(lastLine);
+                                    const textPart = chunk?.message?.content || '';
+                                    if (textPart) {
+                                        reply += textPart;
+                                        writeSse(controller, 'token', { text: textPart });
+                                    }
+                                    if (typeof chunk?.eval_count === 'number') tokenUsage = chunk.eval_count;
+                                }
+                                break;
+                            }
+
+                            buffer += decoder.decode(value, { stream: true });
+                            const lines = buffer.split('\n');
+                            buffer = lines.pop() || '';
+
+                            for (const line of lines) {
+                                const trimmed = line.trim();
+                                if (!trimmed) continue;
+
+                                const chunk = JSON.parse(trimmed);
+                                const textPart = chunk?.message?.content || '';
+                                if (textPart) {
+                                    reply += textPart;
+                                    writeSse(controller, 'token', { text: textPart });
+                                }
+                                if (typeof chunk?.eval_count === 'number') tokenUsage = chunk.eval_count;
+                            }
+                        }
+
+                        try {
+                            reader.releaseLock();
+                        } catch {
+                            // Reader may already be released after the stream ends.
+                        }
+
+                        return { reply, tokenUsage };
+                    };
+
+                    const isMapOptionsMetadata = (metadata: unknown) => {
+                        return asRecord(metadata).event === 'map_options';
+                    };
+
+                    const updateCachedAssistantMessageMetadata = async (
+                        messageId: string,
+                        metadata: Prisma.InputJsonObject
+                    ) => {
+                        const cachedMessages = await redis.lrange(redisKey, 0, -1);
+                        if (cachedMessages.length === 0) return;
+
+                        let changed = false;
+                        const nextMessages = cachedMessages.map((cachedMessage) => {
+                            try {
+                                const parsed = JSON.parse(cachedMessage) as Record<string, unknown>;
+                                if (parsed.id !== messageId) return cachedMessage;
+
+                                changed = true;
+                                return JSON.stringify({
+                                    ...parsed,
+                                    metadata
+                                });
+                            } catch {
+                                return cachedMessage;
+                            }
+                        });
+
+                        if (!changed) return;
+
+                        await redis.del(redisKey);
+                        await redis.rpush(redisKey, ...nextMessages);
+                        await redis.expire(redisKey, REDIS_TTL);
+                    };
+
+                    const findLatestMapOptionsMessageId = async () => {
+                        if (isGuest) return null;
+
+                        const cachedMessageId = typeof savedMapSelectionArgs?.mapOptionsMessageId === 'string'
+                            ? savedMapSelectionArgs.mapOptionsMessageId
+                            : undefined;
+                        if (cachedMessageId) return cachedMessageId;
+
+                        for (const message of [...messagesForLLM].reverse()) {
+                            const record = asRecord(message);
+                            if (record.role !== 'assistant') continue;
+                            if (!isMapOptionsMetadata(record.metadata)) continue;
+
+                            const id = typeof record.id === 'string' ? record.id : undefined;
+                            if (id) return id;
+                        }
+
+                        const recentAssistantMessages = await prisma.messages.findMany({
+                            where: {
+                                conversation_id: convId,
+                                role: 'assistant',
+                                deleted_at: null
+                            },
+                            orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+                            take: 30,
+                            select: {
+                                id: true,
+                                metadata: true
+                            }
+                        });
+
+                        const latestMapOptionsMessage = recentAssistantMessages.find((message) => {
+                            return isMapOptionsMetadata(message.metadata);
+                        });
+
+                        return latestMapOptionsMessage?.id || null;
+                    };
+
+                    const rememberMapOptionsMessageId = async (messageId: string | null) => {
+                        if (!messageId) return;
+
+                        savedMapSelectionArgs = mergeMapToolArgs(savedMapSelectionArgs, {
+                            mapOptionsMessageId: messageId
+                        });
+                        await redis.set(mapSelectionStateKey, JSON.stringify(savedMapSelectionArgs), 'EX', REDIS_TTL);
+                    };
+
+                    const saveOrUpdateMapOptionsMessage = async (
+                        payload: ReturnType<typeof buildMapOptionsEvent>,
+                        shouldUpdateExisting: boolean
+                    ) => {
+                        const metadata = createMapOptionsMetadata(payload);
+
+                        if (!shouldUpdateExisting || isGuest) {
+                            const createdMessageId = await saveAssistantMessage('', metadata);
+                            await rememberMapOptionsMessageId(createdMessageId);
+                            return createdMessageId;
+                        }
+
+                        const latestMapOptionsMessageId = await findLatestMapOptionsMessageId();
+                        if (!latestMapOptionsMessageId) {
+                            return null;
+                        }
+
+                        const updateResult = await prisma.messages.updateMany({
+                            where: {
+                                id: latestMapOptionsMessageId,
+                                conversation_id: convId,
+                                role: 'assistant',
+                                deleted_at: null
+                            },
+                            data: { metadata }
+                        });
+                        if (updateResult.count === 0) {
+                            savedMapSelectionArgs = undefined;
+                            await redis.del(mapSelectionStateKey);
+                            return null;
+                        }
+
+                        await updateCachedAssistantMessageMetadata(latestMapOptionsMessageId, metadata);
+                        await rememberMapOptionsMessageId(latestMapOptionsMessageId);
+
+                        return latestMapOptionsMessageId;
+                    };
+
+                    if (latestMapPayload && latestMapStyle && hasUserMessage && !hasMapSelection) {
+                        const styleCatalog = await handleStyleCatalogTool();
+                        const requestedStyleKey = styleCatalog.success && Array.isArray(styleCatalog.styles)
+                            ? resolveRequestedMapStyleKey(message, styleCatalog.styles, latestMapStyle)
+                            : undefined;
+
+                        if (requestedStyleKey) {
+                            const styleResult = await buildMapStylePayload(latestMapPayload, {
+                                presetKey: requestedStyleKey,
+                                instruction: message
+                            });
+
+                            if (styleResult.success) {
+                                writeSse(controller, 'map_style', styleResult);
+                                const suggestionsPayload = buildMapSuggestionsPayload(latestMapPayload, styleResult, styleCatalog);
+                                if (suggestionsPayload) {
+                                    writeSse(controller, 'suggestions', suggestionsPayload);
+                                }
+                                const styleMetadata = createMapMetadata(latestMapPayload, styleResult);
+                                const postReply = await streamPostMapEventReply('map_style', styleResult);
+                                const assistantMessageId = await saveAssistantMessage(
+                                    postReply.reply,
+                                    styleMetadata,
+                                    0,
+                                    postReply.tokenUsage
+                                );
+                                writeSse(controller, 'done', {
+                                    done: true,
+                                    tokenUsage: postReply.tokenUsage,
+                                    assistantmessage_Id: assistantMessageId,
+                                    skippedAssistantReply: true,
+                                    reason: 'map_style_ready'
+                                });
+                                closeSafely();
+                                return;
+                            }
+                        }
+                    }
+
                     const wantsMapAccess = hasMapSelection
                         ? true
                         : hasUserMessage
                             ? await classifyMapAccessIntent(message, hasImages, selectedModel)
                             : false;
-                    const shouldRequireMapApiKey = wantsMapAccess && !hasMapApiKey;
+                    const shouldOfferMapStyleEdit = Boolean(latestMapStyle && hasUserMessage);
+                    const shouldRequireMapApiKey = wantsMapAccess && !hasMapApiKey && !shouldOfferMapStyleEdit;
                     const shouldHandleMap = hasMapSelection || (wantsMapAccess && hasMapApiKey);
+                    if (shouldOfferMapStyleEdit) {
+                        const styleCatalog = await handleStyleCatalogTool();
+                        const colorKeys = styleCatalog.success && Array.isArray(styleCatalog.colors)
+                            ? styleCatalog.colors.map((color) => color.key)
+                            : [];
+                        mapStyleContext = {
+                            role: 'system',
+                            content: [
+                                'Latest active map_style is available. If the user asks to change map visual style, color, size, width, opacity, symbol, heatmap, or paint/layout, call edit_map_style.',
+                                'Do not call get_map_layer for style-only edits.',
+                                'Normalize user color language into colorKeys from the style color catalog when possible. If the user asks for a mixed color, send colorKeys plus mix weights, or a valid colorValue hex.',
+                                `Available colorKeys: ${JSON.stringify(colorKeys)}`,
+                                `Current map_style: ${JSON.stringify(latestMapStyle)}`
+                            ].join('\n')
+                        };
+                    }
 
                     if (shouldRequireMapApiKey) {
                         writeSse(controller, 'map_error', {
@@ -1157,7 +1732,7 @@ export const processChatMessageStream = (
                         }
 
                         sentMapOptionPayloads.add(fingerprint);
-                        writeSse(controller, 'map_options', payload);
+                        writeSse(controller, 'map_options', toPublicMapOptionsEvent(payload));
                         return true;
                     };
 
@@ -1190,7 +1765,16 @@ export const processChatMessageStream = (
                         const statePatch = {
                             ...(payload.intentName ? { intentName: payload.intentName } : {}),
                             ...(payload.provider ? { provider: payload.provider } : {}),
-                            ...(Object.keys(selectedValues).length > 0 ? { params: selectedValues } : {})
+                            ...(
+                                Object.keys(selectedValues).length > 0 || payload.paginationState
+                                    ? {
+                                        params: {
+                                            ...selectedValues,
+                                            ...(payload.paginationState ? { pagination: payload.paginationState } : {})
+                                        }
+                                    }
+                                    : {}
+                            )
                         };
 
                         if (Object.keys(statePatch).length === 0) return;
@@ -1245,7 +1829,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             if (!optionPayload.complete) {
                                 const wroteOptionPayload = writeMapOptionsEvent(optionPayload);
                                 const assistantMessageId = wroteOptionPayload
-                                    ? await saveAssistantMessage('', createMapOptionsMetadata(optionPayload))
+                                    ? await saveOrUpdateMapOptionsMessage(optionPayload, isMapOptionPaginationAction)
                                     : null;
 
                                 writeSse(controller, 'done', {
@@ -1283,15 +1867,16 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                     await clearMapSelectionState();
                                     const mapStylePayload = await writeMapResultEvents(mapResult.payload);
                                     const mapMetadata = createMapMetadata(mapResult.payload, mapStylePayload);
-                                    const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';
+                                    const postReply = await streamPostMapEventReply('map', mapResult.payload);
                                     const assistantMessageId = await saveAssistantMessage(
-                                        mapSummary,
-                                        mapMetadata
+                                        postReply.reply,
+                                        mapMetadata,
+                                        0,
+                                        postReply.tokenUsage
                                     );
-                                    writeSse(controller, 'token', { text: mapSummary });
                                     writeSse(controller, 'done', {
                                         done: true,
-                                        tokenUsage: 0,
+                                        tokenUsage: postReply.tokenUsage,
                                         assistantmessage_Id: assistantMessageId,
                                         skippedAssistantReply: true,
                                         reason: 'map_ready'
@@ -1305,7 +1890,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                     await persistMapSelectionState(nextOptionPayload);
                                     const wroteNextOptionPayload = writeMapOptionsEvent(nextOptionPayload);
                                     const assistantMessageId = wroteNextOptionPayload
-                                        ? await saveAssistantMessage('', createMapOptionsMetadata(nextOptionPayload))
+                                        ? await saveOrUpdateMapOptionsMessage(nextOptionPayload, isMapOptionPaginationAction)
                                         : null;
                                     writeSse(controller, 'done', {
                                         done: true,
@@ -1341,6 +1926,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                         ...(mapAccessContext ? [mapAccessContext] : []),
                         ...(mapSelectionContext ? [mapSelectionContext] : []),
                         ...(mapToolContext ? [mapToolContext] : []),
+                        ...(mapStyleContext ? [mapStyleContext] : []),
                         ...(lastMessageForLLM ? [lastMessageForLLM] : [])
                     ];
                     // เรียก Ollama แบบ stream เพื่อรับ token ทีละส่วน
@@ -1356,6 +1942,12 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             dynamicMapOptionToolSchema,
                             mapToolSchema
                         ] as unknown[];
+                    }
+                    if (shouldOfferMapStyleEdit) {
+                        ollamaPayload.tools = [
+                            ...((ollamaPayload.tools as unknown[] | undefined) || []),
+                            editMapStyleToolSchema
+                        ];
                     }
                     if (selectedFeelingKey === 'aggressive') {
                         ollamaPayload.options = { temperature: 0.7, top_p: 0.9 };
@@ -1415,6 +2007,41 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             console.log(`AI ตัดสินใจเรียก Tool ชื่อ: ${toolName}`);
                             console.log('พร้อมกับแนบข้อมูลมาให้คือ:', toolCall?.function?.arguments ?? toolCall?.arguments);
 
+                            if (toolName === 'edit_map_style') {
+                                const aiArguments = parseToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments);
+                                const editResult = await handleEditMapStyleTool(
+                                    {
+                                        ...aiArguments,
+                                        instruction: typeof aiArguments.instruction === 'string' ? aiArguments.instruction : message
+                                    },
+                                    latestMapStyle
+                                );
+
+                                if (editResult.success) {
+                                    writeSse(controller, 'map_style', editResult);
+                                    const styleCatalog = await handleStyleCatalogTool();
+                                    const suggestionsPayload = buildMapSuggestionsPayload(latestMapPayload, editResult, styleCatalog);
+                                    if (suggestionsPayload) {
+                                        writeSse(controller, 'suggestions', suggestionsPayload);
+                                    }
+                                    mapMetadata = toPrismaJsonObject({
+                                        ...(asRecord(latestMapPayload)),
+                                        event: asRecord(latestMapPayload).event || 'map_style',
+                                        mapStyle: editResult
+                                    });
+
+                                    const postReply = await streamPostMapEventReply('map_style', editResult);
+                                    assistantReply += postReply.reply;
+                                    tokenUsage += postReply.tokenUsage;
+                                } else {
+                                    const styleErrorMessage = getToolErrorMessage(editResult, 'ไม่สามารถแก้ style แผนที่ได้ครับ');
+                                    writeSse(controller, 'map_error', { message: styleErrorMessage });
+                                    assistantReply += styleErrorMessage;
+                                    writeSse(controller, 'token', { text: styleErrorMessage });
+                                }
+                                continue;
+                            }
+
                             if (toolName === 'check_user_map') {
                                 const accessResult = await handleCheckMapAccess(userId, mapHeaderApiKey, message);
                                 if (!sentMapAccessEvent) {
@@ -1465,9 +2092,9 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                         const mapStylePayload = await writeMapResultEvents(mapResult.payload);
                                         mapMetadata = createMapMetadata(mapResult.payload, mapStylePayload);
 
-                                        const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';
-                                        assistantReply += mapSummary;
-                                        writeSse(controller, 'token', { text: mapSummary });
+                                        const postReply = await streamPostMapEventReply('map', mapResult.payload);
+                                        assistantReply += postReply.reply;
+                                        tokenUsage += postReply.tokenUsage;
                                     } else if (mapResult.needsOptions && mapResult.payload) {
                                         const nextOptionPayload = buildMapOptionsEvent(mapResult.payload);
                                         await persistMapSelectionState(nextOptionPayload);
@@ -1501,9 +2128,9 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                 const mapStylePayload = await writeMapResultEvents(mapResult.payload);
                                 mapMetadata = createMapMetadata(mapResult.payload, mapStylePayload);
 
-                                const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';
-                                assistantReply += mapSummary;
-                                writeSse(controller, 'token', { text: mapSummary });
+                                const postReply = await streamPostMapEventReply('map', mapResult.payload);
+                                assistantReply += postReply.reply;
+                                tokenUsage += postReply.tokenUsage;
                             } else if (mapResult.needsOptions && mapResult.payload) {
                                 const optionPayload = buildMapOptionsEvent(mapResult.payload);
                                 await persistMapSelectionState(optionPayload);
@@ -1557,9 +2184,9 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                         const mapStylePayload = await writeMapResultEvents(mapResult.payload);
                                         mapMetadata = createMapMetadata(mapResult.payload, mapStylePayload);
 
-                                        const mapSummary = 'นี่คือข้อมูลแผนที่ตามที่คุณต้องการครับ';
-                                        assistantReply += mapSummary;
-                                        writeSse(controller, 'token', { text: mapSummary });
+                                        const postReply = await streamPostMapEventReply('map', mapResult.payload);
+                                        assistantReply += postReply.reply;
+                                        tokenUsage += postReply.tokenUsage;
                                     } else if (mapResult.needsOptions && mapResult.payload) {
                                         const nextOptionPayload = buildMapOptionsEvent(mapResult.payload);
                                         await persistMapSelectionState(nextOptionPayload);
@@ -1739,9 +2366,11 @@ export const getChatHistory = async (userId: string, role: string, conversationI
         ...message,
         metadata: await hydrateChatAttachmentUrls(message.metadata)
     })));
+    const xApiKey = await getConversationXApiKey(userId, conversationId);
 
     return {
         data: messages,
+        ...(xApiKey ? { xApiKey } : {}),
         pagination: {
             currentPage: page,
             pageSize: limit,
