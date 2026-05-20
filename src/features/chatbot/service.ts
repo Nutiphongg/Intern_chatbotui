@@ -1,4 +1,4 @@
-// src/features/chat/service.ts
+﻿// src/features/chat/service.ts
 import { prisma } from '../setup/prisma';
 import { redis } from '../setup/redis';
 import { Errors } from '../../lib/errors';
@@ -12,6 +12,8 @@ import {
     buildMapStylePayload,
     editMapStyleToolSchema,
     handleEditMapStyleTool,
+    clearMapLayersToolSchema,
+    handleClearMapLayersTool,
     handleStyleCatalogTool,
     checkMapAccessSchema,
     handleCheckMapAccess,
@@ -36,8 +38,8 @@ const REDIS_TTL = 3600; // ให้ Redis จำไว้ 1 ชั่วโม�
 const DEFAULT_OUTPUT_TOKENS = 512;
 const MAP_INTENT_ROUTER_TOKENS = 16;
 const MAP_INTENT_ROUTER_TIMEOUT_MS = 12000;
-const VISION_OUTPUT_TOKENS = 192;
-const VISION_REQUEST_TIMEOUT_MS = 45000;
+const VISION_OUTPUT_TOKENS = 3072;
+const VISION_REQUEST_TIMEOUT_MS = 180000;
 const CHAT_ATTACHMENT_SIGNED_URL_TTL_SECONDS = 60 * 60 * 24;
 const MAX_CHAT_IMAGES = 3;
 const MAX_CHAT_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -56,6 +58,16 @@ type StoredChatImageAttachment = {
     size: number;
     bucket: string;
     path: string;
+};
+
+type VisionDominantColor = {
+    name: string;
+    hex?: string;
+};
+
+type VisionAnalysis = {
+    summary?: string;
+    dominantColors?: VisionDominantColor[];
 };
 
 type ChatHistoryMessage = {
@@ -106,7 +118,7 @@ const findConversationApiKey = async (
     return rows[0];
 };
 
-const getConversationXApiKey = async (
+const getConversationApiKey = async (
     userId: string,
     conversationId: string
 ): Promise<string | undefined> => {
@@ -160,6 +172,8 @@ const fetchOllamaModels = async (): Promise<OllamaModelInfo[]> => {
 
 const resolveVisionModelName = async (): Promise<string> => {
     const configuredModel = VISION_MODEL.trim();
+    if (configuredModel.includes(':')) return configuredModel;
+
     const models = await fetchOllamaModels();
     const exactMatch = models.find((model) => model.name === configuredModel);
     if (exactMatch) return exactMatch.name;
@@ -399,52 +413,166 @@ const getStreamErrorMessage = (error: unknown): string => {
     return 'stream_failed';
 };
 
+const extractOllamaTextContent = (payload: unknown): string | undefined => {
+    const record = asRecord(payload);
+    const message = asRecord(record.message);
+    const content = message.content ?? record.response ?? record.content;
+
+    if (typeof content === 'string' && content.trim()) {
+        return content.trim();
+    }
+
+    if (Array.isArray(content)) {
+        const text = content
+            .map((item) => {
+                if (typeof item === 'string') return item;
+                const itemRecord = asRecord(item);
+                return typeof itemRecord.text === 'string' ? itemRecord.text : '';
+            })
+            .join('')
+            .trim();
+        return text || undefined;
+    }
+
+    return undefined;
+};
+
+const extractJsonObjectText = (value: string): string | undefined => {
+    const trimmed = value.trim();
+    if (!trimmed) return undefined;
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) return trimmed;
+
+    const fencedJson = trimmed.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+    if (fencedJson?.[1]) return fencedJson[1].trim();
+
+    const firstBrace = trimmed.indexOf('{');
+    const lastBrace = trimmed.lastIndexOf('}');
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+        return trimmed.slice(firstBrace, lastBrace + 1);
+    }
+
+    return undefined;
+};
+
+const normalizeVisionDominantColors = (value: unknown): VisionDominantColor[] | undefined => {
+    if (!Array.isArray(value)) return undefined;
+
+    const colors = value
+        .map((item) => {
+            const record = asRecord(item);
+            const name = typeof record.name === 'string'
+                ? record.name.trim()
+                : typeof record.key === 'string'
+                    ? record.key.trim()
+                    : '';
+            const hex = typeof record.hex === 'string' && /^#[0-9a-f]{6}$/i.test(record.hex.trim())
+                ? record.hex.trim().toUpperCase()
+                : undefined;
+
+            return name ? { name, ...(hex ? { hex } : {}) } : undefined;
+        })
+        .filter((color): color is VisionDominantColor => Boolean(color));
+
+    return colors.length > 0 ? colors : undefined;
+};
+
+const parseVisionAnalysis = (content: string | undefined): VisionAnalysis | undefined => {
+    if (!content?.trim()) return undefined;
+
+    const jsonText = extractJsonObjectText(content);
+    if (jsonText) {
+        try {
+            const parsed = JSON.parse(jsonText) as Record<string, unknown>;
+            const summary = typeof parsed.summary === 'string' && parsed.summary.trim()
+                ? parsed.summary.trim()
+                : undefined;
+            const dominantColors = normalizeVisionDominantColors(parsed.dominantColors);
+
+            if (summary || dominantColors) {
+                return {
+                    ...(summary ? { summary } : {}),
+                    ...(dominantColors ? { dominantColors } : {})
+                };
+            }
+        } catch {
+            // Truncated JSON should trigger the plain-text retry instead of being stored as summary text.
+            return undefined;
+        }
+    }
+
+    return { summary: content.trim() };
+};
+
 const analyzeImagesWithVisionModel = async (
     images: ChatImageAttachment[],
     userMessage: string,
     visionModel: string
-): Promise<string | undefined> => {
+): Promise<VisionAnalysis | undefined> => {
     if (images.length === 0) return undefined;
 
-    const abortController = new AbortController();
-    const timeout = setTimeout(() => abortController.abort(), VISION_REQUEST_TIMEOUT_MS);
+    const requestVisionAnalysis = async (prompt: string, responseFormat: 'json' | 'text'): Promise<VisionAnalysis | undefined> => {
+        const abortController = new AbortController();
+        const timeout = setTimeout(() => abortController.abort(), VISION_REQUEST_TIMEOUT_MS);
 
-    const response = await fetch(`${OLLAMA_URL}/api/chat`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-            model: visionModel,
-            stream: false,
-            options: {
-                temperature: 0.1,
-                top_p: 0.8,
-                num_predict: VISION_OUTPUT_TOKENS
-            },
-            messages: [
-                {
-                    role: 'user',
-                    content: [
-                        'You are a vision assistant that summarizes image content for the main chatbot.',
-                        'Return a concise summary based only on visible image evidence. Do not explain your reasoning.',
-                        'Match the user language: answer in Thai when the user asks in Thai, and answer in English when the user asks in English.',
-                        'Include important OCR text if visible.',
-                        'If the user asks about map styling, include colors, visual theme, and practical map style hints.',
-                        `User question: ${userMessage || '(no text question; image only)'}`
-                    ].join('\n'),
-                    images: images.map((image) => image.base64)
-                }
-            ]
-        }),
-        signal: abortController.signal
-    }).finally(() => clearTimeout(timeout));
+        const response = await fetch(`${OLLAMA_URL}/api/chat`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                model: visionModel,
+                stream: false,
+                options: {
+                    temperature: 0.1,
+                    top_p: 0.8,
+                    num_predict: VISION_OUTPUT_TOKENS
+                },
+                messages: [
+                    {
+                        role: 'user',
+                        content: prompt,
+                        images: images.map((image) => image.base64)
+                    }
+                ]
+            }),
+            signal: abortController.signal
+        }).finally(() => clearTimeout(timeout));
 
-    if (!response.ok) {
-        const errorText = await response.text().catch(() => '');
-        throw new Error(`vision model "${visionModel}" request failed: ${response.status} ${response.statusText}${errorText ? ` - ${errorText}` : ''}`);
-    }
+        if (!response.ok) {
+            const errorText = await response.text().catch(() => '');
+            throw new Error(`vision model "${visionModel}" request failed: ${response.status} ${response.statusText}${errorText ? ` - ${errorText}` : ''}`);
+        }
 
-    const payload = await response.json() as { message?: { content?: string } };
-    return payload.message?.content?.trim() || undefined;
+        const payload = await response.json();
+        const analysis = parseVisionAnalysis(extractOllamaTextContent(payload));
+        if (responseFormat === 'json' && !analysis) {
+            const record = asRecord(payload);
+            console.error('[vision] empty JSON response from model:', {
+                model: record.model,
+                done_reason: record.done_reason,
+                eval_count: record.eval_count
+            });
+        }
+        return analysis;
+    };
+
+    const jsonPrompt = [
+        'Return minified JSON only.',
+        'Schema: {"summary":"very short visible description","dominantColors":[{"name":"color name","hex":"#RRGGBB"}]}',
+        'dominantColors must come from the image. Do not use markdown.',
+        `Question: ${userMessage || '(image only)'}`
+    ].join('\n');
+
+    const jsonAnalysis = await requestVisionAnalysis(jsonPrompt, 'json');
+    if (jsonAnalysis?.summary || jsonAnalysis?.dominantColors?.length) return jsonAnalysis;
+
+    const textPrompt = [
+        'Describe the attached image in one short paragraph.',
+        'Mention the most visible colors by name.',
+        'Mention any readable text if visible.',
+        'Do not return JSON. Do not return an empty response.',
+        `Question: ${userMessage || '(image only)'}`
+    ].join('\n');
+
+    return requestVisionAnalysis(textPrompt, 'text');
 };
 
 // const toPrismaJsonObject = (value: unknown): Prisma.InputJsonObject => {
@@ -485,19 +613,49 @@ const getToolErrorMessage = (value: unknown, fallback: string): string => {
 };
 
 const getLatestMapStyleFromMessages = (messages: Array<{ role: string; content: string }>): unknown | undefined => {
+    const clearedLayerIds = new Set<string>();
+
     for (const message of [...messages].reverse()) {
         const metadata = asRecord((message as Record<string, unknown>).metadata);
-        if (metadata.mapStyle) return metadata.mapStyle;
-        if (metadata.event === 'map_style') return metadata;
+        if (metadata.event === 'map_clear') {
+            const mode = metadata.mode;
+            if (mode === 'all') return undefined;
+            if (mode === 'selected' && typeof metadata.layerId === 'string') {
+                clearedLayerIds.add(metadata.layerId);
+            }
+            continue;
+        }
+
+        const mapStyle = metadata.mapStyle || (metadata.event === 'map_style' ? metadata : undefined);
+        const mapStyleLayerId = asRecord(mapStyle).layerId;
+        if (mapStyle && (typeof mapStyleLayerId !== 'string' || !clearedLayerIds.has(mapStyleLayerId))) {
+            return mapStyle;
+        }
     }
 
     return undefined;
 };
 
 const getLatestMapPayloadFromMessages = (messages: Array<{ role: string; content: string }>): unknown | undefined => {
+    const removedLayerIds = new Set<string>();
+
     for (const message of [...messages].reverse()) {
         const metadata = asRecord((message as Record<string, unknown>).metadata);
-        if (metadata.event === 'layer_catalog' && metadata.layer) return metadata;
+        if (metadata.event === 'map_clear') {
+            const mode = metadata.mode;
+            if (mode === 'all') return undefined;
+            if (mode === 'selected' && typeof metadata.layerId === 'string') {
+                removedLayerIds.add(metadata.layerId);
+            }
+            continue;
+        }
+
+        if (metadata.event === 'layer_catalog' && metadata.layer) {
+            const layerId = asRecord(metadata.layer).layerId;
+            if (typeof layerId !== 'string' || !removedLayerIds.has(layerId)) {
+                return metadata;
+            }
+        }
     }
 
     return undefined;
@@ -594,6 +752,52 @@ const hasEditableColorPaint = (mapStyle: unknown): boolean => {
     });
 };
 
+const normalizeSuggestionColorValue = (value: unknown): string | undefined => {
+    if (typeof value !== 'string') return undefined;
+    const color = value.trim();
+    if (/^#[0-9a-f]{3}$/i.test(color)) {
+        const [, r = '', g = '', b = ''] = color;
+        return `#${r}${r}${g}${g}${b}${b}`.toUpperCase();
+    }
+    if (/^#[0-9a-f]{6}$/i.test(color)) return color.toUpperCase();
+    return undefined;
+};
+
+const getPrimaryColorFromPaintValue = (value: unknown): string | undefined => {
+    const directColor = normalizeSuggestionColorValue(value);
+    if (directColor) return directColor;
+
+    if (!Array.isArray(value)) return undefined;
+
+    for (let index = value.length - 1; index >= 0; index -= 1) {
+        const color = normalizeSuggestionColorValue(value[index]);
+        if (color) return color;
+    }
+
+    return undefined;
+};
+
+const getCurrentMapStyleColor = (mapStyle: unknown): string | undefined => {
+    const styleRecord = asRecord(mapStyle);
+    const appliedColor = normalizeSuggestionColorValue(styleRecord.appliedColor);
+    if (appliedColor) return appliedColor;
+
+    const layers = styleRecord.layers;
+    if (!Array.isArray(layers)) return undefined;
+
+    for (const layer of layers) {
+        const paint = asRecord(asRecord(layer).paint);
+        for (const [key, value] of Object.entries(paint)) {
+            if (!key.endsWith('-color') || key === 'heatmap-color') continue;
+
+            const color = getPrimaryColorFromPaintValue(value);
+            if (color) return color;
+        }
+    }
+
+    return undefined;
+};
+
 const buildMapSuggestionsPayload = (
     mapPayload: unknown,
     mapStyle: unknown,
@@ -629,37 +833,62 @@ const buildMapSuggestionsPayload = (
         .filter((option, index, allOptions) => {
             return allOptions.findIndex((item) => item.value === option.value) === index;
         });
-    const nextStyleOption = styleOptions.find((option) => option.value !== activeStyle) || styleOptions[0];
+    const activeStyleIndex = styleOptions.findIndex((option) => option.value === activeStyle);
+    const nextStyleOption = styleOptions.length > 0
+        ? styleOptions[(activeStyleIndex >= 0 ? activeStyleIndex + 1 : 0) % styleOptions.length]
+        : undefined;
 
     const colorOptions = colors
         .map((color) => {
             const record = asRecord(color);
             const value = toSuggestionString(record.key);
+            const colorValue = normalizeSuggestionColorValue(record.value);
             if (!value) return undefined;
 
             return {
                 label: value,
-                value
+                value,
+                ...(colorValue ? { colorValue } : {})
             };
         })
-        .filter((option): option is { label: string; value: string } => Boolean(option))
+        .filter((option): option is { label: string; value: string; colorValue?: string } => Boolean(option))
         .slice(0, 6);
+    const currentColor = getCurrentMapStyleColor(mapStyle);
+    const activeColorIndex = currentColor
+        ? colorOptions.findIndex((option) => option.colorValue === currentColor)
+        : -1;
+    const nextColorOption = colorOptions.length > 0
+        ? colorOptions[(activeColorIndex >= 0 ? activeColorIndex + 1 : 0) % colorOptions.length]!
+        : undefined;
 
     const items = [
         ...(styleOptions.length > 1
             ? [{
                 key: 'change_style',
-                label: 'Change style',
-                promptTemplate: `Change the current map layer style to ${nextStyleOption?.value}`
+                label: 'Change layer style to ',
+                value: nextStyleOption?.value || nextStyleOption?.label,
+                promptTemplate: 'Change the current map layer style to {value}'
             }]
             : []),
         ...(colorOptions.length > 0 && hasEditableColorPaint(mapStyle)
             ? [{
                 key: 'change_color',
-                label: 'Change color',
-                promptTemplate: `Change the current map layer primary color to ${colorOptions[3]?.value || colorOptions[0]?.value}`
+                label: 'Change color style to ',
+                value: nextColorOption?.value,
+                promptTemplate: 'Change the current map layer primary color to {value}'
             }]
-            : [])
+            : []),
+        {
+            key: 'clear_layer',
+            label: 'Clear  layerId',
+            value: 'layerId',
+            promptTemplate: 'Clear map layer {value}'
+        },
+        {
+            key: 'clear_all_layers',
+            label: 'Clear all layers',
+            promptTemplate: 'Clear all map layers'
+        }
     ];
 
     if (items.length === 0) return undefined;
@@ -1040,6 +1269,15 @@ export const processChatMessageStream = (
         }
     };
 
+    const startHeartbeat = (controller: ReadableStreamDefaultController<Uint8Array>) => {
+        if (heartbeat || isClosed) return;
+        heartbeat = setInterval(() => {
+            if (!isClosed) {
+                writeSse(controller, 'ping', { ts: Date.now() });
+            }
+        }, 10000);
+    };
+
     const abortOllamaStream = () => {
         ollamaAbortController?.abort();
         ollamaAbortController = null;
@@ -1073,19 +1311,22 @@ export const processChatMessageStream = (
                 try {
                     if (isClosed) return;
                      
-                    // ส่ง heartbeat กัน proxy/ngrok ตัด connection ตอนโมเดลยังไม่ตอบ token แรก
-                    if (!isClosed) {
-                        heartbeat = setInterval(() => {
-                            if (!isClosed) {
-                                writeSse(controller, 'ping', { ts: Date.now() });
-                            }
-                        }, 10000);
-                    }
+                    // Keep long vision/model requests alive through proxies and API clients.
+                    startHeartbeat(controller);
                     const imageAttachments = rawImages.slice(0, MAX_CHAT_IMAGES).map(parseChatImage);
                     if (rawImages.length > MAX_CHAT_IMAGES) {
                         throw Errors.badRequest(`too many images; max ${MAX_CHAT_IMAGES}`);
                     }
-                    let visionSummary: string | undefined;
+                    const imageAttachmentMetadataPromise = uploadChatImageAttachments(
+                        imageAttachments,
+                        userId,
+                        convId,
+                        userMessageId
+                    )
+                        .then((value) => ({ ok: true as const, value }))
+                        .catch((error) => ({ ok: false as const, error }));
+                    let visionAnalysis: VisionAnalysis | undefined;
+                    let visionErrorMessage: string | undefined;
                     let usedVisionModel = VISION_MODEL;
                     if (imageAttachments.length > 0) {
                         usedVisionModel = await getResolvedVisionModelName();
@@ -1095,13 +1336,16 @@ export const processChatMessageStream = (
                             count: imageAttachments.length
                         });
                         try {
-                            visionSummary = await analyzeImagesWithVisionModel(imageAttachments, message, usedVisionModel);
+                            visionAnalysis = await analyzeImagesWithVisionModel(imageAttachments, message, usedVisionModel);
                             writeSse(controller, 'vision', {
                                 status: 'done',
-                                model: usedVisionModel
+                                model: usedVisionModel,
+                                ...(visionAnalysis?.summary ? { summary: visionAnalysis.summary } : {}),
+                                ...(visionAnalysis?.dominantColors ? { dominantColors: visionAnalysis.dominantColors } : {})
                             });
                         } catch (error) {
                             console.error('[vision] analyze failed:', error);
+                            visionErrorMessage = error instanceof Error ? error.message : 'vision_model_failed';
                             writeSse(controller, 'vision', {
                                 status: 'error',
                                 model: usedVisionModel,
@@ -1109,16 +1353,22 @@ export const processChatMessageStream = (
                             });
                         }
                     }
-                    const imageAttachmentMetadata = await uploadChatImageAttachments(
-                        imageAttachments,
-                        userId,
-                        convId,
-                        userMessageId
-                    );
+                    const imageAttachmentMetadataResult = await imageAttachmentMetadataPromise;
+                    if (!imageAttachmentMetadataResult.ok) {
+                        throw imageAttachmentMetadataResult.error;
+                    }
+                    const imageAttachmentMetadata = imageAttachmentMetadataResult.value;
                     const userMessageMetadata = imageAttachmentMetadata.length > 0
                         ? toPrismaJsonObject({
                             attachments: imageAttachmentMetadata,
-                            ...(visionSummary ? { vision: { model: usedVisionModel, summary: visionSummary } } : {})
+                            vision: {
+                                model: usedVisionModel,
+                                status: visionAnalysis ? 'done' : visionErrorMessage ? 'error' : 'empty',
+                                ...(visionAnalysis?.summary ? { summary: visionAnalysis.summary } : {}),
+                                ...(visionAnalysis?.dominantColors ? { dominantColors: visionAnalysis.dominantColors } : {}),
+                                ...(!visionAnalysis && !visionErrorMessage ? { error: 'vision_model_empty_response' } : {}),
+                                ...(visionErrorMessage ? { error: visionErrorMessage } : {})
+                            }
                         })
                         : undefined;
                     if (currentUserHistoryMessage && userMessageMetadata) {
@@ -1154,7 +1404,7 @@ export const processChatMessageStream = (
                                 await linkConversationApiKey(convId, userApiKeyId);
                             }
                         } else {
-                            const conversationApiKey = await getConversationXApiKey(userId, convId);
+                            const conversationApiKey = await getConversationApiKey(userId, convId);
                             if (conversationApiKey) {
                                 mapHeaderApiKey = conversationApiKey;
                                 hasMapApiKey = true;
@@ -1430,7 +1680,7 @@ export const processChatMessageStream = (
                     };
 
                     const streamPostMapEventReply = async (
-                        eventName: 'map' | 'map_style',
+                        eventName: 'map' | 'map_style' | 'map_clear',
                         eventPayload: unknown
                     ) => {
                         const replyMessages = [
@@ -1447,7 +1697,9 @@ export const processChatMessageStream = (
                                     'Do not claim that you still need to fetch or prepare the map.',
                                     eventName === 'map'
                                         ? 'Say that the requested map layer is ready/displayed. Keep it to one short sentence.'
-                                        : 'Say that the requested map style has been applied. Keep it to one short sentence.',
+                                        : eventName === 'map_style'
+                                            ? 'Say that the requested map style has been applied. Keep it to one short sentence.'
+                                            : 'Say that the requested map layer clear action has been applied. Keep it to one short sentence.',
                                     `Internal context for grounding only, not for direct quotation: ${JSON.stringify(eventPayload).slice(0, 600)}`
                                 ].join('\n')
                             },
@@ -1698,7 +1950,9 @@ export const processChatMessageStream = (
                             role: 'system',
                             content: [
                                 'Latest active map_style is available. If the user asks to change map visual style, color, size, width, opacity, symbol, heatmap, or paint/layout, call edit_map_style.',
+                                'If the user asks to clear displayed map layers, call clear_map_layers. Use mode "selected" for one layerId and mode "all" for every displayed layer.',
                                 'Do not call get_map_layer for style-only edits.',
+                                'Do not call get_map_layer for map layer clear commands.',
                                 'Normalize user color language into colorKeys from the style color catalog when possible. If the user asks for a mixed color, send colorKeys plus mix weights, or a valid colorValue hex.',
                                 `Available colorKeys: ${JSON.stringify(colorKeys)}`,
                                 `Current map_style: ${JSON.stringify(latestMapStyle)}`
@@ -1911,10 +2165,16 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             content: `The user selected these map options in the UI. Treat these as DB-backed params/options for get_map_layer, validate via map_options if uncertain, and call get_map_layer when every required placeholder is present: ${JSON.stringify(mapSelectionPayload)}`
                         }
                         : undefined;
-                    const visionContext = visionSummary
+                    const visionContext = visionAnalysis
                         ? {
                             role: 'system',
-                            content: `The user attached image(s). A vision model (${usedVisionModel}) analyzed them before this chat response. Use this analysis as image context; do not claim you directly saw pixels beyond this analysis. If the user asks to style a map from the image, convert visual colors/themes into map styling intent.\n\nVision analysis:\n${visionSummary}`
+                            content: [
+                                `The user attached image(s). A vision model (${usedVisionModel}) analyzed them before this chat response.`,
+                                'Use this analysis as image context; do not claim you directly saw pixels beyond this analysis.',
+                                'When answering the user, describe colors by natural color names only. Do not mention hex values unless the user explicitly asks for hex/color codes.',
+                                'If the user asks to style a map from the image, you may use the hex values internally for map styling intent.',
+                                `Vision analysis JSON:\n${JSON.stringify(visionAnalysis)}`
+                            ].join('\n')
                         }
                         : undefined;
 
@@ -1946,7 +2206,8 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                     if (shouldOfferMapStyleEdit) {
                         ollamaPayload.tools = [
                             ...((ollamaPayload.tools as unknown[] | undefined) || []),
-                            editMapStyleToolSchema
+                            editMapStyleToolSchema,
+                            clearMapLayersToolSchema
                         ];
                     }
                     if (selectedFeelingKey === 'aggressive') {
@@ -2006,6 +2267,33 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                             console.log(`AI ตัดสินใจเรียก Tool ชื่อ: ${toolName}`);
                             console.log('พร้อมกับแนบข้อมูลมาให้คือ:', toolCall?.function?.arguments ?? toolCall?.arguments);
+
+                            if (toolName === 'clear_map_layers') {
+                                const aiArguments = parseToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments);
+                                const controlResult = await handleClearMapLayersTool(
+                                    userId,
+                                    convId,
+                                    {
+                                        mode: typeof aiArguments.mode === 'string' ? aiArguments.mode : undefined,
+                                        layerId: typeof aiArguments.layerId === 'string' ? aiArguments.layerId : undefined
+                                    }
+                                );
+
+                                if (controlResult.success) {
+                                    writeSse(controller, 'map_clear', controlResult);
+                                    mapMetadata = toPrismaJsonObject(controlResult);
+
+                                    const postReply = await streamPostMapEventReply('map_clear', controlResult);
+                                    assistantReply += postReply.reply;
+                                    tokenUsage += postReply.tokenUsage;
+                                } else {
+                                    const controlErrorMessage = getToolErrorMessage(controlResult, 'ไม่สามารถจัดการ layer แผนที่ได้ครับ');
+                                    writeSse(controller, 'map_error', { message: controlErrorMessage });
+                                    assistantReply += controlErrorMessage;
+                                    writeSse(controller, 'token', { text: controlErrorMessage });
+                                }
+                                continue;
+                            }
 
                             if (toolName === 'edit_map_style') {
                                 const aiArguments = parseToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments);
@@ -2256,7 +2544,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                     // แจ้งจบ stream ให้ frontend ปิด loading/state
                     writeSse(controller, 'done', {
-                        done :
+                        done: true,
                         tokenUsage,
                         assistantmessage_Id: assistantMessageId,
                     });
@@ -2366,11 +2654,11 @@ export const getChatHistory = async (userId: string, role: string, conversationI
         ...message,
         metadata: await hydrateChatAttachmentUrls(message.metadata)
     })));
-    const xApiKey = await getConversationXApiKey(userId, conversationId);
+    const ApiKey = await getConversationApiKey(userId, conversationId);
 
     return {
         data: messages,
-        ...(xApiKey ? { xApiKey } : {}),
+        ...(ApiKey ? { ApiKey } : {}),
         pagination: {
             currentPage: page,
             pageSize: limit,

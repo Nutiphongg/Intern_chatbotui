@@ -1,4 +1,4 @@
-import { prisma } from "../setup/prisma";
+﻿import { prisma } from "../setup/prisma";
 import { decrypt, hashApiKey } from "../setup/encryption";
 import { env } from "../../lib/env";
 import type {
@@ -50,6 +50,17 @@ type EditMapStyleArgs = MapToolArgs & {
   width?: number | string;
   paint?: unknown;
   layout?: unknown;
+};
+
+type ClearMapLayersArgs = {
+  mode?: string;
+  layerId?: string;
+};
+
+type ActiveMapLayer = {
+  layerId: string;
+  title?: string;
+  sourceLayer?: string;
 };
 
 let styleCatalogCache: {
@@ -344,6 +355,75 @@ const safeMapStyleId = (value: string): string => {
 const getMapLayerRecord = (payload: unknown): Record<string, unknown> => {
   const record = pickRecord(payload);
   return pickRecord(record.layer) || record;
+};
+
+const getMapControlLayerInfo = (metadata: unknown): ActiveMapLayer | undefined => {
+  const record = pickRecord(metadata);
+  if (record.event !== "layer_catalog" || !record.layer) return undefined;
+
+  const layer = pickRecord(record.layer);
+  const layerId = toStringValue(layer.layerId) || toStringValue(layer.id);
+  if (!layerId) return undefined;
+
+  return {
+    layerId,
+    ...(toStringValue(layer.title) ? { title: toStringValue(layer.title) } : {}),
+    ...(toStringValue(layer.sourceLayer) ? { sourceLayer: toStringValue(layer.sourceLayer) } : {})
+  };
+};
+
+const getActiveMapLayersFromMetadata = (metadataList: unknown[]): ActiveMapLayer[] => {
+  const activeLayers = new Map<string, ActiveMapLayer>();
+
+  for (const metadata of metadataList) {
+    const record = pickRecord(metadata);
+
+    if (record.event === "layer_catalog") {
+      const layer = getMapControlLayerInfo(record);
+      if (layer) activeLayers.set(layer.layerId, layer);
+      continue;
+    }
+
+    if (record.event !== "map_clear") continue;
+
+    const mode = toStringValue(record.mode);
+    if (mode === "all") {
+      activeLayers.clear();
+      continue;
+    }
+
+    if (mode === "selected") {
+      const layerId = toStringValue(record.layerId);
+      if (layerId) activeLayers.delete(layerId);
+    }
+  }
+
+  return Array.from(activeLayers.values());
+};
+
+export const getActiveMapLayersForConversation = async (
+  userId: string,
+  conversationId: string
+): Promise<ActiveMapLayer[]> => {
+  const messages = await prisma.messages.findMany({
+    where: {
+      conversation_id: conversationId,
+      deleted_at: null,
+      conversations: {
+        user_id: userId,
+        is_deleted: false
+      }
+    },
+    orderBy: [
+      { created_at: "asc" },
+      { id: "asc" }
+    ],
+    select: {
+      metadata: true
+    }
+  });
+
+  return getActiveMapLayersFromMetadata(messages.map((message) => message.metadata));
 };
 
 const scoreStyleCatalogEntry = (
@@ -769,6 +849,68 @@ export const handleEditMapStyleTool = async (
     ...(resolvedColor ? { appliedColor: resolvedColor } : {}),
     ...(colorKeys.length > 0 ? { colorKeys } : {})
   };
+};
+
+export const handleClearMapLayersTool = async (
+  userId: string,
+  conversationId: string,
+  aiArgs: ClearMapLayersArgs
+) => {
+  try {
+    const mode = toStringValue(aiArgs.mode);
+    if (!mode) {
+      return {
+        success: false,
+        event: "map_clear",
+        message: "Map clear mode is required."
+      };
+    }
+
+    const validModes = new Set(["selected", "all"]);
+    if (!validModes.has(mode)) {
+      return {
+        success: false,
+        event: "map_clear",
+        message: `Unsupported map clear mode: ${mode}`
+      };
+    }
+
+    if (mode === "all") {
+      return {
+        success: true,
+        event: "map_clear",
+        mode: "all"
+      };
+    }
+
+    const activeLayers = await getActiveMapLayersForConversation(userId, conversationId);
+    const layer = aiArgs.layerId
+      ? activeLayers.find((item) => item.layerId === aiArgs.layerId)
+      : activeLayers[activeLayers.length - 1];
+
+    if (!layer) {
+      return {
+        success: false,
+        event: "map_clear",
+        mode: "selected",
+        message: "No active map layer matched the clear request."
+      };
+    }
+
+    return {
+      success: true,
+      event: "map_clear",
+      mode: "selected",
+      layerId: layer.layerId
+    };
+  } catch (error) {
+    console.error("Clear Map Layers Tool Error:", error);
+    return {
+      success: false,
+      event: "map_clear",
+      message: "An error occurred while managing map layers."
+    };
+  }
 };
 
 const replaceTemplateVariables = (
@@ -3085,6 +3227,29 @@ export const editMapStyleToolSchema = {
         }
       },
       required: []
+    }
+  }
+};
+
+export const clearMapLayersToolSchema = {
+  type: "function",
+  function: {
+    name: "clear_map_layers",
+    description: "Clear displayed map layers without fetching new map data. Use this when the user wants to clear the current map layer, clear a specific layerId, or clear all displayed map layers.",
+    parameters: {
+      type: "object",
+      properties: {
+        mode: {
+          type: "string",
+          enum: ["selected", "all"],
+          description: "selected clears one layerId and its style/color state. all clears every displayed map layer."
+        },
+        layerId: {
+          type: "string",
+          description: "Specific layerId to clear when mode is selected. If omitted, the latest active layer in the conversation is used."
+        }
+      },
+      required: ["mode"]
     }
   }
 };
