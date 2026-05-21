@@ -503,6 +503,54 @@ const parseVisionAnalysis = (content: string | undefined): VisionAnalysis | unde
     return { summary: content.trim() };
 };
 
+const structureVisionAnalysisWithTextModel = async (
+    visionText: string,
+    userMessage: string
+): Promise<VisionAnalysis | undefined> => {
+    if (!visionText.trim()) return undefined;
+
+    const response = await fetch(`${OLLAMA_URL}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            model: DEFAULT_CHAT_MODEL,
+            stream: false,
+            options: {
+                temperature: 0,
+                num_predict: 256
+            },
+            messages: [
+                {
+                    role: 'system',
+                    content: [
+                        'Convert vision text into compact valid JSON only.',
+                        'Schema: {"summary":"short visible description","dominantColors":[{"name":"color name","hex":"#RRGGBB"}]}',
+                        'dominantColors must be inferred only from the provided vision text.',
+                        'If hex is not explicitly present, infer common hex values for simple color names.',
+                        'Do not include markdown or extra text.'
+                    ].join('\n')
+                },
+                {
+                    role: 'user',
+                    content: JSON.stringify({
+                        userQuestion: userMessage || undefined,
+                        visionText
+                    })
+                }
+            ]
+        })
+    });
+
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '');
+        throw new Error(`vision structuring request failed: ${response.status} ${response.statusText}${errorText ? ` - ${errorText}` : ''}`);
+    }
+
+    const payload = await response.json();
+    const structured = parseVisionAnalysis(extractOllamaTextContent(payload));
+    return structured || { summary: visionText.trim() };
+};
+
 const analyzeImagesWithVisionModel = async (
     images: ChatImageAttachment[],
     userMessage: string,
@@ -510,7 +558,7 @@ const analyzeImagesWithVisionModel = async (
 ): Promise<VisionAnalysis | undefined> => {
     if (images.length === 0) return undefined;
 
-    const requestVisionAnalysis = async (prompt: string, responseFormat: 'json' | 'text'): Promise<VisionAnalysis | undefined> => {
+    const requestVisionText = async (prompt: string): Promise<string | undefined> => {
         const abortController = new AbortController();
         const timeout = setTimeout(() => abortController.abort(), VISION_REQUEST_TIMEOUT_MS);
 
@@ -542,27 +590,8 @@ const analyzeImagesWithVisionModel = async (
         }
 
         const payload = await response.json();
-        const analysis = parseVisionAnalysis(extractOllamaTextContent(payload));
-        if (responseFormat === 'json' && !analysis) {
-            const record = asRecord(payload);
-            console.error('[vision] empty JSON response from model:', {
-                model: record.model,
-                done_reason: record.done_reason,
-                eval_count: record.eval_count
-            });
-        }
-        return analysis;
+        return extractOllamaTextContent(payload);
     };
-
-    const jsonPrompt = [
-        'Return minified JSON only.',
-        'Schema: {"summary":"very short visible description","dominantColors":[{"name":"color name","hex":"#RRGGBB"}]}',
-        'dominantColors must come from the image. Do not use markdown.',
-        `Question: ${userMessage || '(image only)'}`
-    ].join('\n');
-
-    const jsonAnalysis = await requestVisionAnalysis(jsonPrompt, 'json');
-    if (jsonAnalysis?.summary || jsonAnalysis?.dominantColors?.length) return jsonAnalysis;
 
     const textPrompt = [
         'Describe the attached image in one short paragraph.',
@@ -572,7 +601,8 @@ const analyzeImagesWithVisionModel = async (
         `Question: ${userMessage || '(image only)'}`
     ].join('\n');
 
-    return requestVisionAnalysis(textPrompt, 'text');
+    const visionText = await requestVisionText(textPrompt);
+    return structureVisionAnalysisWithTextModel(visionText || '', userMessage);
 };
 
 // const toPrismaJsonObject = (value: unknown): Prisma.InputJsonObject => {
@@ -612,6 +642,17 @@ const getToolErrorMessage = (value: unknown, fallback: string): string => {
         : fallback;
 };
 
+const getClearLayerIds = (metadata: Record<string, unknown>): string[] => {
+    const layerIds = Array.isArray(metadata.layerIds)
+        ? metadata.layerIds.filter((item): item is string => typeof item === 'string' && Boolean(item.trim()))
+        : [];
+
+    return Array.from(new Set([
+        ...layerIds,
+        ...(typeof metadata.layerId === 'string' && metadata.layerId.trim() ? [metadata.layerId] : [])
+    ]));
+};
+
 const getLatestMapStyleFromMessages = (messages: Array<{ role: string; content: string }>): unknown | undefined => {
     const clearedLayerIds = new Set<string>();
 
@@ -620,8 +661,10 @@ const getLatestMapStyleFromMessages = (messages: Array<{ role: string; content: 
         if (metadata.event === 'map_clear') {
             const mode = metadata.mode;
             if (mode === 'all') return undefined;
-            if (mode === 'selected' && typeof metadata.layerId === 'string') {
-                clearedLayerIds.add(metadata.layerId);
+            if (mode === 'selected') {
+                for (const layerId of getClearLayerIds(metadata)) {
+                    clearedLayerIds.add(layerId);
+                }
             }
             continue;
         }
@@ -644,8 +687,10 @@ const getLatestMapPayloadFromMessages = (messages: Array<{ role: string; content
         if (metadata.event === 'map_clear') {
             const mode = metadata.mode;
             if (mode === 'all') return undefined;
-            if (mode === 'selected' && typeof metadata.layerId === 'string') {
-                removedLayerIds.add(metadata.layerId);
+            if (mode === 'selected') {
+                for (const layerId of getClearLayerIds(metadata)) {
+                    removedLayerIds.add(layerId);
+                }
             }
             continue;
         }
@@ -659,6 +704,72 @@ const getLatestMapPayloadFromMessages = (messages: Array<{ role: string; content
     }
 
     return undefined;
+};
+
+const getLatestVisionFromMessages = (messages: Array<{ role: string; content: string }>): unknown | undefined => {
+    for (const message of [...messages].reverse()) {
+        const vision = asRecord(asRecord((message as Record<string, unknown>).metadata).vision);
+        if (Object.keys(vision).length > 0) {
+            return vision;
+        }
+    }
+
+    return undefined;
+};
+
+const getLatestMapClearFromMessages = (messages: Array<{ role: string; content: string }>): unknown | undefined => {
+    for (const message of [...messages].reverse()) {
+        const metadata = asRecord((message as Record<string, unknown>).metadata);
+        if (metadata.event === 'map_clear') {
+            return metadata;
+        }
+    }
+
+    return undefined;
+};
+
+const getLatestMapOptionsFromMessages = (messages: Array<{ role: string; content: string }>): unknown | undefined => {
+    for (const message of [...messages].reverse()) {
+        const metadata = asRecord((message as Record<string, unknown>).metadata);
+        if (metadata.event === 'map_options') {
+            return metadata.payload || metadata;
+        }
+    }
+
+    return undefined;
+};
+
+const buildConversationMemoryFromDb = async (
+    conversationId: string
+): Promise<Record<string, unknown>> => {
+    const dbMessages = await prisma.messages.findMany({
+        where: {
+            conversation_id: conversationId,
+            deleted_at: null
+        },
+        orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+        take: 80,
+        select: {
+            role: true,
+            content: true,
+            metadata: true
+        }
+    });
+
+    const messages = dbMessages.reverse();
+    const latestVision = getLatestVisionFromMessages(messages);
+    const latestMap = getLatestMapPayloadFromMessages(messages);
+    const latestMapStyle = getLatestMapStyleFromMessages(messages);
+    const latestMapClear = getLatestMapClearFromMessages(messages);
+    const latestMapOptions = getLatestMapOptionsFromMessages(messages);
+
+    return {
+        ...(latestVision ? { latestVision } : {}),
+        ...(latestMap ? { latestMap } : {}),
+        ...(latestMapStyle ? { latestMapStyle } : {}),
+        ...(latestMapClear ? { latestMapClear } : {}),
+        ...(latestMapOptions ? { latestMapOptions } : {})
+    };
 };
 
 const normalizeStyleSwitchText = (value: unknown): string => {
@@ -882,7 +993,7 @@ const buildMapSuggestionsPayload = (
             key: 'clear_layer',
             label: 'Clear  layerId',
             value: 'layerId',
-            promptTemplate: 'Clear map layer {value}'
+            promptTemplate: 'Clear map layer '
         },
         {
             key: 'clear_all_layers',
@@ -1246,7 +1357,6 @@ export const processChatMessageStream = (
         ? { id: userMessageId, role: 'user', content: message, created_at: userMessageCreatedAt.toISOString(), is_silent_retry: false }
         : undefined;
 
-
     const encoder = new TextEncoder();
     
     const writeSse = (controller: ReadableStreamDefaultController<Uint8Array>, event: string, data: unknown) => {
@@ -1337,20 +1447,22 @@ export const processChatMessageStream = (
                         });
                         try {
                             visionAnalysis = await analyzeImagesWithVisionModel(imageAttachments, message, usedVisionModel);
-                            writeSse(controller, 'vision', {
+                            const visionPayload = {
                                 status: 'done',
                                 model: usedVisionModel,
                                 ...(visionAnalysis?.summary ? { summary: visionAnalysis.summary } : {}),
                                 ...(visionAnalysis?.dominantColors ? { dominantColors: visionAnalysis.dominantColors } : {})
-                            });
+                            };
+                            writeSse(controller, 'vision', visionPayload);
                         } catch (error) {
                             console.error('[vision] analyze failed:', error);
                             visionErrorMessage = error instanceof Error ? error.message : 'vision_model_failed';
-                            writeSse(controller, 'vision', {
+                            const visionErrorPayload = {
                                 status: 'error',
                                 model: usedVisionModel,
                                 message: 'vision_model_failed'
-                            });
+                            };
+                            writeSse(controller, 'vision', visionErrorPayload);
                         }
                     }
                     const imageAttachmentMetadataResult = await imageAttachmentMetadataPromise;
@@ -1601,8 +1713,22 @@ export const processChatMessageStream = (
                         .filter((msg) => msg.role !== 'system')
                         .map((msg) => ({ role: msg.role, content: msg.content }));
                     const lastMessageForLLM = sanitizedMessagesForLLM.pop();
-                    const latestMapStyle = getLatestMapStyleFromMessages(messagesForLLM);
-                    const latestMapPayload = getLatestMapPayloadFromMessages(messagesForLLM);
+                    const memoryPayload = isGuest
+                        ? {}
+                        : await buildConversationMemoryFromDb(convId);
+                    const latestMapStyle = getLatestMapStyleFromMessages(messagesForLLM) || memoryPayload.latestMapStyle;
+                    const latestMapPayload = getLatestMapPayloadFromMessages(messagesForLLM) || memoryPayload.latestMap;
+                    const conversationMemoryContext = Object.keys(memoryPayload).length > 0
+                        ? {
+                            role: 'system',
+                            content: [
+                                'Conversation memory from the database is available below.',
+                                'Use it as recent conversation state when the user refers to previous images, maps, layers, styles, or colors.',
+                                'Do not mention this memory unless the user asks how memory works.',
+                                `Memory JSON:\n${JSON.stringify(memoryPayload)}`
+                            ].join('\n')
+                        }
+                        : undefined;
                     let mapToolContext: { role: string, content: string } | undefined;
                     let mapStyleContext: { role: string, content: string } | undefined;
                     let mapMetadata: Prisma.InputJsonObject | undefined;
@@ -1950,11 +2076,13 @@ export const processChatMessageStream = (
                             role: 'system',
                             content: [
                                 'Latest active map_style is available. If the user asks to change map visual style, color, size, width, opacity, symbol, heatmap, or paint/layout, call edit_map_style.',
-                                'If the user asks to clear displayed map layers, call clear_map_layers. Use mode "selected" for one layerId and mode "all" for every displayed layer.',
+                                'If the user asks to clear displayed map layers, call clear_map_layers. Use mode "selected" with layerId for one layer or layerIds for multiple layers. Use mode "all" for every displayed layer.',
                                 'Do not call get_map_layer for style-only edits.',
                                 'Do not call get_map_layer for map layer clear commands.',
                                 'Normalize user color language into colorKeys from the style color catalog when possible. If the user asks for a mixed color, send colorKeys plus mix weights, or a valid colorValue hex.',
+                                'If the user asks to use colors from a previous image/photo, read latestVision.dominantColors from conversation memory and call edit_map_style with colorValue from the best matching dominant color hex.',
                                 `Available colorKeys: ${JSON.stringify(colorKeys)}`,
+                                `Latest vision memory: ${JSON.stringify(memoryPayload.latestVision || null)}`,
                                 `Current map_style: ${JSON.stringify(latestMapStyle)}`
                             ].join('\n')
                         };
@@ -2182,6 +2310,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                         systemMessage,
                         ...sanitizedMessagesForLLM,
                         styleReminder,
+                        ...(conversationMemoryContext ? [conversationMemoryContext] : []),
                         ...(visionContext ? [visionContext] : []),
                         ...(mapAccessContext ? [mapAccessContext] : []),
                         ...(mapSelectionContext ? [mapSelectionContext] : []),
@@ -2275,7 +2404,8 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                     convId,
                                     {
                                         mode: typeof aiArguments.mode === 'string' ? aiArguments.mode : undefined,
-                                        layerId: typeof aiArguments.layerId === 'string' ? aiArguments.layerId : undefined
+                                        layerId: typeof aiArguments.layerId === 'string' ? aiArguments.layerId : undefined,
+                                        layerIds: Array.isArray(aiArguments.layerIds) ? aiArguments.layerIds : undefined
                                     }
                                 );
 

@@ -55,6 +55,7 @@ type EditMapStyleArgs = MapToolArgs & {
 type ClearMapLayersArgs = {
   mode?: string;
   layerId?: string;
+  layerIds?: unknown;
 };
 
 type ActiveMapLayer = {
@@ -78,8 +79,18 @@ const normalizeProvider = (provider?: string): string => {
   return provider?.trim().toUpperCase() || "";
 };
 
+const isVallarisProvider = (provider?: string): boolean => {
+  return normalizeProvider(provider).includes("VALLARIS");
+};
+
 const sameProvider = (left?: string, right?: string): boolean => {
-  return normalizeProvider(left) === normalizeProvider(right);
+  const normalizedLeft = normalizeProvider(left);
+  const normalizedRight = normalizeProvider(right);
+
+  if (!normalizedLeft || !normalizedRight) return false;
+  if (normalizedLeft === normalizedRight) return true;
+
+  return isVallarisProvider(normalizedLeft) && isVallarisProvider(normalizedRight);
 };
 
 const STYLE_CATALOG_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -89,12 +100,7 @@ const getUniqueProviders = (providers: string[]): string[] => {
 };
 
 const providerAllowed = (allowedProviders: string[], provider?: string): boolean => {
-  const normalizedProvider = normalizeProvider(provider);
-  return Boolean(normalizedProvider) && allowedProviders.includes(normalizedProvider);
-};
-
-const isVallarisProvider = (provider?: string): boolean => {
-  return normalizeProvider(provider) === "VALLARIS";
+  return allowedProviders.some((allowedProvider) => sameProvider(allowedProvider, provider));
 };
 
 const pickRecord = (value: unknown): Record<string, unknown> => {
@@ -393,8 +399,10 @@ const getActiveMapLayersFromMetadata = (metadataList: unknown[]): ActiveMapLayer
     }
 
     if (mode === "selected") {
-      const layerId = toStringValue(record.layerId);
-      if (layerId) activeLayers.delete(layerId);
+      const layerIds = toUniqueStringList(record.layerIds, record.layerId);
+      for (const layerId of layerIds) {
+        activeLayers.delete(layerId);
+      }
     }
   }
 
@@ -579,6 +587,10 @@ const toStringList = (value: unknown): string[] => {
   }
   const stringValue = toStringValue(value);
   return stringValue ? [stringValue] : [];
+};
+
+const toUniqueStringList = (...values: unknown[]): string[] => {
+  return Array.from(new Set(values.flatMap(toStringList).filter(Boolean)));
 };
 
 const toNumberList = (value: unknown, length: number): number[] => {
@@ -884,11 +896,12 @@ export const handleClearMapLayersTool = async (
     }
 
     const activeLayers = await getActiveMapLayersForConversation(userId, conversationId);
-    const layer = aiArgs.layerId
-      ? activeLayers.find((item) => item.layerId === aiArgs.layerId)
-      : activeLayers[activeLayers.length - 1];
+    const requestedLayerIds = toUniqueStringList(aiArgs.layerIds, aiArgs.layerId);
+    const layers = requestedLayerIds.length > 0
+      ? activeLayers.filter((item) => requestedLayerIds.includes(item.layerId))
+      : activeLayers.slice(-1);
 
-    if (!layer) {
+    if (layers.length === 0) {
       return {
         success: false,
         event: "map_clear",
@@ -901,7 +914,8 @@ export const handleClearMapLayersTool = async (
       success: true,
       event: "map_clear",
       mode: "selected",
-      layerId: layer.layerId
+      layerIds: layers.map((layer) => layer.layerId),
+      ...(layers.length === 1 ? { layerId: layers[0].layerId } : {})
     };
   } catch (error) {
     console.error("Clear Map Layers Tool Error:", error);
@@ -2729,6 +2743,93 @@ const buildVectorTileSampleUrl = (
     .replace(/{y}/g, String(y));
 };
 
+const buildVectorTileSampleUrls = (
+  tileTemplates: string[] | undefined,
+  center: number[] | undefined,
+  bounds: number[] | undefined,
+  minzoom: number | undefined,
+  maxzoom: number | undefined
+): string[] => {
+  const template = tileTemplates?.[0];
+  if (!template) return [];
+
+  const centerZoom = center?.[2];
+  const minZoomValue = minzoom ?? 0;
+  const maxZoomValue = maxzoom ?? Math.max(minZoomValue, Number.isFinite(centerZoom) ? centerZoom as number : minZoomValue);
+  const rawZooms = [
+    Number.isFinite(centerZoom) ? centerZoom as number : undefined,
+    maxZoomValue,
+    Math.floor((minZoomValue + maxZoomValue) / 2),
+    minZoomValue
+  ];
+  const zooms = Array.from(new Set(
+    rawZooms
+      .map((zoom) => zoom === undefined ? undefined : Math.max(minZoomValue, Math.min(maxZoomValue, Math.floor(zoom))))
+      .filter((zoom): zoom is number => zoom !== undefined)
+  ));
+  const normalizedTemplate = template
+    .replace(/%7Bz%7D/gi, "{z}")
+    .replace(/%7Bx%7D/gi, "{x}")
+    .replace(/%7By%7D/gi, "{y}");
+  const urls: string[] = [];
+  const samplePoints: Array<[number, number]> = [];
+
+  if (center?.[0] !== undefined && center?.[1] !== undefined) {
+    samplePoints.push([center[0], center[1]]);
+  }
+
+  if (bounds?.length === 4) {
+    const [minLon, minLat, maxLon, maxLat] = bounds;
+    const lonSteps = [0.25, 0.5, 0.75];
+    const latSteps = [0.25, 0.5, 0.75];
+
+    for (const lonStep of lonSteps) {
+      for (const latStep of latSteps) {
+        samplePoints.push([
+          minLon + (maxLon - minLon) * lonStep,
+          minLat + (maxLat - minLat) * latStep
+        ]);
+      }
+    }
+  }
+
+  const uniqueSamplePoints = Array.from(
+    new Map(samplePoints.map(([lon, lat]) => [`${lon.toFixed(6)},${lat.toFixed(6)}`, [lon, lat] as [number, number]])).values()
+  );
+  if (uniqueSamplePoints.length === 0) return [];
+
+  for (const zoom of zooms) {
+    for (const [lon, lat] of uniqueSamplePoints) {
+      const { x, y } = lonLatToTile(lon, lat, zoom);
+      const maxIndex = 2 ** zoom - 1;
+      const offsets = zoom <= 6
+        ? [[0, 0]]
+        : [
+          [0, 0],
+          [-1, 0],
+          [1, 0],
+          [0, -1],
+          [0, 1]
+        ];
+
+      for (const [dx, dy] of offsets) {
+        const sampleX = x + dx;
+        const sampleY = y + dy;
+        if (sampleX < 0 || sampleY < 0 || sampleX > maxIndex || sampleY > maxIndex) continue;
+
+        urls.push(
+          normalizedTemplate
+            .replace(/{z}/g, String(zoom))
+            .replace(/{x}/g, String(sampleX))
+            .replace(/{y}/g, String(sampleY))
+        );
+      }
+    }
+  }
+
+  return Array.from(new Set(urls)).slice(0, 36);
+};
+
 const fetchVectorTileBytes = async (url: string): Promise<Uint8Array> => {
   const abortController = new AbortController();
   const timeout = setTimeout(() => abortController.abort(), VECTOR_TILE_GEOMETRY_INFER_TIMEOUT_MS);
@@ -2836,6 +2937,7 @@ const inferVectorTileGeometryType = async (
   layerId: string,
   tileTemplates: string[] | undefined,
   center: number[] | undefined,
+  bounds: number[] | undefined,
   minzoom: number | undefined,
   maxzoom: number | undefined
 ): Promise<string | undefined> => {
@@ -2843,11 +2945,23 @@ const inferVectorTileGeometryType = async (
   if (cached && cached.expiresAt > Date.now()) return cached.geometryType;
 
   const sampleUrl = buildVectorTileSampleUrl(tileTemplates, center, minzoom, maxzoom);
-  if (!sampleUrl) return undefined;
+  const sampleUrls = buildVectorTileSampleUrls(tileTemplates, center, bounds, minzoom, maxzoom);
+  const candidateUrls = Array.from(new Set([
+    ...(sampleUrl ? [sampleUrl] : []),
+    ...sampleUrls
+  ]));
+  if (candidateUrls.length === 0) return undefined;
 
   try {
-    const bytes = await fetchVectorTileBytes(sampleUrl);
-    const geometryType = vectorTileFeatureTypeToGeometryType(readFirstVectorTileFeatureType(bytes));
+    const results = await Promise.allSettled(
+      candidateUrls.map(async (url) => {
+        const bytes = await fetchVectorTileBytes(url);
+        return vectorTileFeatureTypeToGeometryType(readFirstVectorTileFeatureType(bytes));
+      })
+    );
+    const geometryType = results.find((result): result is PromiseFulfilledResult<string> => (
+      result.status === "fulfilled" && Boolean(result.value)
+    ))?.value;
     if (geometryType) {
       vectorTileGeometryCache.set(layerId, {
         geometryType,
@@ -2886,14 +3000,15 @@ const buildVectorTileLayerPayload = async (
   const maxzoom = toNumberValue(tileRecord.maxzoom ?? tileRecord.maxZoom);
   const center = toNumberArray(tileRecord.center);
   const bounds = toNumberArray(tileRecord.bounds);
-  const secureTiles = toStringArray(tileRecord.tiles)
+  const secureTiles = (toStringArray(tileRecord.tiles)
     || toStringArray(tileRecord.tileUrls)
-    || toStringArray(tileRecord.tile_urls);
+    || toStringArray(tileRecord.tile_urls))
+    ?.map((url) => appendApiKeyQuery(url, apiKey));
   const tiles = secureTiles?.map(createVectorTilePublicUrl);
   const template = pickRecord(config.layerConfigTemplate);
   const geometryType = getDirectGeometryType(tileRecord)
     || getDirectGeometryType(template)
-    || await inferVectorTileGeometryType(layerId, secureTiles, center, minzoom, maxzoom);
+    || await inferVectorTileGeometryType(layerId, secureTiles, center, bounds, minzoom, maxzoom);
   const sourceLayer = findSourceLayer(tileRecord, layerId);
 
   return {
@@ -3128,7 +3243,6 @@ export const mapToolSchema = {
         },
         provider: {
           type: "string",
-          enum: ["GISTDA", "VALLARIS"],
           description: "The provider from map_access that the user is allowed to use"
         },
         params: {
@@ -3242,11 +3356,16 @@ export const clearMapLayersToolSchema = {
         mode: {
           type: "string",
           enum: ["selected", "all"],
-          description: "selected clears one layerId and its style/color state. all clears every displayed map layer."
+          description: "selected clears one or more layerIds and their style/color state. all clears every displayed map layer."
         },
         layerId: {
           type: "string",
           description: "Specific layerId to clear when mode is selected. If omitted, the latest active layer in the conversation is used."
+        },
+        layerIds: {
+          type: "array",
+          items: { type: "string" },
+          description: "Specific layerIds to clear when mode is selected. Use this when the user asks to clear more than one layer."
         }
       },
       required: ["mode"]
@@ -3276,7 +3395,6 @@ export const mapOptionToolSchema = {
         },
         provider: {
           type: "string",
-          enum: ["GISTDA", "VALLARIS"],
           description: "The provider from map_access, if known"
         },
         params: {
