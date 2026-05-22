@@ -24,6 +24,10 @@ import {
     buildMapOptionChoiceContext
 } from '../map/tools';
 import type { Prisma } from '@prisma/client';
+import {
+    retrieveConversationMemoryChunks,
+    saveConversationMemoryChunks
+} from './memoryChunks';
 
 
 
@@ -196,13 +200,15 @@ const getResolvedVisionModelName = async (): Promise<string> => {
     return resolvedVisionModelPromise;
 };
 
-const classifyMapAccessIntent = async (
+type MapRequestIntent = 'map_access' | 'map_control' | 'chat';
+
+const classifyMapRequestIntent = async (
     message: string,
     hasImages: boolean,
     model: string
-): Promise<boolean> => {
+): Promise<MapRequestIntent> => {
     const trimmedMessage = message.trim();
-    if (!trimmedMessage) return false;
+    if (!trimmedMessage) return 'chat';
 
     const abortController = new AbortController();
     const timeout = setTimeout(() => abortController.abort(), MAP_INTENT_ROUTER_TIMEOUT_MS);
@@ -222,10 +228,11 @@ const classifyMapAccessIntent = async (
                     {
                         role: 'system',
                         content: [
-                            'Classify whether the user is asking to access existing map/layer/tile data from an external map API.',
-                            'Return only JSON: {"intent":"map_access"} or {"intent":"chat"}.',
+                            'Classify the user request for the map/chat pipeline.',
+                            'Return only JSON with one of these intents: {"intent":"map_access"}, {"intent":"map_control"}, or {"intent":"chat"}.',
                             'Use "map_access" only when the user wants to list, fetch, open, get a URL, get WMS/WMTS/TMS/vector tile, or retrieve map/layer data.',
                             'Use "map_access" when the user asks to list, search, fetch, or choose existing provider map styles/style records/style catalog from the map API.',
+                            'Use "map_control" when the user wants to manage already displayed map state without fetching provider data, such as clearing or hiding existing displayed layers.',
                             'Use "chat" for general discussion, explanations, image analysis, or visual/map style advice that does not require fetching existing provider data.'
                         ].join('\n')
                     },
@@ -241,16 +248,18 @@ const classifyMapAccessIntent = async (
             signal: abortController.signal
         }).finally(() => clearTimeout(timeout));
 
-        if (!response.ok) return false;
+        if (!response.ok) return 'chat';
 
         const payload = await response.json() as { message?: { content?: string } };
         const content = payload.message?.content?.trim() || '';
         const jsonMatch = content.match(/\{[\s\S]*\}/);
         const parsed = JSON.parse(jsonMatch?.[0] || content) as { intent?: string };
-        return parsed.intent === 'map_access';
+        return parsed.intent === 'map_access' || parsed.intent === 'map_control'
+            ? parsed.intent
+            : 'chat';
     } catch (error) {
         console.error('[map-intent] classify failed:', error);
-        return false;
+        return 'chat';
     }
 };
 
@@ -636,9 +645,13 @@ const asRecord = (value: unknown): Record<string, unknown> => {
 };
 
 const getToolErrorMessage = (value: unknown, fallback: string): string => {
-    const error = asRecord(value).error;
-    return typeof error === 'string' && error.trim()
-        ? error
+    const record = asRecord(value);
+    const error = record.error;
+    if (typeof error === 'string' && error.trim()) return error;
+
+    const message = record.message;
+    return typeof message === 'string' && message.trim()
+        ? message
         : fallback;
 };
 
@@ -651,6 +664,192 @@ const getClearLayerIds = (metadata: Record<string, unknown>): string[] => {
         ...layerIds,
         ...(typeof metadata.layerId === 'string' && metadata.layerId.trim() ? [metadata.layerId] : [])
     ]));
+};
+
+type ConversationMapLayerState = {
+    layer?: unknown;
+    mapPayload?: unknown;
+    styles: Record<string, unknown>;
+    activeStyle?: string;
+    latestMapStyle?: unknown;
+};
+
+type ConversationMapState = {
+    layers: Record<string, ConversationMapLayerState>;
+    activeLayerId?: string;
+};
+
+const toClearLayerIdList = (...values: unknown[]): string[] => {
+    const layerIds = values.flatMap((value) => {
+        if (Array.isArray(value)) {
+            return value.filter((item): item is string => typeof item === 'string' && Boolean(item.trim()));
+        }
+
+        if (typeof value !== 'string' || !value.trim()) return [];
+        return value
+            .split(/[\s,]+/g)
+            .map((item) => item.trim())
+            .filter((item) => item.length >= 3);
+    });
+
+    return Array.from(new Set(layerIds));
+};
+
+const getMapStyleKey = (mapStyle: unknown): string | undefined => {
+    const record = asRecord(mapStyle);
+    const directStyleKey = typeof record.styleKey === 'string'
+        ? record.styleKey
+        : typeof record.activeStyle === 'string'
+            ? record.activeStyle
+            : typeof record.preset === 'string'
+                ? record.preset
+                : undefined;
+    if (directStyleKey?.trim()) return directStyleKey.trim();
+
+    const layers = Array.isArray(record.layers) ? record.layers : [];
+    const firstLayerType = asRecord(layers[0]).type;
+    return typeof firstLayerType === 'string' && firstLayerType.trim()
+        ? firstLayerType.trim()
+        : undefined;
+};
+
+const getMapStyleLayerId = (mapStyle: unknown, fallbackLayerId?: string): string | undefined => {
+    const layerId = asRecord(mapStyle).layerId;
+    return typeof layerId === 'string' && layerId.trim()
+        ? layerId.trim()
+        : fallbackLayerId;
+};
+
+const getLayerIdFromMapPayload = (mapPayload: unknown): string | undefined => {
+    const payloadRecord = asRecord(mapPayload);
+    const layerRecord = asRecord(payloadRecord.layer);
+    const layerId = layerRecord.layerId || payloadRecord.layerId;
+    return typeof layerId === 'string' && layerId.trim()
+        ? layerId.trim()
+        : undefined;
+};
+
+const getLayerRecordFromMapPayload = (mapPayload: unknown): unknown | undefined => {
+    const payloadRecord = asRecord(mapPayload);
+    return Object.keys(asRecord(payloadRecord.layer)).length > 0
+        ? payloadRecord.layer
+        : undefined;
+};
+
+const ensureMapLayerState = (
+    state: ConversationMapState,
+    layerId: string
+): ConversationMapLayerState => {
+    state.layers[layerId] ??= { styles: {} };
+    return state.layers[layerId];
+};
+
+const applyMapPayloadToState = (
+    state: ConversationMapState,
+    mapPayload: unknown
+) => {
+    const layerId = getLayerIdFromMapPayload(mapPayload);
+    if (!layerId) return;
+
+    const layerState = ensureMapLayerState(state, layerId);
+    const layer = getLayerRecordFromMapPayload(mapPayload);
+    layerState.mapPayload = mapPayload;
+    if (layer) {
+        layerState.layer = layer;
+    }
+    state.activeLayerId = layerId;
+
+    const mapStyle = asRecord(mapPayload).mapStyle;
+    if (mapStyle) {
+        applyMapStyleToState(state, mapStyle, layerId);
+    }
+};
+
+const applyMapStyleToState = (
+    state: ConversationMapState,
+    mapStyle: unknown,
+    fallbackLayerId?: string
+) => {
+    const layerId = getMapStyleLayerId(mapStyle, fallbackLayerId);
+    const styleKey = getMapStyleKey(mapStyle);
+    if (!layerId || !styleKey) return;
+
+    const layerState = ensureMapLayerState(state, layerId);
+    layerState.styles[styleKey] = mapStyle;
+    layerState.activeStyle = styleKey;
+    layerState.latestMapStyle = mapStyle;
+    state.activeLayerId = layerId;
+};
+
+const getLatestLayerState = (state?: unknown): ConversationMapLayerState | undefined => {
+    const mapState = state as ConversationMapState | undefined;
+    if (!mapState?.layers) return undefined;
+
+    if (mapState.activeLayerId && mapState.layers[mapState.activeLayerId]) {
+        return mapState.layers[mapState.activeLayerId];
+    }
+
+    const layerIds = Object.keys(mapState.layers);
+    return layerIds.length > 0 ? mapState.layers[layerIds[layerIds.length - 1]] : undefined;
+};
+
+const getLatestMapPayloadFromState = (state?: unknown): unknown | undefined => {
+    return getLatestLayerState(state)?.mapPayload;
+};
+
+const getLatestMapStyleFromState = (state?: unknown): unknown | undefined => {
+    const layerState = getLatestLayerState(state);
+    if (!layerState) return undefined;
+    if (layerState.activeStyle && layerState.styles[layerState.activeStyle]) {
+        return layerState.styles[layerState.activeStyle];
+    }
+    return layerState.latestMapStyle;
+};
+
+const buildConversationMapStateFromMessages = (
+    messages: Array<{ role: string; content: string }>
+): ConversationMapState => {
+    const state: ConversationMapState = { layers: {} };
+
+    for (const message of messages) {
+        const metadata = asRecord((message as Record<string, unknown>).metadata);
+        if (Object.keys(metadata).length === 0) continue;
+
+        if (metadata.event === 'map_clear') {
+            if (metadata.mode === 'all') {
+                state.layers = {};
+                state.activeLayerId = undefined;
+                continue;
+            }
+
+            if (metadata.mode === 'selected') {
+                for (const layerId of getClearLayerIds(metadata)) {
+                    delete state.layers[layerId];
+                    if (state.activeLayerId === layerId) {
+                        const activeLayerIds = Object.keys(state.layers);
+                        state.activeLayerId = activeLayerIds[activeLayerIds.length - 1];
+                    }
+                }
+                continue;
+            }
+        }
+
+        if (metadata.event === 'layer_catalog' && metadata.layer) {
+            applyMapPayloadToState(state, metadata);
+            continue;
+        }
+
+        if (metadata.event === 'map_style') {
+            applyMapStyleToState(state, metadata);
+            continue;
+        }
+
+        if (metadata.mapStyle) {
+            applyMapPayloadToState(state, metadata);
+        }
+    }
+
+    return state;
 };
 
 const getLatestMapStyleFromMessages = (messages: Array<{ role: string; content: string }>): unknown | undefined => {
@@ -760,6 +959,7 @@ const buildConversationMemoryFromDb = async (
     const latestVision = getLatestVisionFromMessages(messages);
     const latestMap = getLatestMapPayloadFromMessages(messages);
     const latestMapStyle = getLatestMapStyleFromMessages(messages);
+    const conversationMapState = buildConversationMapStateFromMessages(messages);
     const latestMapClear = getLatestMapClearFromMessages(messages);
     const latestMapOptions = getLatestMapOptionsFromMessages(messages);
 
@@ -767,6 +967,7 @@ const buildConversationMemoryFromDb = async (
         ...(latestVision ? { latestVision } : {}),
         ...(latestMap ? { latestMap } : {}),
         ...(latestMapStyle ? { latestMapStyle } : {}),
+        ...(Object.keys(conversationMapState.layers).length > 0 ? { conversationMapState } : {}),
         ...(latestMapClear ? { latestMapClear } : {}),
         ...(latestMapOptions ? { latestMapOptions } : {})
     };
@@ -819,6 +1020,241 @@ const resolveRequestedMapStyleKey = (
         .sort((left, right) => Number(left.isCurrent) - Number(right.isCurrent) || right.score - left.score);
 
     return matches[0]?.styleKey;
+};
+
+const mapStyleMatchesRequest = (
+    styleKey: string,
+    mapStyle: unknown,
+    requestText: string,
+    target?: string
+): boolean => {
+    const normalizedRequest = normalizeStyleSwitchText(requestText);
+    const normalizedTarget = normalizeStyleSwitchText(target);
+    const styleRecord = asRecord(mapStyle);
+    const layers = Array.isArray(styleRecord.layers) ? styleRecord.layers : [];
+    const layerTypes = layers
+        .map((layer) => asRecord(layer).type)
+        .filter((value): value is string => typeof value === 'string' && Boolean(value.trim()));
+    const terms = [
+        styleKey,
+        styleRecord.styleKey,
+        styleRecord.activeStyle,
+        styleRecord.styleName,
+        styleRecord.preset,
+        ...layerTypes
+    ]
+        .map(normalizeStyleSwitchText)
+        .filter((term, index, allTerms) => term.length >= 3 && allTerms.indexOf(term) === index);
+
+    if (normalizedTarget && terms.some((term) => term === normalizedTarget || term.includes(normalizedTarget) || normalizedTarget.includes(term))) {
+        return true;
+    }
+
+    return Boolean(normalizedRequest) && terms.some((term) => normalizedRequest.includes(term));
+};
+
+const getRequestedLayerIdFromToolArgs = (aiArgs: Record<string, unknown>): string | undefined => {
+    const layerId = aiArgs.layerId || asRecord(aiArgs.params).layerId || asRecord(aiArgs.options).layerId;
+    return typeof layerId === 'string' && layerId.trim() ? layerId.trim() : undefined;
+};
+
+const getRequestedLayerTextFromToolArgs = (aiArgs: Record<string, unknown>): string => {
+    return [
+        aiArgs.layerName,
+        aiArgs.layerTitle,
+        aiArgs.sourceLayer,
+        asRecord(aiArgs.params).layerName,
+        asRecord(aiArgs.params).layerTitle,
+        asRecord(aiArgs.params).sourceLayer,
+        asRecord(aiArgs.options).layerName,
+        asRecord(aiArgs.options).layerTitle,
+        asRecord(aiArgs.options).sourceLayer
+    ]
+        .filter((value): value is string => typeof value === 'string' && Boolean(value.trim()))
+        .join(' ');
+};
+
+const getLayerMatchTerms = (
+    layerId: string,
+    layerState: ConversationMapLayerState
+): string[] => {
+    const layerRecord = asRecord(layerState.layer);
+    const mapPayloadLayer = asRecord(asRecord(layerState.mapPayload).layer);
+    const mapPayloadRecord = asRecord(layerState.mapPayload);
+    const styleValues = Object.values(layerState.styles).flatMap((style) => {
+        const styleRecord = asRecord(style);
+        return [
+            styleRecord.layerId,
+            styleRecord.sourceLayer,
+            styleRecord.source_layer,
+            styleRecord.title,
+            styleRecord.name
+        ];
+    });
+
+    return [
+        layerId,
+        layerRecord.layerId,
+        layerRecord.title,
+        layerRecord.name,
+        layerRecord.sourceLayer,
+        layerRecord.source_layer,
+        layerRecord.geometryType,
+        mapPayloadLayer.layerId,
+        mapPayloadLayer.title,
+        mapPayloadLayer.name,
+        mapPayloadLayer.sourceLayer,
+        mapPayloadLayer.source_layer,
+        mapPayloadRecord.title,
+        mapPayloadRecord.name,
+        ...styleValues
+    ]
+        .map(normalizeStyleSwitchText)
+        .filter((term, index, allTerms) => term.length >= 3 && allTerms.indexOf(term) === index);
+};
+
+const selectMapLayerStateByText = (
+    mapState: ConversationMapState,
+    requestText: string
+): ConversationMapLayerState | undefined => {
+    const normalizedRequest = normalizeStyleSwitchText(requestText);
+    if (!normalizedRequest) return undefined;
+
+    const matches = Object.entries(mapState.layers)
+        .map(([layerId, layerState]) => {
+            const terms = getLayerMatchTerms(layerId, layerState);
+            const matchedTerm = terms
+                .filter((term) => normalizedRequest.includes(term) || term.includes(normalizedRequest))
+                .sort((left, right) => right.length - left.length)[0];
+            if (!matchedTerm) return undefined;
+
+            return {
+                layerState,
+                score: matchedTerm.length,
+                isActive: mapState.activeLayerId === layerId
+            };
+        })
+        .filter((item): item is { layerState: ConversationMapLayerState; score: number; isActive: boolean } => Boolean(item))
+        .sort((left, right) => right.score - left.score || Number(right.isActive) - Number(left.isActive));
+
+    return matches[0]?.layerState;
+};
+
+const selectMapLayerIdsByText = (
+    mapState: ConversationMapState | undefined,
+    requestText: string
+): string[] => {
+    if (!mapState?.layers) return [];
+
+    const normalizedRequest = normalizeStyleSwitchText(requestText);
+    if (!normalizedRequest) return [];
+
+    return Object.entries(mapState.layers)
+        .map(([layerId, layerState]) => {
+            const terms = getLayerMatchTerms(layerId, layerState);
+            const matchedTerm = terms
+                .filter((term) => normalizedRequest.includes(term) || term.includes(normalizedRequest))
+                .sort((left, right) => right.length - left.length)[0];
+            if (!matchedTerm) return undefined;
+
+            return {
+                layerId,
+                score: matchedTerm.length,
+                isActive: mapState.activeLayerId === layerId
+            };
+        })
+        .filter((item): item is { layerId: string; score: number; isActive: boolean } => Boolean(item))
+        .sort((left, right) => right.score - left.score || Number(right.isActive) - Number(left.isActive))
+        .map((item) => item.layerId);
+};
+
+const selectMapLayerStateForEdit = (
+    mapState: ConversationMapState | undefined,
+    aiArgs: Record<string, unknown>,
+    message?: string
+): ConversationMapLayerState | undefined => {
+    if (!mapState?.layers) return undefined;
+
+    const requestedLayerId = getRequestedLayerIdFromToolArgs(aiArgs);
+    if (requestedLayerId && mapState.layers[requestedLayerId]) {
+        return mapState.layers[requestedLayerId];
+    }
+
+    const requestedLayerText = [
+        message,
+        getRequestedLayerTextFromToolArgs(aiArgs)
+    ].filter(Boolean).join(' ');
+    const requestedLayerState = selectMapLayerStateByText(mapState, requestedLayerText);
+    if (requestedLayerState) {
+        return requestedLayerState;
+    }
+
+    return getLatestLayerState(mapState);
+};
+
+const selectMapStyleForEdit = (
+    mapState: ConversationMapState | undefined,
+    aiArgs: Record<string, unknown>,
+    message: string,
+    fallbackMapStyle?: unknown
+): unknown | undefined => {
+    const layerState = selectMapLayerStateForEdit(mapState, aiArgs, message);
+    if (!layerState) return fallbackMapStyle;
+
+    const target = typeof aiArgs.target === 'string' ? aiArgs.target : undefined;
+    const styleEntries = Object.entries(layerState.styles);
+    const requestedStyle = styleEntries.find(([styleKey, mapStyle]) => {
+        return mapStyleMatchesRequest(styleKey, mapStyle, message, target);
+    });
+    if (requestedStyle) return requestedStyle[1];
+
+    if (layerState.activeStyle && layerState.styles[layerState.activeStyle]) {
+        return layerState.styles[layerState.activeStyle];
+    }
+
+    return layerState.latestMapStyle || fallbackMapStyle;
+};
+
+const selectMapPayloadForEdit = (
+    mapState: ConversationMapState | undefined,
+    aiArgs: Record<string, unknown>,
+    fallbackMapPayload?: unknown,
+    message?: string
+): unknown | undefined => {
+    return selectMapLayerStateForEdit(mapState, aiArgs, message)?.mapPayload || fallbackMapPayload;
+};
+
+const buildClearMapLayerArgs = (
+    aiArgs: Record<string, unknown>,
+    message: string,
+    mapState?: ConversationMapState
+) => {
+    const params = asRecord(aiArgs.params);
+    const options = asRecord(aiArgs.options);
+    const explicitLayerIds = toClearLayerIdList(
+        aiArgs.layerIds,
+        aiArgs.layerId,
+        params.layerIds,
+        params.layerId,
+        options.layerIds,
+        options.layerId
+    );
+    const inferredLayerIds = selectMapLayerIdsByText(mapState, message);
+    const layerIds = Array.from(new Set([
+        ...explicitLayerIds,
+        ...inferredLayerIds
+    ]));
+    const mode = typeof aiArgs.mode === 'string' && aiArgs.mode.trim()
+        ? aiArgs.mode
+        : layerIds.length > 0
+            ? 'selected'
+            : undefined;
+
+    return {
+        mode,
+        layerId: layerIds.length === 1 ? layerIds[0] : undefined,
+        layerIds: layerIds.length > 0 ? layerIds : undefined
+    };
 };
 
 const toSuggestionString = (value: unknown): string | undefined => {
@@ -909,10 +1345,24 @@ const getCurrentMapStyleColor = (mapStyle: unknown): string | undefined => {
     return undefined;
 };
 
+const buildClearMapSuggestionItems = () => [
+    {
+        key: 'clear_layer',
+        label: 'Clear layer',
+        promptTemplate: 'Clear map layer {value}'
+    },
+    {
+        key: 'clear_all_layers',
+        label: 'Clear all layers',
+        promptTemplate: 'Clear all map layers'
+    }
+];
+
 const buildMapSuggestionsPayload = (
     mapPayload: unknown,
     mapStyle: unknown,
-    styleCatalog: unknown
+    styleCatalog: unknown,
+    _mapState?: ConversationMapState
 ): Record<string, unknown> | undefined => {
     const layer = getSuggestionLayerRecord(mapPayload);
     const styleRecord = asRecord(mapStyle);
@@ -989,17 +1439,7 @@ const buildMapSuggestionsPayload = (
                 promptTemplate: 'Change the current map layer primary color to {value}'
             }]
             : []),
-        {
-            key: 'clear_layer',
-            label: 'Clear  layerId',
-            value: 'layerId',
-            promptTemplate: 'Clear map layer '
-        },
-        {
-            key: 'clear_all_layers',
-            label: 'Clear all layers',
-            promptTemplate: 'Clear all map layers'
-        }
+        ...buildClearMapSuggestionItems()
     ];
 
     if (items.length === 0) return undefined;
@@ -1008,6 +1448,10 @@ const buildMapSuggestionsPayload = (
         items
     };
 };
+
+const buildMapControlSuggestionsPayload = (): Record<string, unknown> => ({
+    items: buildClearMapSuggestionItems()
+});
 
 const mergeMapToolArgs = (...argsList: Array<Record<string, unknown> | undefined>) => {
     const merged: Record<string, unknown> = {};
@@ -1562,6 +2006,17 @@ export const processChatMessageStream = (
                                     is_silent_retry: false
                                 }
                             });
+                            await saveConversationMemoryChunks({
+                                userId,
+                                message: {
+                                    id: userMessageId,
+                                    conversation_id: convId,
+                                    role: 'user',
+                                    content: message,
+                                    metadata: userMessageMetadata,
+                                    created_at: userMessageCreatedAt
+                                }
+                            });
                         }
                     }
                     const personas: Record<string, string> = {
@@ -1716,8 +2171,13 @@ export const processChatMessageStream = (
                     const memoryPayload = isGuest
                         ? {}
                         : await buildConversationMemoryFromDb(convId);
-                    const latestMapStyle = getLatestMapStyleFromMessages(messagesForLLM) || memoryPayload.latestMapStyle;
-                    const latestMapPayload = getLatestMapPayloadFromMessages(messagesForLLM) || memoryPayload.latestMap;
+                    const conversationMapState = (memoryPayload.conversationMapState || buildConversationMapStateFromMessages(messagesForLLM)) as ConversationMapState | undefined;
+                    const latestMapStyle = getLatestMapStyleFromState(conversationMapState)
+                        || getLatestMapStyleFromMessages(messagesForLLM)
+                        || memoryPayload.latestMapStyle;
+                    const latestMapPayload = getLatestMapPayloadFromState(conversationMapState)
+                        || getLatestMapPayloadFromMessages(messagesForLLM)
+                        || memoryPayload.latestMap;
                     const conversationMemoryContext = Object.keys(memoryPayload).length > 0
                         ? {
                             role: 'system',
@@ -1726,6 +2186,20 @@ export const processChatMessageStream = (
                                 'Use it as recent conversation state when the user refers to previous images, maps, layers, styles, or colors.',
                                 'Do not mention this memory unless the user asks how memory works.',
                                 `Memory JSON:\n${JSON.stringify(memoryPayload)}`
+                            ].join('\n')
+                        }
+                        : undefined;
+                    const retrievedMemoryChunks = !isGuest && hasUserMessage
+                        ? await retrieveConversationMemoryChunks(userId, convId, message)
+                        : [];
+                    const retrievedMemoryContext = retrievedMemoryChunks.length > 0
+                        ? {
+                            role: 'system',
+                            content: [
+                                'Relevant semantic memory chunks retrieved from previous messages/events are available below.',
+                                'Use them as clues to resolve references such as previous image colors, non-active map styles, layerIds, and styleKeys.',
+                                'Do not treat retrieved text as the source of truth for map payloads; use structured map state/metadata for actual tool operations.',
+                                `Retrieved memory JSON:\n${JSON.stringify(retrievedMemoryChunks)}`
                             ].join('\n')
                         }
                         : undefined;
@@ -1751,13 +2225,19 @@ export const processChatMessageStream = (
                         const styleResult = await buildMapStylePayload(payload, {
                             instruction: hasUserMessage ? message : undefined
                         });
-                        writeSse(controller, 'map_style', styleResult);
-                        const styleCatalog = await handleStyleCatalogTool();
-                        const suggestionsPayload = buildMapSuggestionsPayload(payload, styleResult, styleCatalog);
+                        const mapStylePayload = styleResult.success ? styleResult : undefined;
+                        if (mapStylePayload) {
+                            writeSse(controller, 'map_style', mapStylePayload);
+                        }
+
+                        const styleCatalog = mapStylePayload ? await handleStyleCatalogTool() : undefined;
+                        const suggestionsPayload = mapStylePayload && styleCatalog
+                            ? buildMapSuggestionsPayload(payload, mapStylePayload, styleCatalog, conversationMapState)
+                            : buildMapControlSuggestionsPayload();
                         if (suggestionsPayload) {
                             writeSse(controller, 'suggestions', suggestionsPayload);
                         }
-                        return styleResult;
+                        return mapStylePayload;
                     };
                     const saveAssistantMessage = async (
                         content: string,
@@ -1788,6 +2268,17 @@ export const processChatMessageStream = (
                                     model: selectedModel,
                                     response_time: responseTimeMs,
                                     token_usage: tokenUsage,
+                                    metadata,
+                                    created_at: assistantMessageCreatedAt
+                                }
+                            });
+                            await saveConversationMemoryChunks({
+                                userId,
+                                message: {
+                                    id: assistantMessageId,
+                                    conversation_id: convId,
+                                    role: 'assistant',
+                                    content,
                                     metadata,
                                     created_at: assistantMessageCreatedAt
                                 }
@@ -2015,6 +2506,17 @@ export const processChatMessageStream = (
                         }
 
                         await updateCachedAssistantMessageMetadata(latestMapOptionsMessageId, metadata);
+                        await saveConversationMemoryChunks({
+                            userId,
+                            message: {
+                                id: latestMapOptionsMessageId,
+                                conversation_id: convId,
+                                role: 'assistant',
+                                content: '',
+                                metadata,
+                                created_at: new Date()
+                            }
+                        });
                         await rememberMapOptionsMessageId(latestMapOptionsMessageId);
 
                         return latestMapOptionsMessageId;
@@ -2034,7 +2536,7 @@ export const processChatMessageStream = (
 
                             if (styleResult.success) {
                                 writeSse(controller, 'map_style', styleResult);
-                                const suggestionsPayload = buildMapSuggestionsPayload(latestMapPayload, styleResult, styleCatalog);
+                                const suggestionsPayload = buildMapSuggestionsPayload(latestMapPayload, styleResult, styleCatalog, conversationMapState);
                                 if (suggestionsPayload) {
                                     writeSse(controller, 'suggestions', suggestionsPayload);
                                 }
@@ -2059,12 +2561,13 @@ export const processChatMessageStream = (
                         }
                     }
 
-                    const wantsMapAccess = hasMapSelection
-                        ? true
-                        : hasUserMessage
-                            ? await classifyMapAccessIntent(message, hasImages, selectedModel)
-                            : false;
                     const shouldOfferMapStyleEdit = Boolean(latestMapStyle && hasUserMessage);
+                    const mapRequestIntent: MapRequestIntent = hasMapSelection
+                        ? 'map_access'
+                        : hasUserMessage
+                            ? await classifyMapRequestIntent(message, hasImages, selectedModel)
+                            : 'chat';
+                    const wantsMapAccess = mapRequestIntent === 'map_access';
                     const shouldRequireMapApiKey = wantsMapAccess && !hasMapApiKey && !shouldOfferMapStyleEdit;
                     const shouldHandleMap = hasMapSelection || (wantsMapAccess && hasMapApiKey);
                     if (shouldOfferMapStyleEdit) {
@@ -2081,9 +2584,11 @@ export const processChatMessageStream = (
                                 'Do not call get_map_layer for map layer clear commands.',
                                 'Normalize user color language into colorKeys from the style color catalog when possible. If the user asks for a mixed color, send colorKeys plus mix weights, or a valid colorValue hex.',
                                 'If the user asks to use colors from a previous image/photo, read latestVision.dominantColors from conversation memory and call edit_map_style with colorValue from the best matching dominant color hex.',
+                                'If the user names a non-active style such as circle, heatmap, fill, line, or 3d_extrusion, call edit_map_style with target/style wording so the backend can edit that saved style instead of only the latest active style.',
                                 `Available colorKeys: ${JSON.stringify(colorKeys)}`,
                                 `Latest vision memory: ${JSON.stringify(memoryPayload.latestVision || null)}`,
-                                `Current map_style: ${JSON.stringify(latestMapStyle)}`
+                                `Current map_style: ${JSON.stringify(latestMapStyle)}`,
+                                `Conversation map state: ${JSON.stringify(conversationMapState || null)}`
                             ].join('\n')
                         };
                     }
@@ -2116,6 +2621,21 @@ export const processChatMessageStream = (
                         sentMapOptionPayloads.add(fingerprint);
                         writeSse(controller, 'map_options', toPublicMapOptionsEvent(payload));
                         return true;
+                    };
+                    const handleMapFlowException = (error: unknown, fallbackMessage: string) => {
+                        console.error('Map Flow Error:', error);
+                        const message = error instanceof Error && error.message
+                            ? error.message
+                            : fallbackMessage;
+                        const safeMessage = message.toLowerCase().includes('api_key')
+                            ? fallbackMessage
+                            : message;
+                        writeSse(controller, 'map_error', { message: safeMessage });
+                        assistantEventMetadata = toPrismaJsonObject({
+                            event: 'map_error',
+                            message: safeMessage
+                        });
+                        return safeMessage;
                     };
 
                     let savedMapSelectionArgs: Record<string, unknown> | undefined;
@@ -2311,6 +2831,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                         ...sanitizedMessagesForLLM,
                         styleReminder,
                         ...(conversationMemoryContext ? [conversationMemoryContext] : []),
+                        ...(retrievedMemoryContext ? [retrievedMemoryContext] : []),
                         ...(visionContext ? [visionContext] : []),
                         ...(mapAccessContext ? [mapAccessContext] : []),
                         ...(mapSelectionContext ? [mapSelectionContext] : []),
@@ -2402,11 +2923,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                 const controlResult = await handleClearMapLayersTool(
                                     userId,
                                     convId,
-                                    {
-                                        mode: typeof aiArguments.mode === 'string' ? aiArguments.mode : undefined,
-                                        layerId: typeof aiArguments.layerId === 'string' ? aiArguments.layerId : undefined,
-                                        layerIds: Array.isArray(aiArguments.layerIds) ? aiArguments.layerIds : undefined
-                                    }
+                                    buildClearMapLayerArgs(aiArguments, message, conversationMapState)
                                 );
 
                                 if (controlResult.success) {
@@ -2420,31 +2937,32 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                     const controlErrorMessage = getToolErrorMessage(controlResult, 'ไม่สามารถจัดการ layer แผนที่ได้ครับ');
                                     writeSse(controller, 'map_error', { message: controlErrorMessage });
                                     assistantReply += controlErrorMessage;
-                                    writeSse(controller, 'token', { text: controlErrorMessage });
                                 }
                                 continue;
                             }
 
                             if (toolName === 'edit_map_style') {
                                 const aiArguments = parseToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments);
+                                const selectedMapStyle = selectMapStyleForEdit(conversationMapState, aiArguments, message, latestMapStyle);
+                                const selectedMapPayload = selectMapPayloadForEdit(conversationMapState, aiArguments, latestMapPayload, message);
                                 const editResult = await handleEditMapStyleTool(
                                     {
                                         ...aiArguments,
                                         instruction: typeof aiArguments.instruction === 'string' ? aiArguments.instruction : message
                                     },
-                                    latestMapStyle
+                                    selectedMapStyle
                                 );
 
                                 if (editResult.success) {
                                     writeSse(controller, 'map_style', editResult);
                                     const styleCatalog = await handleStyleCatalogTool();
-                                    const suggestionsPayload = buildMapSuggestionsPayload(latestMapPayload, editResult, styleCatalog);
+                                    const suggestionsPayload = buildMapSuggestionsPayload(selectedMapPayload, editResult, styleCatalog, conversationMapState);
                                     if (suggestionsPayload) {
                                         writeSse(controller, 'suggestions', suggestionsPayload);
                                     }
                                     mapMetadata = toPrismaJsonObject({
-                                        ...(asRecord(latestMapPayload)),
-                                        event: asRecord(latestMapPayload).event || 'map_style',
+                                        ...(asRecord(selectedMapPayload)),
+                                        event: asRecord(selectedMapPayload).event || 'map_style',
                                         mapStyle: editResult
                                     });
 
@@ -2476,34 +2994,51 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             }
 
                             if (toolName === 'map_options') {
-                                const aiArguments = parseToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments);
-                                const contextualArguments = buildContextualMapToolArgs(aiArguments);
-                                const optionResult = await handleMapOptionsTool(userId, contextualArguments, mapHeaderApiKey);
-                                const optionPayload = buildMapOptionsEvent(optionResult);
-                                await persistMapSelectionState(optionPayload);
-                                const wroteOptionPayload = optionPayload.complete
-                                    ? false
-                                    : writeMapOptionsEvent(optionPayload);
+                                let aiArguments: Record<string, unknown>;
+                                let contextualArguments: Record<string, unknown>;
+                                let optionPayload: ReturnType<typeof buildMapOptionsEvent>;
+                                let wroteOptionPayload = false;
+                                try {
+                                    aiArguments = parseToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments);
+                                    contextualArguments = buildContextualMapToolArgs(aiArguments);
+                                    const optionResult = await handleMapOptionsTool(userId, contextualArguments, mapHeaderApiKey);
+                                    optionPayload = buildMapOptionsEvent(optionResult);
+                                    await persistMapSelectionState(optionPayload);
+                                    wroteOptionPayload = optionPayload.complete
+                                        ? false
+                                        : writeMapOptionsEvent(optionPayload);
+                                } catch (error) {
+                                    const mapErrorMessage = handleMapFlowException(error, 'Unable to build map options.');
+                                    assistantReply += mapErrorMessage;
+                                    continue;
+                                }
 
                                 if (optionPayload.complete && optionPayload.intentName && optionPayload.provider) {
                                     const selectedValues = asRecord(optionPayload.selectedValues);
-                                    const mapResult = await handleMapTool(
-                                        userId,
-                                        {
-                                            ...contextualArguments,
-                                            intentName: optionPayload.intentName,
-                                            provider: optionPayload.provider,
-                                            params: {
-                                                ...selectedValues,
-                                                ...asRecord(contextualArguments.params)
+                                    let mapResult: Awaited<ReturnType<typeof handleMapTool>>;
+                                    try {
+                                        mapResult = await handleMapTool(
+                                            userId,
+                                            {
+                                                ...contextualArguments,
+                                                intentName: optionPayload.intentName,
+                                                provider: optionPayload.provider,
+                                                params: {
+                                                    ...selectedValues,
+                                                    ...asRecord(contextualArguments.params)
+                                                },
+                                                options: {
+                                                    ...selectedValues,
+                                                    ...asRecord(contextualArguments.options)
+                                                }
                                             },
-                                            options: {
-                                                ...selectedValues,
-                                                ...asRecord(contextualArguments.options)
-                                            }
-                                        },
-                                        mapHeaderApiKey
-                                    );
+                                            mapHeaderApiKey
+                                        );
+                                    } catch (error) {
+                                        const mapErrorMessage = handleMapFlowException(error, 'Unable to fetch map layer.');
+                                        assistantReply += mapErrorMessage;
+                                        continue;
+                                    }
 
                                     if (mapResult.success) {
                                         await clearMapSelectionState();
@@ -2524,7 +3059,6 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                         const mapErrorMessage = getToolErrorMessage(mapResult, 'ไม่สามารถดึงข้อมูลแผนที่ได้ครับ');
                                         writeSse(controller, 'map_error', { message: mapErrorMessage });
                                         assistantReply += mapErrorMessage;
-                                        writeSse(controller, 'token', { text: mapErrorMessage });
                                     }
                                     continue;
                                 }
@@ -2539,7 +3073,14 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                             const aiArguments = parseToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments);
                             const contextualArguments = buildContextualMapToolArgs(aiArguments);
-                            const mapResult = await handleMapTool(userId, contextualArguments, mapHeaderApiKey);
+                            let mapResult: Awaited<ReturnType<typeof handleMapTool>>;
+                            try {
+                                mapResult = await handleMapTool(userId, contextualArguments, mapHeaderApiKey);
+                            } catch (error) {
+                                const mapErrorMessage = handleMapFlowException(error, 'Unable to fetch map layer.');
+                                assistantReply += mapErrorMessage;
+                                continue;
+                            }
 
                             if (mapResult.success) {
                                 await clearMapSelectionState();
@@ -2560,7 +3101,6 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                 const mapErrorMessage = getToolErrorMessage(mapResult, 'ไม่สามารถดึงข้อมูลแผนที่ได้ครับ');
                                 writeSse(controller, 'map_error', { message: mapErrorMessage });
                                 assistantReply += mapErrorMessage;
-                                writeSse(controller, 'token', { text: mapErrorMessage });
                             }
                         }
 
@@ -2569,33 +3109,49 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             console.log("AI เลือกที่จะตอบเป็นข้อความธรรมดา (ไม่ได้เรียก Tool)");
 
                             if (shouldHandleMap) {
-                                const contextualArguments = buildContextualMapToolArgs({});
-                                const optionResult = await handleMapOptionsTool(userId, contextualArguments, mapHeaderApiKey);
-                                const optionPayload = buildMapOptionsEvent(optionResult);
-                                await persistMapSelectionState(optionPayload);
-                                const wroteOptionPayload = optionPayload.complete
-                                    ? false
-                                    : writeMapOptionsEvent(optionPayload);
+                                let contextualArguments: Record<string, unknown>;
+                                let optionPayload: ReturnType<typeof buildMapOptionsEvent>;
+                                let wroteOptionPayload = false;
+                                try {
+                                    contextualArguments = buildContextualMapToolArgs({});
+                                    const optionResult = await handleMapOptionsTool(userId, contextualArguments, mapHeaderApiKey);
+                                    optionPayload = buildMapOptionsEvent(optionResult);
+                                    await persistMapSelectionState(optionPayload);
+                                    wroteOptionPayload = optionPayload.complete
+                                        ? false
+                                        : writeMapOptionsEvent(optionPayload);
+                                } catch (error) {
+                                    const mapErrorMessage = handleMapFlowException(error, 'Unable to build map options.');
+                                    assistantReply += mapErrorMessage;
+                                    return;
+                                }
 
                                 if (optionPayload.complete && optionPayload.intentName && optionPayload.provider) {
                                     const selectedValues = asRecord(optionPayload.selectedValues);
-                                    const mapResult = await handleMapTool(
-                                        userId,
-                                        {
-                                            ...contextualArguments,
-                                            intentName: optionPayload.intentName,
-                                            provider: optionPayload.provider,
-                                            params: {
-                                                ...selectedValues,
-                                                ...asRecord(contextualArguments.params)
+                                    let mapResult: Awaited<ReturnType<typeof handleMapTool>>;
+                                    try {
+                                        mapResult = await handleMapTool(
+                                            userId,
+                                            {
+                                                ...contextualArguments,
+                                                intentName: optionPayload.intentName,
+                                                provider: optionPayload.provider,
+                                                params: {
+                                                    ...selectedValues,
+                                                    ...asRecord(contextualArguments.params)
+                                                },
+                                                options: {
+                                                    ...selectedValues,
+                                                    ...asRecord(contextualArguments.options)
+                                                }
                                             },
-                                            options: {
-                                                ...selectedValues,
-                                                ...asRecord(contextualArguments.options)
-                                            }
-                                        },
-                                        mapHeaderApiKey
-                                    );
+                                            mapHeaderApiKey
+                                        );
+                                    } catch (error) {
+                                        const mapErrorMessage = handleMapFlowException(error, 'Unable to fetch map layer.');
+                                        assistantReply += mapErrorMessage;
+                                        return;
+                                    }
 
                                     if (mapResult.success) {
                                         await clearMapSelectionState();
@@ -2616,7 +3172,6 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                         const mapErrorMessage = getToolErrorMessage(mapResult, 'ไม่สามารถดึงข้อมูลแผนที่ได้ครับ');
                                         writeSse(controller, 'map_error', { message: mapErrorMessage });
                                         assistantReply += mapErrorMessage;
-                                        writeSse(controller, 'token', { text: mapErrorMessage });
                                     }
                                 } else {
                                     if (wroteOptionPayload) {
@@ -2721,8 +3276,19 @@ export const getChatHistory = async (userId: string, role: string, conversationI
         return { data: [], pagination: { currentPage: page, pageSize: limit, totalItems: 0, totalPages: 0 } };
     }
 
-    const allMessages = cached
-   
+    const conversationModel = cached
+        .map((msg) => {
+            try {
+                const parsed = JSON.parse(msg);
+                return typeof parsed.model === 'string' && parsed.model.trim()
+                    ? parsed.model.trim()
+                    : undefined;
+            } catch {
+                return undefined;
+            }
+        })
+        .find(Boolean) ;
+
     const totalCount = cached.length;
     const start = totalCount - (page * limit);
     const end = totalCount -((page - 1) * limit);
@@ -2748,6 +3314,7 @@ export const getChatHistory = async (userId: string, role: string, conversationI
 
     return {
         data: messages,
+        model: conversationModel,
         pagination: {
             currentPage: page,
             pageSize: limit,
@@ -2766,7 +3333,7 @@ export const getChatHistory = async (userId: string, role: string, conversationI
         throw Errors.badRequest('ไม่พบห้องแชท หรือคุณไม่มีสิทธิ์เข้าถึงข้อมูลนี้');
     }
 
-    const [dbMessages, totalCount] = await Promise.all([
+    const [dbMessages, totalCount, conversationModelMessage] = await Promise.all([
         prisma.messages.findMany({
             where: { conversation_id: conversationId ,is_generate:false},
             orderBy: [{ created_at: 'desc' },{id:'desc'}], // 
@@ -2776,6 +3343,15 @@ export const getChatHistory = async (userId: string, role: string, conversationI
         }),
         prisma.messages.count({
             where: { conversation_id: conversationId,is_generate: false }
+        }),
+        prisma.messages.findFirst({
+            where: {
+                conversation_id: conversationId,
+                deleted_at: null,
+                model: { not: null }
+            },
+            orderBy: [{ created_at: 'asc' }, { id: 'asc' }],
+            select: { model: true }
         })
     ]);
 
@@ -2789,6 +3365,7 @@ export const getChatHistory = async (userId: string, role: string, conversationI
     return {
         data: messages,
         ...(ApiKey ? { ApiKey } : {}),
+        model: conversationModelMessage?.model ,
         pagination: {
             currentPage: page,
             pageSize: limit,

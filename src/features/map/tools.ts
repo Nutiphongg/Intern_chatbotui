@@ -88,9 +88,7 @@ const sameProvider = (left?: string, right?: string): boolean => {
   const normalizedRight = normalizeProvider(right);
 
   if (!normalizedLeft || !normalizedRight) return false;
-  if (normalizedLeft === normalizedRight) return true;
-
-  return isVallarisProvider(normalizedLeft) && isVallarisProvider(normalizedRight);
+  return normalizedLeft === normalizedRight;
 };
 
 const STYLE_CATALOG_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -490,12 +488,14 @@ const getCandidateStyleCatalogEntries = (
     normalizeGeometryType(layer.geomType)
   ].filter((item): item is string => Boolean(item));
   const uniqueGeometryTypes = new Set(geometryTypes);
+  if (uniqueGeometryTypes.size === 0) return [];
+
   const geometryAwareEntries = entries.filter((entry) => entry.geometryTypes?.length);
   const candidateEntries = uniqueGeometryTypes.size > 0 && geometryAwareEntries.length > 0
     ? geometryAwareEntries.filter((entry) => entry.geometryTypes?.some((geometryType) => uniqueGeometryTypes.has(geometryType)))
     : entries;
 
-  return candidateEntries.length > 0 ? candidateEntries : entries;
+  return candidateEntries;
 };
 
 export const buildMapStylePayload = async (
@@ -895,8 +895,18 @@ export const handleClearMapLayersTool = async (
       };
     }
 
-    const activeLayers = await getActiveMapLayersForConversation(userId, conversationId);
     const requestedLayerIds = toUniqueStringList(aiArgs.layerIds, aiArgs.layerId);
+    if (requestedLayerIds.length > 0) {
+      return {
+        success: true,
+        event: "map_clear",
+        mode: "selected",
+        layerIds: requestedLayerIds,
+        ...(requestedLayerIds.length === 1 ? { layerId: requestedLayerIds[0] } : {})
+      };
+    }
+
+    const activeLayers = await getActiveMapLayersForConversation(userId, conversationId);
     const layers = requestedLayerIds.length > 0
       ? activeLayers.filter((item) => requestedLayerIds.includes(item.layerId))
       : activeLayers.slice(-1);
@@ -1389,6 +1399,14 @@ const normalizeConfigMatchTerm = (value: string): string => {
   return value.toLowerCase().replace(/[\s()[\]{}"'`.,:;|/_-]+/g, "");
 };
 
+const splitConfigMatchTokens = (value: string): string[] => {
+  return value
+    .toLowerCase()
+    .split(/[\s()[\]{}"'`.,:;|/_-]+/g)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3);
+};
+
 const collectConfigStringValues = (value: unknown): string[] => {
   const cleanValue = toCleanString(value);
   if (cleanValue) return [cleanValue];
@@ -1402,6 +1420,7 @@ const collectConfigStringValues = (value: unknown): string[] => {
 
 const collectConfigMatchTerms = (config: {
   intentName: string;
+  provider?: string;
   layerConfigTemplate?: unknown;
 }): string[] => {
   const template = pickRecord(config.layerConfigTemplate);
@@ -1409,8 +1428,9 @@ const collectConfigMatchTerms = (config: {
   const itemTypeTerms = collectConfigStringValues(collectionQuery.itemType)
     .filter((value) => normalizeConfigMatchTerm(value).length > 4);
 
-  return Array.from(new Set([
+  const rawTerms = [
     config.intentName,
+    config.provider,
     ...collectConfigStringValues(template.type),
     ...collectConfigStringValues(template.handler),
     ...itemTypeTerms,
@@ -1419,13 +1439,21 @@ const collectConfigMatchTerms = (config: {
     ...collectConfigStringValues(template.matchTerms),
     ...collectConfigStringValues(template.searchTerms),
     ...collectConfigStringValues(template.intentKeywords)
-  ]))
+  ];
+
+  return Array.from(new Set(rawTerms.flatMap((value) => {
+    const cleanValue = toCleanString(value);
+    return cleanValue
+      ? [cleanValue, ...splitConfigMatchTokens(cleanValue)]
+      : [];
+  })))
     .map(normalizeConfigMatchTerm)
-    .filter((term) => term.length > 0);
+    .filter((term) => term.length >= 3);
 };
 
 const filterConfigsByQuery = <T extends {
   intentName: string;
+  provider?: string;
   layerConfigTemplate?: unknown;
 }>(
   configs: T[],
@@ -1434,12 +1462,22 @@ const filterConfigsByQuery = <T extends {
   const normalizedQuery = query ? normalizeConfigMatchTerm(query) : "";
   if (!normalizedQuery) return configs;
 
-  const matchedConfigs = configs.filter((config) => {
+  const scoredConfigs = configs.map((config) => {
     const terms = collectConfigMatchTerms(config);
-    return terms.some((term) => normalizedQuery.includes(term));
-  });
+    const score = terms.reduce((total, term) => {
+      if (!normalizedQuery.includes(term)) return total;
+      return total + term.length;
+    }, 0);
 
-  return matchedConfigs.length > 0 ? matchedConfigs : configs;
+    return { config, score };
+  }).filter((item) => item.score > 0);
+
+  if (scoredConfigs.length === 0) return configs;
+
+  const maxScore = Math.max(...scoredConfigs.map((item) => item.score));
+  return scoredConfigs
+    .filter((item) => item.score === maxScore)
+    .map((item) => item.config);
 };
 
 const buildMapOptionQuestion = (options: MapOptionInfo[]): string | undefined => {
