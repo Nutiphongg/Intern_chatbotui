@@ -440,12 +440,15 @@ const getMapControlLayerInfo = (metadata: unknown): ActiveMapLayer | undefined =
   if (record.event !== "layer_catalog" || !record.layer) return undefined;
 
   const layer = pickRecord(record.layer);
-  const layerId = toStringValue(layer.layerId) || toStringValue(layer.id);
+  const layerId = toStringValue(layer.layerId)
+    || toStringValue(layer.styleId)
+    || toStringValue(layer.id);
   if (!layerId) return undefined;
 
   return {
     layerId,
     ...(toStringValue(layer.title) ? { title: toStringValue(layer.title) } : {}),
+    ...(toStringValue(layer.styleTitle) ? { title: toStringValue(layer.styleTitle) } : {}),
     ...(toStringValue(layer.sourceLayer) ? { sourceLayer: toStringValue(layer.sourceLayer) } : {})
   };
 };
@@ -1519,6 +1522,7 @@ const collectConfigStringValues = (value: unknown): string[] => {
 const collectConfigMatchTerms = (config: {
   intentName: string;
   provider?: string;
+  urlTemplate?: string;
   layerConfigTemplate?: unknown;
 }): string[] => {
   const template = pickRecord(config.layerConfigTemplate);
@@ -1529,6 +1533,7 @@ const collectConfigMatchTerms = (config: {
   const rawTerms = [
     config.intentName,
     config.provider,
+    config.urlTemplate,
     ...collectConfigStringValues(template.type),
     ...collectConfigStringValues(template.handler),
     ...itemTypeTerms,
@@ -1541,9 +1546,12 @@ const collectConfigMatchTerms = (config: {
 
   return Array.from(new Set(rawTerms.flatMap((value) => {
     const cleanValue = toCleanString(value);
-    return cleanValue
-      ? [cleanValue, ...splitConfigMatchTokens(cleanValue)]
-      : [];
+    if (!cleanValue) return [];
+    const tokens = splitConfigMatchTokens(cleanValue);
+    const singularTokens = tokens
+      .filter((token) => token.endsWith("s") && token.length > 4)
+      .map((token) => token.slice(0, -1));
+    return [cleanValue, ...tokens, ...singularTokens];
   })))
     .map(normalizeConfigMatchTerm)
     .filter((term) => term.length >= 3);
@@ -3273,6 +3281,7 @@ const buildVallarisLayerPayload = async (
 
   const selectedValues = pickRecord(optionsPayload.selectedValues);
   const styleId = toStringValue(selectedValues.styleId);
+  const styleTitle = toStringValue(selectedValues.styleTitle);
   const selectedType = toStringValue(selectedValues.type);
   const selectedUrl = toStringValue(selectedValues.url);
   const type = selectedType;
@@ -3296,6 +3305,7 @@ const buildVallarisLayerPayload = async (
       event: "layer_catalog",
       layer: {
         styleId,
+        ...(styleTitle ? { title: styleTitle, styleTitle } : {}),
         type,
         url: selectedUrl,
       }
@@ -3571,23 +3581,31 @@ export const clearMapLayersToolSchema = {
   type: "function",
   function: {
     name: "clear_map_layers",
-    description: "Clear displayed map layers without fetching new map data. Use this when the user wants to clear the current map layer, clear a specific layerId, or clear all displayed map layers.",
+    description: "Clear displayed map layers without fetching new map data. Use this when the user wants to clear the current map layer, a selected map layer/style by id or title, multiple selected map layers, or all displayed map layers. The backend resolves titles and styleIds from conversation map state.",
     parameters: {
       type: "object",
       properties: {
         mode: {
           type: "string",
           enum: ["selected", "all"],
-          description: "selected clears one or more layerIds and their style/color state. all clears every displayed map layer."
+          description: "selected clears one or more displayed map entries and their style/color state. all clears every displayed map entry."
         },
         layerId: {
           type: "string",
-          description: "Specific layerId to clear when mode is selected. If omitted, the latest active layer in the conversation is used."
+          description: "Specific map identifier to clear when mode is selected. This may be a layerId, styleId, id, title, styleTitle, or sourceLayer from the conversation map state."
         },
         layerIds: {
           type: "array",
           items: { type: "string" },
-          description: "Specific layerIds to clear when mode is selected. Use this when the user asks to clear more than one layer."
+          description: "Specific map identifiers to clear when mode is selected. Values may be layerIds, styleIds, ids, titles, styleTitles, or sourceLayers."
+        },
+        layerTitle: {
+          type: "string",
+          description: "Layer or style title named by the user when clearing a selected map entry."
+        },
+        styleId: {
+          type: "string",
+          description: "Style id named by the user when clearing a style-based map entry."
         }
       },
       required: ["mode"]
@@ -3663,6 +3681,7 @@ export const handleMapOptionsTool = async (
         intentName: true,
         provider: true,
         baseUrl: true,
+        urlTemplate: true,
         layerConfigTemplate: true
       },
       orderBy: [
@@ -3670,10 +3689,8 @@ export const handleMapOptionsTool = async (
         { intentName: "asc" }
       ]
     });
-    const configs = filterConfigsByQuery(
-      filterConfigsByProviders(allConfigs, allowedProviders),
-      getMapQuery(aiArgs)
-    );
+    const providerAllowedConfigs = filterConfigsByProviders(allConfigs, allowedProviders);
+    const configs = filterConfigsByQuery(providerAllowedConfigs, getMapQuery(aiArgs));
     let intentName = aiArgs.intentName?.trim();
     let provider = normalizeProvider(aiArgs.provider) || undefined;
 
@@ -3684,6 +3701,9 @@ export const handleMapOptionsTool = async (
     const providerScopedConfigs = provider
       ? configs.filter((config) => sameProvider(config.provider, provider))
       : configs;
+    const providerScopedAllConfigs = provider
+      ? providerAllowedConfigs.filter((config) => sameProvider(config.provider, provider))
+      : providerAllowedConfigs;
     const explicitQueryMatches = getExplicitConfigMatchesByQuery(
       providerScopedConfigs,
       getMapQuery(aiArgs)
@@ -3725,7 +3745,7 @@ export const handleMapOptionsTool = async (
         label: value,
         value
       }));
-      const intentChoices = configs.map((config) => ({
+      const intentChoices = providerScopedAllConfigs.map((config) => ({
         label: `${config.provider}:${config.intentName}`,
         value: config.intentName,
         description: `provider=${config.provider}`
@@ -4117,10 +4137,11 @@ export const handleCheckMapAccess = async (userId: string, headerApiKey?: string
         { intentName: "asc" }
       ]
     });
-    const configs = filterConfigsByQuery(
-      filterConfigsByProviders(allConfigs, allowedProviders),
-      query
-    );
+    const providerAllowedConfigs = filterConfigsByProviders(allConfigs, allowedProviders);
+    const explicitQueryMatches = getExplicitConfigMatchesByQuery(providerAllowedConfigs, query);
+    const configs = explicitQueryMatches.length > 0
+      ? explicitQueryMatches
+      : providerAllowedConfigs;
 
     if (configs.length === 0) {
       return {

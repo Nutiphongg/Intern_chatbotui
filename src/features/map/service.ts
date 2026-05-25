@@ -43,7 +43,12 @@ const toSafeApiKeyResponse = (apiKey: EncryptedApiKeyRecord): ApiKeySummaryRespo
     createdAt: apiKey.createdAt
   };
 };
-
+export const getActivehosts = async () => {
+  return await prisma.mapconfig_hosts.findMany({
+    where: { isActive: true },
+    select: { id: true, provider: true, hostname: true }
+  });
+}
 // userapikey
 export const createApiKey = async (data: CreateApiKeyPayload): Promise<CreatedApiKeyResponse> => {
   const provider = normalizeProvider(data.provider);
@@ -65,7 +70,7 @@ export const createApiKey = async (data: CreateApiKeyPayload): Promise<CreatedAp
     throw new Error(`you have API Key name "${keyName}"  ${provider} `);
   }
 
-  // 2. [พระเอกออกโรง] นำ keyValue ที่ Frontend ส่งมาไปเข้ารหัส 
+  // 2. นำ keyValue ที่ Frontend ส่งมาไปเข้ารหัส 
   const { iv, encryptedKey } = encrypt(data.keyValue);
   const keyHash = hashApiKey(data.keyValue);
   const  id_apikey = ulid();

@@ -9,10 +9,7 @@ export type DayRange = number;
 export const CreateApiKeyBody = t.Object({
   provider: t.String({ minLength: 1 }),
   hostId: t.Optional(t.String({ minLength: 1 })),
-  keyName: t.String({ 
-    minLength: 1,
-    default: 'Production Key'
-  }),
+  keyName: t.String({ }),
   keyValue: t.String({ minLength: 1 })
 });
 
