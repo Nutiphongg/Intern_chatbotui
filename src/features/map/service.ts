@@ -36,6 +36,7 @@ const toSafeApiKeyResponse = (apiKey: EncryptedApiKeyRecord): ApiKeySummaryRespo
   return {
     id: apiKey.id,
     provider: apiKey.provider,
+    hostId: apiKey.hostId,
     keyName: apiKey.keyName,
     maskedKey: maskApiKey(keyValue),
     isActive: apiKey.isActive,
@@ -74,6 +75,7 @@ export const createApiKey = async (data: CreateApiKeyPayload): Promise<CreatedAp
       id: id_apikey,
       userId: data.userId,
       provider,
+      ...(data.hostId !== undefined ? { hostId: data.hostId } : {}),
       keyName,
       encryptedKey: encryptedKey,
       iv: iv,
@@ -83,6 +85,7 @@ export const createApiKey = async (data: CreateApiKeyPayload): Promise<CreatedAp
   return {
     id: newApiKey.id,
     provider: newApiKey.provider,
+    hostId: newApiKey.hostId,
     keyName: newApiKey.keyName,
     isActive: newApiKey.isActive,
     createdAt: newApiKey.createdAt,
@@ -98,6 +101,7 @@ export const getApiKeys = async (userId: string): Promise<ApiKeySummaryResponse[
     select: {
       id: true,
       provider: true,
+      hostId: true,
       keyName: true,
       encryptedKey: true,
       iv: true,
@@ -123,6 +127,7 @@ export const getApiKeyById = async (
     select: {
       id: true,
       provider: true,
+      hostId: true,
       keyName: true,
       encryptedKey: true,
       iv: true,
@@ -146,6 +151,7 @@ export const getApiKeyById = async (
 export const updateApiKey = async (data: UpdateApiKeyPayload): Promise<ApiKeySummaryResponse> => {
   if (
     data.keyName === undefined
+    && data.hostId === undefined
     && data.isActive === undefined
   ) {
     throw Errors.badRequest("no api key update data found");
@@ -191,11 +197,13 @@ export const updateApiKey = async (data: UpdateApiKeyPayload): Promise<ApiKeySum
     where: { id: data.apiKeyId },
     data: {
       keyName: nextKeyName,
+      ...(data.hostId !== undefined ? { hostId: data.hostId } : {}),
       ...(data.isActive !== undefined ? { isActive: data.isActive } : {})
     },
     select: {
       id: true,
       provider: true,
+      hostId: true,
       keyName: true,
       encryptedKey: true,
       iv: true,

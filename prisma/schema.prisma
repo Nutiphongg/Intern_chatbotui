@@ -98,11 +98,25 @@ model mapconfig {
   @@unique([intentName, provider])
 }
 
+model mapconfig_hosts {
+  id          String        @id
+  provider    String
+  hostname    String
+  baseUrl     String
+  isActive    Boolean       @default(true)
+  createdAt   DateTime      @default(now())
+  user_apikey user_apikey[]
+
+  @@unique([provider, hostname])
+  @@index([provider])
+}
+
 /// This model contains row level security and requires additional setup for migrations. Visit https://pris.ly/d/row-level-security for more info.
 model user_apikey {
   id           String    @id(map: "UserApiKey_pkey")
   userId       String    @map("user_id")
   provider     String
+  hostId       String?
   keyName      String
   encryptedKey String
   iv           String
@@ -111,9 +125,11 @@ model user_apikey {
   keyHash      String?   @db.VarChar(64)
   deletedAt    DateTime?
   users        users     @relation(fields: [userId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_user_apikey_user")
+  mapconfig_hosts mapconfig_hosts? @relation(fields: [hostId], references: [id], onDelete: SetNull, onUpdate: NoAction, map: "fk_user_apikey_mapconfig_host")
   conversation_api_keys conversation_api_keys[]
 
   @@index([userId], map: "idx_user_apikey_user_id")
+  @@index([hostId], map: "idx_user_apikey_host_id")
   @@index([userId, provider, keyName], map: "idx_user_apikey_user_provider_key_name")
   @@index([keyHash], map: "idx_user_apikey_key_hash")
   @@index([deletedAt], map: "idx_user_apikey_deleted_at")

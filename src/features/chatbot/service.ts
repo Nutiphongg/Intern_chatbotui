@@ -1349,7 +1349,7 @@ const buildClearMapSuggestionItems = () => [
     {
         key: 'clear_layer',
         label: 'Clear layer',
-        promptTemplate: 'Clear map layer {value}'
+        promptTemplate: 'Clear map layer '
     },
     {
         key: 'clear_all_layers',
@@ -1488,6 +1488,12 @@ const normalizeMapSelectionArgs = (selection: unknown): Record<string, unknown> 
             ? record.currentKey
             : undefined;
     const value = record.value ?? record.selectedValue;
+    const selectedIntentName = key === 'intentName' && typeof value === 'string'
+        ? value
+        : undefined;
+    const selectedProvider = key === 'provider' && typeof value === 'string'
+        ? value
+        : undefined;
     const inlineParams = Object.fromEntries(
         Object.entries(record).filter(([entryKey]) => {
             return ![
@@ -1503,7 +1509,12 @@ const normalizeMapSelectionArgs = (selection: unknown): Record<string, unknown> 
             ].includes(entryKey);
         })
     );
-    const selectedParam = key && value !== undefined && value !== null && value !== ''
+    const selectedParam = key
+        && key !== 'intentName'
+        && key !== 'provider'
+        && value !== undefined
+        && value !== null
+        && value !== ''
         ? { [key]: value }
         : {};
     const params = {
@@ -1511,12 +1522,20 @@ const normalizeMapSelectionArgs = (selection: unknown): Record<string, unknown> 
         ...selectedParam,
         ...explicitParams
     };
+    const selectedTopLevelOptions = {
+        ...(selectedIntentName ? { intentName: selectedIntentName } : {}),
+        ...(selectedProvider ? { provider: selectedProvider } : {})
+    };
+    const selectedOptions = {
+        ...explicitOptions,
+        ...selectedTopLevelOptions
+    };
 
     return {
-        ...(typeof record.intentName === 'string' ? { intentName: record.intentName } : {}),
-        ...(typeof record.provider === 'string' ? { provider: record.provider } : {}),
+        ...(typeof record.intentName === 'string' ? { intentName: record.intentName } : selectedIntentName ? { intentName: selectedIntentName } : {}),
+        ...(typeof record.provider === 'string' ? { provider: record.provider } : selectedProvider ? { provider: selectedProvider } : {}),
         ...(Object.keys(params).length > 0 ? { params } : {}),
-        ...(Object.keys(explicitOptions).length > 0 ? { options: explicitOptions } : {}),
+        ...(Object.keys(selectedOptions).length > 0 ? { selectedOptions } : {}),
         ...(Object.keys(explicitVariables).length > 0 ? { variables: explicitVariables } : {})
     };
 };
@@ -2561,7 +2580,9 @@ export const processChatMessageStream = (
                         }
                     }
 
+                    const hasActiveMapLayers = Object.keys(conversationMapState?.layers || {}).length > 0;
                     const shouldOfferMapStyleEdit = Boolean(latestMapStyle && hasUserMessage);
+                    const shouldOfferMapLayerClear = Boolean(hasActiveMapLayers && hasUserMessage);
                     const mapRequestIntent: MapRequestIntent = hasMapSelection
                         ? 'map_access'
                         : hasUserMessage
@@ -2570,7 +2591,7 @@ export const processChatMessageStream = (
                     const wantsMapAccess = mapRequestIntent === 'map_access';
                     const shouldRequireMapApiKey = wantsMapAccess && !hasMapApiKey && !shouldOfferMapStyleEdit;
                     const shouldHandleMap = hasMapSelection || (wantsMapAccess && hasMapApiKey);
-                    if (shouldOfferMapStyleEdit) {
+                    if (shouldOfferMapStyleEdit || shouldOfferMapLayerClear) {
                         const styleCatalog = await handleStyleCatalogTool();
                         const colorKeys = styleCatalog.success && Array.isArray(styleCatalog.colors)
                             ? styleCatalog.colors.map((color) => color.key)
@@ -2578,16 +2599,22 @@ export const processChatMessageStream = (
                         mapStyleContext = {
                             role: 'system',
                             content: [
-                                'Latest active map_style is available. If the user asks to change map visual style, color, size, width, opacity, symbol, heatmap, or paint/layout, call edit_map_style.',
+                                ...(shouldOfferMapStyleEdit
+                                    ? ['Latest active map_style is available. If the user asks to change map visual style, color, size, width, opacity, symbol, heatmap, or paint/layout, call edit_map_style.']
+                                    : []),
                                 'If the user asks to clear displayed map layers, call clear_map_layers. Use mode "selected" with layerId for one layer or layerIds for multiple layers. Use mode "all" for every displayed layer.',
                                 'Do not call get_map_layer for style-only edits.',
                                 'Do not call get_map_layer for map layer clear commands.',
-                                'Normalize user color language into colorKeys from the style color catalog when possible. If the user asks for a mixed color, send colorKeys plus mix weights, or a valid colorValue hex.',
-                                'If the user asks to use colors from a previous image/photo, read latestVision.dominantColors from conversation memory and call edit_map_style with colorValue from the best matching dominant color hex.',
-                                'If the user names a non-active style such as circle, heatmap, fill, line, or 3d_extrusion, call edit_map_style with target/style wording so the backend can edit that saved style instead of only the latest active style.',
-                                `Available colorKeys: ${JSON.stringify(colorKeys)}`,
-                                `Latest vision memory: ${JSON.stringify(memoryPayload.latestVision || null)}`,
-                                `Current map_style: ${JSON.stringify(latestMapStyle)}`,
+                                ...(shouldOfferMapStyleEdit
+                                    ? [
+                                        'Normalize user color language into colorKeys from the style color catalog when possible. If the user asks for a mixed color, send colorKeys plus mix weights, or a valid colorValue hex.',
+                                        'If the user asks to use colors from a previous image/photo, read latestVision.dominantColors from conversation memory and call edit_map_style with colorValue from the best matching dominant color hex.',
+                                        'If the user names a non-active style such as circle, heatmap, fill, line, or 3d_extrusion, call edit_map_style with target/style wording so the backend can edit that saved style instead of only the latest active style.',
+                                        `Available colorKeys: ${JSON.stringify(colorKeys)}`,
+                                        `Latest vision memory: ${JSON.stringify(memoryPayload.latestVision || null)}`,
+                                        `Current map_style: ${JSON.stringify(latestMapStyle)}`
+                                    ]
+                                    : []),
                                 `Conversation map state: ${JSON.stringify(conversationMapState || null)}`
                             ].join('\n')
                         };
@@ -2650,6 +2677,39 @@ export const processChatMessageStream = (
                                     savedMapSelectionArgs = undefined;
                                 }
                             }
+
+                            if (!savedMapSelectionArgs && isMapOptionPaginationAction && !isGuest) {
+                                const latestMapOptions = await prisma.messages.findFirst({
+                                    where: {
+                                        conversation_id: convId,
+                                        role: 'assistant',
+                                        deleted_at: null,
+                                        metadata: {
+                                            path: ['event'],
+                                            equals: 'map_options'
+                                        }
+                                    },
+                                    orderBy: [{ created_at: 'desc' }, { id: 'desc' }],
+                                    select: {
+                                        metadata: true
+                                    }
+                                });
+                                const payload = asRecord(asRecord(latestMapOptions?.metadata).payload);
+                                const selectedValues = asRecord(payload.selectedValues);
+                                const restoredParams = {
+                                    ...selectedValues,
+                                    ...(Object.keys(asRecord(payload.pagination)).length > 0 ? { pagination: payload.pagination } : {})
+                                };
+                                savedMapSelectionArgs = {
+                                    ...(typeof payload.intentName === 'string' ? { intentName: payload.intentName } : {}),
+                                    ...(typeof payload.provider === 'string' ? { provider: payload.provider } : {}),
+                                    ...(Object.keys(restoredParams).length > 0 ? { params: restoredParams } : {}),
+                                    selectedOptions: {
+                                        ...(typeof payload.intentName === 'string' ? { intentName: payload.intentName } : {}),
+                                        ...(typeof payload.provider === 'string' ? { provider: payload.provider } : {})
+                                    }
+                                };
+                            }
                         } else {
                             await redis.del(mapSelectionStateKey);
                         }
@@ -2667,6 +2727,10 @@ export const processChatMessageStream = (
                         const statePatch = {
                             ...(payload.intentName ? { intentName: payload.intentName } : {}),
                             ...(payload.provider ? { provider: payload.provider } : {}),
+                            selectedOptions: {
+                                ...(payload.intentName ? { intentName: payload.intentName } : {}),
+                                ...(payload.provider ? { provider: payload.provider } : {})
+                            },
                             ...(
                                 Object.keys(selectedValues).length > 0 || payload.paginationState
                                     ? {
@@ -2853,10 +2917,10 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             mapToolSchema
                         ] as unknown[];
                     }
-                    if (shouldOfferMapStyleEdit) {
+                    if (shouldOfferMapStyleEdit || shouldOfferMapLayerClear) {
                         ollamaPayload.tools = [
                             ...((ollamaPayload.tools as unknown[] | undefined) || []),
-                            editMapStyleToolSchema,
+                            ...(shouldOfferMapStyleEdit ? [editMapStyleToolSchema] : []),
                             clearMapLayersToolSchema
                         ];
                     }

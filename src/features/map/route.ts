@@ -37,6 +37,7 @@ export const mapConfigRoutes = new Elysia({ prefix: '/management' })
         const result = await createApiKey({
           userId: userId,
           provider: body.provider,
+          hostId: body.hostId,
           keyName: body.keyName,
           keyValue: body.keyValue
         });
@@ -65,6 +66,7 @@ export const mapConfigRoutes = new Elysia({ prefix: '/management' })
         userId: user.id,
         apiKeyId: params.apiKeyId,
         keyName: body.keyName,
+        hostId: body.hostId,
         isActive: body.isActive
       });
 

@@ -18,6 +18,7 @@ export interface ApiKeyIdentityPayload {
 export interface EncryptedApiKeyRecord {
   id: string;
   provider: string;
+  hostId?: string | null;
   keyName: string;
   encryptedKey: string;
   iv: string;
@@ -28,6 +29,7 @@ export interface EncryptedApiKeyRecord {
 export interface ApiKeySummaryResponse {
   id: string;
   provider: string;
+  hostId?: string | null;
   keyName: string;
   maskedKey: string;
   isActive: boolean;
@@ -37,6 +39,7 @@ export interface ApiKeySummaryResponse {
 export interface CreatedApiKeyResponse {
   id: string;
   provider: string;
+  hostId?: string | null;
   keyName: string;
   isActive: boolean;
   createdAt: Date;
