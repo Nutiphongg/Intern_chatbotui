@@ -23,7 +23,7 @@ import {
     resolveUserMapToolConfigs,
     buildMapOptionChoiceContext
 } from '../map/tools';
-import type { Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import {
     retrieveConversationMemoryChunks,
     saveConversationMemoryChunks
@@ -898,6 +898,470 @@ const getLayerRecordFromMapPayload = (mapPayload: unknown): unknown | undefined 
     return Object.keys(asRecord(payloadRecord.layer)).length > 0
         ? payloadRecord.layer
         : undefined;
+};
+
+type ConversationMapLayerRow = {
+    id: string;
+    layerKey: string;
+    title: string | null;
+    type: string | null;
+    order: number;
+    visible: boolean;
+    layerPayload: unknown;
+    mapStyle: unknown | null;
+    activeStyle: string | null;
+    createdAt: Date;
+    updatedAt: Date;
+};
+
+type MapLayerOrderItem = string | Record<string, unknown>;
+type MapLayerOrderPayload = {
+    layerIds?: unknown;
+    layerKeys?: unknown;
+    order?: unknown;
+    layerTitles?: unknown;
+    layers?: unknown;
+    titles?: unknown;
+};
+
+let ensureConversationMapLayersTablePromise: Promise<void> | undefined;
+
+const ensureConversationMapLayersTable = async () => {
+    ensureConversationMapLayersTablePromise ??= (async () => {
+        await prisma.$executeRaw`
+            CREATE TABLE IF NOT EXISTS "conversation_map_layers" (
+                "id" TEXT NOT NULL,
+                "conversation_id" TEXT NOT NULL,
+                "layer_key" TEXT NOT NULL,
+                "title" TEXT,
+                "type" TEXT,
+                "order" INTEGER NOT NULL DEFAULT 0,
+                "visible" BOOLEAN NOT NULL DEFAULT true,
+                "layer_payload" JSONB NOT NULL,
+                "map_style" JSONB,
+                "active_style" TEXT,
+                "deleted_at" TIMESTAMP(6),
+                "created_at" TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                "updated_at" TIMESTAMP(6) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                CONSTRAINT "conversation_map_layers_pkey" PRIMARY KEY ("id")
+            )
+        `;
+        await prisma.$executeRaw`
+            CREATE UNIQUE INDEX IF NOT EXISTS "conversation_map_layers_conversation_layer_key"
+            ON "conversation_map_layers"("conversation_id", "layer_key")
+        `;
+        await prisma.$executeRaw`
+            CREATE INDEX IF NOT EXISTS "idx_conversation_map_layers_conversation_order"
+            ON "conversation_map_layers"("conversation_id", "order")
+        `;
+        await prisma.$executeRaw`
+            CREATE INDEX IF NOT EXISTS "idx_conversation_map_layers_conversation_deleted"
+            ON "conversation_map_layers"("conversation_id", "deleted_at")
+        `;
+        await prisma.$executeRawUnsafe(`
+            DO $$
+            BEGIN
+                IF NOT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conname = 'fk_conversation_map_layers_conversation'
+                ) THEN
+                    ALTER TABLE "conversation_map_layers"
+                    ADD CONSTRAINT "fk_conversation_map_layers_conversation"
+                    FOREIGN KEY ("conversation_id") REFERENCES "conversations"("id")
+                    ON DELETE CASCADE ON UPDATE NO ACTION;
+                END IF;
+            END $$;
+        `);
+    })();
+
+    return ensureConversationMapLayersTablePromise;
+};
+
+const getMapLayerTitle = (mapPayload: unknown): string | undefined => {
+    const payloadRecord = asRecord(mapPayload);
+    const layerRecord = asRecord(payloadRecord.layer);
+    const title = layerRecord.title
+        || layerRecord.styleTitle
+        || layerRecord.name
+        || payloadRecord.title
+        || payloadRecord.styleTitle
+        || payloadRecord.name;
+
+    return typeof title === 'string' && title.trim() ? title.trim() : undefined;
+};
+
+const getMapLayerType = (mapPayload: unknown): string | undefined => {
+    const payloadRecord = asRecord(mapPayload);
+    const layerRecord = asRecord(payloadRecord.layer);
+    const type = layerRecord.type || payloadRecord.type;
+
+    return typeof type === 'string' && type.trim() ? type.trim() : undefined;
+};
+
+const normalizeLayerTitle = (value: string): string => {
+    return value.trim().replace(/\s+/g, ' ').toLowerCase();
+};
+
+const toTrimmedString = (value: unknown): string | undefined => {
+    return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+};
+
+const getMapLayerOrderItems = (payload: MapLayerOrderPayload): MapLayerOrderItem[] => {
+    const items: MapLayerOrderItem[] = [];
+
+    for (const value of [payload.order, payload.layerIds, payload.layerKeys, payload.layers, payload.titles, payload.layerTitles]) {
+        if (!Array.isArray(value)) continue;
+
+        for (const item of value) {
+            if (typeof item === 'string' && item.trim()) {
+                items.push(item.trim());
+                continue;
+            }
+
+            const record = asRecord(item);
+            if (Object.keys(record).length > 0) {
+                items.push(record);
+            }
+        }
+    }
+
+    return items;
+};
+
+const getRowTitleCandidates = (row: ConversationMapLayerRow): string[] => {
+    return [
+        row.title,
+        getMapLayerTitle(row.layerPayload)
+    ].filter((value): value is string => typeof value === 'string' && Boolean(value.trim()));
+};
+
+const resolveMapLayerOrderIds = (
+    rows: ConversationMapLayerRow[],
+    payload: MapLayerOrderPayload
+): string[] => {
+    const activeLayerKeys = new Set(rows.map((row) => row.layerKey));
+    const titleToLayerKey = new Map<string, string>();
+
+    for (const row of rows) {
+        for (const title of getRowTitleCandidates(row)) {
+            const normalizedTitle = normalizeLayerTitle(title);
+            if (!titleToLayerKey.has(normalizedTitle)) {
+                titleToLayerKey.set(normalizedTitle, row.layerKey);
+            }
+        }
+    }
+
+    const orderedLayerIds: string[] = [];
+    const seenLayerIds = new Set<string>();
+
+    for (const item of getMapLayerOrderItems(payload)) {
+        const record = typeof item === 'string' ? {} : item;
+        const idCandidates = typeof item === 'string'
+            ? [item]
+            : [record.layerKey, record.layerId, record.id]
+                .map(toTrimmedString)
+                .filter((value): value is string => Boolean(value));
+        const titleCandidates = typeof item === 'string'
+            ? [item]
+            : [record.title, record.layerTitle, record.styleTitle, record.name]
+                .map(toTrimmedString)
+                .filter((value): value is string => Boolean(value));
+
+        const layerId = idCandidates.find((candidate) => activeLayerKeys.has(candidate))
+            || titleCandidates
+                .map((candidate) => titleToLayerKey.get(normalizeLayerTitle(candidate)))
+                .find((candidate): candidate is string => Boolean(candidate));
+
+        if (layerId && !seenLayerIds.has(layerId)) {
+            orderedLayerIds.push(layerId);
+            seenLayerIds.add(layerId);
+        }
+    }
+
+    return orderedLayerIds;
+};
+
+const toCompactConversationMapLayer = (row: ConversationMapLayerRow) => ({
+    id: row.layerKey,
+    layerKey: row.layerKey,
+    title: row.title,
+    type: row.type,
+    order: row.order,
+    visible: row.visible,
+    activeStyle: row.activeStyle,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt
+});
+
+const fetchConversationMapLayerRows = async (
+    conversationId: string
+): Promise<ConversationMapLayerRow[]> => {
+    await ensureConversationMapLayersTable();
+
+    return prisma.$queryRaw<ConversationMapLayerRow[]>`
+        SELECT
+            "id",
+            "layer_key" AS "layerKey",
+            "title",
+            "type",
+            "order",
+            "visible",
+            "layer_payload" AS "layerPayload",
+            "map_style" AS "mapStyle",
+            "active_style" AS "activeStyle",
+            "created_at" AS "createdAt",
+            "updated_at" AS "updatedAt"
+        FROM "conversation_map_layers"
+        WHERE "conversation_id" = ${conversationId}
+            AND "deleted_at" IS NULL
+        ORDER BY "order" ASC, "created_at" ASC, "id" ASC
+    `;
+};
+
+const rebuildConversationMapLayersFromMessages = async (
+    conversationId: string
+) => {
+    await ensureConversationMapLayersTable();
+
+    await prisma.$executeRaw`
+        DELETE FROM "conversation_map_layers"
+        WHERE "conversation_id" = ${conversationId}
+    `;
+
+    const messages = await prisma.messages.findMany({
+        where: {
+            conversation_id: conversationId,
+            deleted_at: null,
+            metadata: { not: Prisma.JsonNull }
+        },
+        orderBy: [{ created_at: 'asc' }, { id: 'asc' }],
+        select: { metadata: true }
+    });
+
+    for (const message of messages) {
+        const metadata = asRecord(message.metadata);
+        if (metadata.event === 'map_clear') {
+            await syncConversationMapClear(conversationId, metadata);
+            continue;
+        }
+
+        if (metadata.event === 'layer_catalog' && metadata.layer) {
+            await syncConversationMapLayerCatalog(conversationId, metadata, metadata.mapStyle);
+            continue;
+        }
+
+        if (metadata.event === 'map_style') {
+            await syncConversationMapStyle(conversationId, metadata);
+            continue;
+        }
+
+        if (metadata.mapStyle) {
+            await syncConversationMapLayerCatalog(conversationId, metadata, metadata.mapStyle);
+        }
+    }
+};
+
+const getConversationMapLayerRows = async (
+    conversationId: string,
+    rebuildIfEmpty = true
+): Promise<ConversationMapLayerRow[]> => {
+    const rows = await fetchConversationMapLayerRows(conversationId);
+    if (rows.length > 0 || !rebuildIfEmpty) return rows;
+
+    await rebuildConversationMapLayersFromMessages(conversationId);
+    return fetchConversationMapLayerRows(conversationId);
+};
+
+const toPublicConversationMapLayer = (row: ConversationMapLayerRow) => ({
+    ...toCompactConversationMapLayer(row),
+    id: row.layerKey,
+    layerKey: row.layerKey,
+    layer: row.layerPayload,
+    mapStyle: row.mapStyle
+});
+
+
+
+const verifyConversationAccess = async (
+    userId: string,
+    conversationId: string
+) => {
+    const conversation = await prisma.conversations.findFirst({
+        where: {
+            id: conversationId,
+            user_id: userId,
+            is_deleted: false
+        },
+        select: { id: true }
+    });
+
+    if (!conversation) {
+        throw Errors.badRequest('ไม่พบห้องแชท หรือคุณไม่มีสิทธิ์เข้าถึงข้อมูลนี้');
+    }
+};
+
+const syncConversationMapLayerCatalog = async (
+    conversationId: string,
+    mapPayload: unknown,
+    mapStyle?: unknown
+) => {
+    await ensureConversationMapLayersTable();
+
+    const layerKey = getLayerIdFromMapPayload(mapPayload);
+    if (!layerKey) return;
+
+    const title = getMapLayerTitle(mapPayload);
+    const type = getMapLayerType(mapPayload);
+    const activeStyle = mapStyle ? getMapStyleKey(mapStyle) : undefined;
+    const layerPayloadJson = JSON.stringify(mapPayload);
+    const mapStyleJson = mapStyle ? JSON.stringify(mapStyle) : null;
+
+    await prisma.$executeRaw`
+        INSERT INTO "conversation_map_layers" (
+            "id",
+            "conversation_id",
+            "layer_key",
+            "title",
+            "type",
+            "order",
+            "visible",
+            "layer_payload",
+            "map_style",
+            "active_style",
+            "deleted_at",
+            "created_at",
+            "updated_at"
+        )
+        VALUES (
+            ${ulid()},
+            ${conversationId},
+            ${layerKey},
+            ${title ?? null},
+            ${type ?? null},
+            COALESCE((
+                SELECT MAX("order") + 1
+                FROM "conversation_map_layers"
+                WHERE "conversation_id" = ${conversationId}
+                    AND "deleted_at" IS NULL
+            ), 0),
+            true,
+            CAST(${layerPayloadJson} AS jsonb),
+            ${mapStyleJson ? Prisma.sql`CAST(${mapStyleJson} AS jsonb)` : Prisma.sql`NULL`},
+            ${activeStyle ?? null},
+            NULL,
+            CURRENT_TIMESTAMP,
+            CURRENT_TIMESTAMP
+        )
+        ON CONFLICT ("conversation_id", "layer_key")
+        DO UPDATE SET
+            "title" = COALESCE(EXCLUDED."title", "conversation_map_layers"."title"),
+            "type" = COALESCE(EXCLUDED."type", "conversation_map_layers"."type"),
+            "visible" = true,
+            "layer_payload" = EXCLUDED."layer_payload",
+            "map_style" = COALESCE(EXCLUDED."map_style", "conversation_map_layers"."map_style"),
+            "active_style" = COALESCE(EXCLUDED."active_style", "conversation_map_layers"."active_style"),
+            "deleted_at" = NULL,
+            "updated_at" = CURRENT_TIMESTAMP
+    `;
+};
+
+const syncConversationMapStyle = async (
+    conversationId: string,
+    mapStyle: unknown
+) => {
+    await ensureConversationMapLayersTable();
+
+    const layerKey = getMapStyleLayerId(mapStyle);
+    if (!layerKey) return;
+
+    const activeStyle = getMapStyleKey(mapStyle);
+    const mapStyleJson = JSON.stringify(mapStyle);
+
+    await prisma.$executeRaw`
+        UPDATE "conversation_map_layers"
+        SET
+            "map_style" = CAST(${mapStyleJson} AS jsonb),
+            "active_style" = ${activeStyle ?? null},
+            "visible" = true,
+            "deleted_at" = NULL,
+            "updated_at" = CURRENT_TIMESTAMP
+        WHERE "conversation_id" = ${conversationId}
+            AND "layer_key" = ${layerKey}
+    `;
+};
+
+const syncConversationMapClear = async (
+    conversationId: string,
+    payload: unknown
+) => {
+    await ensureConversationMapLayersTable();
+
+    const record = asRecord(payload);
+    const mode = record.mode;
+
+    if (mode === 'all') {
+        await prisma.$executeRaw`
+            UPDATE "conversation_map_layers"
+            SET
+                "visible" = false,
+                "deleted_at" = CURRENT_TIMESTAMP,
+                "updated_at" = CURRENT_TIMESTAMP
+            WHERE "conversation_id" = ${conversationId}
+                AND "deleted_at" IS NULL
+        `;
+        return;
+    }
+
+    if (mode !== 'selected') return;
+
+    const layerIds = getClearLayerIds(record);
+    if (layerIds.length === 0) return;
+
+    await prisma.$executeRaw`
+        UPDATE "conversation_map_layers"
+        SET
+            "visible" = false,
+            "deleted_at" = CURRENT_TIMESTAMP,
+            "updated_at" = CURRENT_TIMESTAMP
+        WHERE "conversation_id" = ${conversationId}
+            AND "layer_key" IN (${Prisma.join(layerIds)})
+            AND "deleted_at" IS NULL
+    `;
+};
+
+const safeSyncConversationMapLayerCatalog = async (
+    conversationId: string,
+    mapPayload: unknown,
+    mapStyle?: unknown
+) => {
+    try {
+        await syncConversationMapLayerCatalog(conversationId, mapPayload, mapStyle);
+    } catch (error) {
+        console.error('[map-state] failed to sync layer catalog:', error);
+    }
+};
+
+const safeSyncConversationMapStyle = async (
+    conversationId: string,
+    mapStyle: unknown
+) => {
+    try {
+        await syncConversationMapStyle(conversationId, mapStyle);
+    } catch (error) {
+        console.error('[map-state] failed to sync map style:', error);
+    }
+};
+
+const safeSyncConversationMapClear = async (
+    conversationId: string,
+    payload: unknown
+) => {
+    try {
+        await syncConversationMapClear(conversationId, payload);
+    } catch (error) {
+        console.error('[map-state] failed to sync map clear:', error);
+    }
 };
 
 const ensureMapLayerState = (
@@ -2520,6 +2984,9 @@ export const processChatMessageStream = (
                         if (mapStylePayload) {
                             writeSse(controller, 'map_style', mapStylePayload);
                         }
+                        if (!isGuest) {
+                            await safeSyncConversationMapLayerCatalog(convId, payload, mapStylePayload);
+                        }
 
                         const styleCatalog = mapStylePayload ? await handleStyleCatalogTool() : undefined;
                         const suggestionsPayload = mapStylePayload && styleCatalog
@@ -2829,6 +3296,9 @@ export const processChatMessageStream = (
 
                             if (styleResult.success) {
                                 writeSse(controller, 'map_style', styleResult);
+                                if (!isGuest) {
+                                    await safeSyncConversationMapStyle(convId, styleResult);
+                                }
                                 const suggestionsPayload = buildMapSuggestionsPayload(latestMapPayload, styleResult, styleCatalog, conversationMapState);
                                 if (suggestionsPayload) {
                                     writeSse(controller, 'suggestions', suggestionsPayload);
@@ -3276,6 +3746,9 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                                 if (controlResult.success) {
                                     writeSse(controller, 'map_clear', controlResult);
+                                    if (!isGuest) {
+                                        await safeSyncConversationMapClear(convId, controlResult);
+                                    }
                                     mapMetadata = toPrismaJsonObject(controlResult);
 
                                     const postReply = await streamPostMapEventReply('map_clear', controlResult);
@@ -3303,6 +3776,9 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                                 if (editResult.success) {
                                     writeSse(controller, 'map_style', editResult);
+                                    if (!isGuest) {
+                                        await safeSyncConversationMapStyle(convId, editResult);
+                                    }
                                     const styleCatalog = await handleStyleCatalogTool();
                                     const suggestionsPayload = buildMapSuggestionsPayload(selectedMapPayload, editResult, styleCatalog, conversationMapState);
                                     if (suggestionsPayload) {
@@ -3606,6 +4082,66 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
     });
 
     return { conversationId: convId, stream };
+};
+
+export const getConversationMapLayers = async (
+    userId: string,
+    role: string,
+    conversationId: string,
+    includePayload = false
+) => {
+    if (role === 'guest') {
+        return { success: true, layers: [] };
+    }
+
+    await verifyConversationAccess(userId, conversationId);
+    const rows = await getConversationMapLayerRows(conversationId);
+
+    return {
+        success: true,
+        layers: rows.map(includePayload ? toPublicConversationMapLayer : toCompactConversationMapLayer)
+    };
+};
+
+export const updateConversationMapLayerOrder = async (
+    userId: string,
+    role: string,
+    conversationId: string,
+    payload: MapLayerOrderPayload
+) => {
+    if (role === 'guest') {
+        return { event: 'map_order', layerIds: [], layers: [] };
+    }
+
+    await verifyConversationAccess(userId, conversationId);
+
+    const rows = await getConversationMapLayerRows(conversationId);
+    const requestedLayerIds = resolveMapLayerOrderIds(rows, payload);
+    const remainingLayerIds = rows
+        .map((row) => row.layerKey)
+        .filter((layerId) => !requestedLayerIds.includes(layerId));
+    const orderedLayerIds = [...requestedLayerIds, ...remainingLayerIds];
+
+    for (const [index, layerId] of orderedLayerIds.entries()) {
+        await prisma.$executeRaw`
+            UPDATE "conversation_map_layers"
+            SET
+                "order" = ${index},
+                "updated_at" = CURRENT_TIMESTAMP
+            WHERE "conversation_id" = ${conversationId}
+                AND "layer_key" = ${layerId}
+                AND "deleted_at" IS NULL
+        `;
+    }
+
+    const updatedRows = await getConversationMapLayerRows(conversationId);
+
+    return {
+        success: true,
+        event: 'map_order',
+        layerIds: updatedRows.map((row) => row.layerKey),
+        layers: updatedRows.map(toCompactConversationMapLayer)
+    };
 };
 
 export const getChatHistory = async (userId: string, role: string, conversationId: string, page: number = 1, limit: number = 5) => {

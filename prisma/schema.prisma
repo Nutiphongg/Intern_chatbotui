@@ -49,6 +49,7 @@ model conversations {
   messages        messages[]
   conversation_api_keys conversation_api_keys?
   conversation_memory_chunks conversation_memory_chunks[]
+  conversation_map_layers conversation_map_layers[]
 
   @@index([last_message_at(sort: Desc)], map: "idx_conversations_last_message")
   @@index([user_id], map: "idx_conversations_user_id")
@@ -172,4 +173,25 @@ model conversation_memory_chunks {
   @@index([eventType], map: "idx_conversation_memory_chunks_event")
   @@index([layerId], map: "idx_conversation_memory_chunks_layer")
   @@index([styleKey], map: "idx_conversation_memory_chunks_style")
+}
+
+model conversation_map_layers {
+  id             String        @id
+  conversationId String        @map("conversation_id")
+  layerKey       String        @map("layer_key")
+  title          String?
+  type           String?
+  order          Int           @default(0)
+  visible        Boolean       @default(true)
+  layerPayload   Json          @map("layer_payload")
+  mapStyle       Json?         @map("map_style")
+  activeStyle    String?       @map("active_style")
+  deletedAt      DateTime?     @map("deleted_at")
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamp(6)
+  updatedAt      DateTime      @default(now()) @updatedAt @map("updated_at") @db.Timestamp(6)
+  conversations  conversations @relation(fields: [conversationId], references: [id], onDelete: Cascade, onUpdate: NoAction, map: "fk_conversation_map_layers_conversation")
+
+  @@unique([conversationId, layerKey], map: "conversation_map_layers_conversation_layer_key")
+  @@index([conversationId, order], map: "idx_conversation_map_layers_conversation_order")
+  @@index([conversationId, deletedAt], map: "idx_conversation_map_layers_conversation_deleted")
 }

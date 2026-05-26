@@ -1,7 +1,7 @@
 // src/features/chat/route.ts
 import { Elysia, t } from 'elysia';
-import { chatHistoryQuerySchema, chatRequestSchema, conversationParamsSchema ,editMessageParamsSchema,editMessageBodySchema,updateConvTitleParamsSchema,updateConveTitleBodySchema} from './types';
-import { processChatMessageStream, getChatHistory, getUserConversations,deleteConversation,editMessage, editConvTitle,getAvailableModels} from './service';
+import { chatHistoryQuerySchema, chatRequestSchema, conversationParamsSchema ,editMessageParamsSchema,editMessageBodySchema,updateConvTitleParamsSchema,updateConveTitleBodySchema,mapLayerOrderBodySchema,mapLayerListQuerySchema} from './types';
+import { processChatMessageStream, getChatHistory, getUserConversations,deleteConversation,editMessage, editConvTitle,getAvailableModels,getConversationMapLayers,updateConversationMapLayerOrder} from './service';
 import { authPlugin } from '../../plugins/plugin';
 import { redis } from '../setup/redis';
 import { env} from '../../lib/env'
@@ -63,6 +63,20 @@ export const chatRoutes = new Elysia({ prefix: '/chat' })
     }, {
         params: conversationParamsSchema,
         query: chatHistoryQuerySchema 
+    })
+    // GET /chat/conversations/:conversationId/map-layers
+    .get('/conversations/:conversationId/map-layers', async ({ params, query, user }) => {
+        return await getConversationMapLayers(user.id, user.role, params.conversationId, query.includePayload ?? false);
+    }, {
+        params: conversationParamsSchema,
+        query: mapLayerListQuerySchema
+    })
+    // PATCH /chat/conversations/:conversationId/map-layers
+    .patch('/conversations/:conversationId/map-layers', async ({ params, body, user }) => {
+        return await updateConversationMapLayerOrder(user.id, user.role, params.conversationId, body);
+    }, {
+        params: conversationParamsSchema,
+        body: mapLayerOrderBodySchema
     })
     // DELETE /chat/:conversationId (ลบห้องแชท)
     .delete('/conversations/:conversationId', async ({ params, user }) => {
