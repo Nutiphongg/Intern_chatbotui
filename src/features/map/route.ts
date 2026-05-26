@@ -1,10 +1,22 @@
 // src/routes/mapConfig.route.ts
 import { Elysia } from 'elysia';
 import { CreateApiKeyBody, apiKeyParamsSchema, updateApiKeyBodySchema } from './type';
-import { createApiKey, deleteApiKey, getApiKeyById, getApiKeys, updateApiKey } from './service';
+import { createApiKey, deleteApiKey, getApiKeyById, getApiKeys, updateApiKey,getActivehosts } from './service';
 import { authPlugin } from '../../plugins/plugin';
 
 export const mapConfigRoutes = new Elysia({ prefix: '/management' })
+  .get('/hosts',async() => {
+    try {
+      const hosts = await getActivehosts();
+      return {
+      data: hosts
+      };
+    } catch {
+      return { error: "failed to fetch hosts"};
+
+    } 
+  })
+
   .use(authPlugin)
   .get('/api-keys', async ({ user }) => {
     return {
@@ -37,6 +49,7 @@ export const mapConfigRoutes = new Elysia({ prefix: '/management' })
         const result = await createApiKey({
           userId: userId,
           provider: body.provider,
+          hostId: body.hostId,
           keyName: body.keyName,
           keyValue: body.keyValue
         });
@@ -65,6 +78,7 @@ export const mapConfigRoutes = new Elysia({ prefix: '/management' })
         userId: user.id,
         apiKeyId: params.apiKeyId,
         keyName: body.keyName,
+        hostId: body.hostId,
         isActive: body.isActive
       });
 

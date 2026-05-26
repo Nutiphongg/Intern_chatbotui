@@ -1,4 +1,4 @@
-import { prisma } from "../setup/prisma";
+﻿import { prisma } from "../setup/prisma";
 import { decrypt, hashApiKey } from "../setup/encryption";
 import { env } from "../../lib/env";
 import type {
@@ -15,7 +15,16 @@ type ResolvedUserApiKey = {
   keyName: string;
   encryptedKey: string;
   iv: string;
+  hostId?: string | null;
+  host?: {
+    id: string;
+    provider: string;
+    hostname: string;
+    baseUrl: string;
+  } | null;
 };
+
+type RuntimeMapConfig<T extends { baseUrl?: string | null; provider: string }> = T & { baseUrl: string };
 
 type StyleCatalogEntry = {
   key: string;
@@ -52,6 +61,18 @@ type EditMapStyleArgs = MapToolArgs & {
   layout?: unknown;
 };
 
+type ClearMapLayersArgs = {
+  mode?: string;
+  layerId?: string;
+  layerIds?: unknown;
+};
+
+type ActiveMapLayer = {
+  layerId: string;
+  title?: string;
+  sourceLayer?: string;
+};
+
 let styleCatalogCache: {
   expiresAt: number;
   sourceUrl: string;
@@ -67,23 +88,91 @@ const normalizeProvider = (provider?: string): string => {
   return provider?.trim().toUpperCase() || "";
 };
 
+const isVallarisProvider = (provider?: string): boolean => {
+  return normalizeProvider(provider).includes("VALLARIS");
+};
+
 const sameProvider = (left?: string, right?: string): boolean => {
-  return normalizeProvider(left) === normalizeProvider(right);
+  const normalizedLeft = normalizeProvider(left);
+  const normalizedRight = normalizeProvider(right);
+
+  if (!normalizedLeft || !normalizedRight) return false;
+  return normalizedLeft === normalizedRight;
 };
 
 const STYLE_CATALOG_CACHE_TTL_MS = 5 * 60 * 1000;
 
 const getUniqueProviders = (providers: string[]): string[] => {
-  return Array.from(new Set(providers.map(normalizeProvider).filter(Boolean)));
+  const providersByKey = new Map<string, string>();
+  for (const provider of providers) {
+    const cleanProvider = provider.trim();
+    const normalizedProvider = normalizeProvider(cleanProvider);
+    if (!normalizedProvider || providersByKey.has(normalizedProvider)) continue;
+    providersByKey.set(normalizedProvider, cleanProvider);
+  }
+
+  return Array.from(providersByKey.values());
 };
 
 const providerAllowed = (allowedProviders: string[], provider?: string): boolean => {
-  const normalizedProvider = normalizeProvider(provider);
-  return Boolean(normalizedProvider) && allowedProviders.includes(normalizedProvider);
+  return allowedProviders.some((allowedProvider) => sameProvider(allowedProvider, provider));
 };
 
-const isVallarisProvider = (provider?: string): boolean => {
-  return normalizeProvider(provider) === "VALLARIS";
+const getConfigType = (layerConfigTemplate: unknown): string | undefined => {
+  return toCleanString(pickRecord(layerConfigTemplate).type) || undefined;
+};
+
+const withApiKeyHostBaseUrl = <
+  T extends { baseUrl?: string | null; provider: string }
+>(
+  config: T,
+  apiKey?: ResolvedUserApiKey
+): RuntimeMapConfig<T> => {
+  const hostBaseUrl = apiKey?.host?.baseUrl?.trim();
+  const legacyBaseUrl = typeof config.baseUrl === "string" ? config.baseUrl.trim() : "";
+  const baseUrl = hostBaseUrl || legacyBaseUrl;
+  if (!baseUrl) {
+    throw new Error(`No map host baseUrl is configured for provider ${config.provider}.`);
+  }
+
+  return {
+    ...config,
+    baseUrl
+  };
+};
+
+const getAllowedHosts = (apiKeys: ResolvedUserApiKey[]) => {
+  const hostsByKey = new Map<string, {
+    providerKey: string;
+    hostKey: string;
+    baseUrl: string;
+  }>();
+
+  for (const apiKey of apiKeys) {
+    const host = apiKey.host;
+    if (!host?.baseUrl || !host.hostname) continue;
+
+    const providerKey = apiKey.provider || host.provider;
+    const mapKey = `${normalizeProvider(providerKey)}:${host.hostname}`;
+    if (hostsByKey.has(mapKey)) continue;
+
+    hostsByKey.set(mapKey, {
+      providerKey,
+      hostKey: host.hostname,
+      baseUrl: host.baseUrl
+    });
+  }
+
+  return Array.from(hostsByKey.values());
+};
+
+const selectApiKeyForProvider = (
+  apiKeys: ResolvedUserApiKey[],
+  provider: string
+): ResolvedUserApiKey | undefined => {
+  const providerKeys = apiKeys.filter((apiKey) => sameProvider(apiKey.provider, provider));
+  return providerKeys.find((apiKey) => Boolean(apiKey.host?.baseUrl?.trim()))
+    || providerKeys[0];
 };
 
 const pickRecord = (value: unknown): Record<string, unknown> => {
@@ -346,6 +435,80 @@ const getMapLayerRecord = (payload: unknown): Record<string, unknown> => {
   return pickRecord(record.layer) || record;
 };
 
+const getMapControlLayerInfo = (metadata: unknown): ActiveMapLayer | undefined => {
+  const record = pickRecord(metadata);
+  if (record.event !== "layer_catalog" || !record.layer) return undefined;
+
+  const layer = pickRecord(record.layer);
+  const layerId = toStringValue(layer.layerId)
+    || toStringValue(layer.styleId)
+    || toStringValue(layer.id);
+  if (!layerId) return undefined;
+
+  return {
+    layerId,
+    ...(toStringValue(layer.title) ? { title: toStringValue(layer.title) } : {}),
+    ...(toStringValue(layer.styleTitle) ? { title: toStringValue(layer.styleTitle) } : {}),
+    ...(toStringValue(layer.sourceLayer) ? { sourceLayer: toStringValue(layer.sourceLayer) } : {})
+  };
+};
+
+const getActiveMapLayersFromMetadata = (metadataList: unknown[]): ActiveMapLayer[] => {
+  const activeLayers = new Map<string, ActiveMapLayer>();
+
+  for (const metadata of metadataList) {
+    const record = pickRecord(metadata);
+
+    if (record.event === "layer_catalog") {
+      const layer = getMapControlLayerInfo(record);
+      if (layer) activeLayers.set(layer.layerId, layer);
+      continue;
+    }
+
+    if (record.event !== "map_clear") continue;
+
+    const mode = toStringValue(record.mode);
+    if (mode === "all") {
+      activeLayers.clear();
+      continue;
+    }
+
+    if (mode === "selected") {
+      const layerIds = toUniqueStringList(record.layerIds, record.layerId);
+      for (const layerId of layerIds) {
+        activeLayers.delete(layerId);
+      }
+    }
+  }
+
+  return Array.from(activeLayers.values());
+};
+
+export const getActiveMapLayersForConversation = async (
+  userId: string,
+  conversationId: string
+): Promise<ActiveMapLayer[]> => {
+  const messages = await prisma.messages.findMany({
+    where: {
+      conversation_id: conversationId,
+      deleted_at: null,
+      conversations: {
+        user_id: userId,
+        is_deleted: false
+      }
+    },
+    orderBy: [
+      { created_at: "asc" },
+      { id: "asc" }
+    ],
+    select: {
+      metadata: true
+    }
+  });
+
+  return getActiveMapLayersFromMetadata(messages.map((message) => message.metadata));
+};
+
 const scoreStyleCatalogEntry = (
   entry: StyleCatalogEntry,
   layer: Record<string, unknown>,
@@ -402,12 +565,14 @@ const getCandidateStyleCatalogEntries = (
     normalizeGeometryType(layer.geomType)
   ].filter((item): item is string => Boolean(item));
   const uniqueGeometryTypes = new Set(geometryTypes);
+  if (uniqueGeometryTypes.size === 0) return [];
+
   const geometryAwareEntries = entries.filter((entry) => entry.geometryTypes?.length);
   const candidateEntries = uniqueGeometryTypes.size > 0 && geometryAwareEntries.length > 0
     ? geometryAwareEntries.filter((entry) => entry.geometryTypes?.some((geometryType) => uniqueGeometryTypes.has(geometryType)))
     : entries;
 
-  return candidateEntries.length > 0 ? candidateEntries : entries;
+  return candidateEntries;
 };
 
 export const buildMapStylePayload = async (
@@ -499,6 +664,10 @@ const toStringList = (value: unknown): string[] => {
   }
   const stringValue = toStringValue(value);
   return stringValue ? [stringValue] : [];
+};
+
+const toUniqueStringList = (...values: unknown[]): string[] => {
+  return Array.from(new Set(values.flatMap(toStringList).filter(Boolean)));
 };
 
 const toNumberList = (value: unknown, length: number): number[] => {
@@ -771,6 +940,80 @@ export const handleEditMapStyleTool = async (
   };
 };
 
+export const handleClearMapLayersTool = async (
+  userId: string,
+  conversationId: string,
+  aiArgs: ClearMapLayersArgs
+) => {
+  try {
+    const mode = toStringValue(aiArgs.mode);
+    if (!mode) {
+      return {
+        success: false,
+        event: "map_clear",
+        message: "Map clear mode is required."
+      };
+    }
+
+    const validModes = new Set(["selected", "all"]);
+    if (!validModes.has(mode)) {
+      return {
+        success: false,
+        event: "map_clear",
+        message: `Unsupported map clear mode: ${mode}`
+      };
+    }
+
+    if (mode === "all") {
+      return {
+        success: true,
+        event: "map_clear",
+        mode: "all"
+      };
+    }
+
+    const requestedLayerIds = toUniqueStringList(aiArgs.layerIds, aiArgs.layerId);
+    if (requestedLayerIds.length > 0) {
+      return {
+        success: true,
+        event: "map_clear",
+        mode: "selected",
+        layerIds: requestedLayerIds,
+        ...(requestedLayerIds.length === 1 ? { layerId: requestedLayerIds[0] } : {})
+      };
+    }
+
+    const activeLayers = await getActiveMapLayersForConversation(userId, conversationId);
+    const layers = requestedLayerIds.length > 0
+      ? activeLayers.filter((item) => requestedLayerIds.includes(item.layerId))
+      : activeLayers.slice(-1);
+
+    if (layers.length === 0) {
+      return {
+        success: false,
+        event: "map_clear",
+        mode: "selected",
+        message: "No active map layer matched the clear request."
+      };
+    }
+
+    return {
+      success: true,
+      event: "map_clear",
+      mode: "selected",
+      layerIds: layers.map((layer) => layer.layerId),
+      ...(layers.length === 1 ? { layerId: layers[0].layerId } : {})
+    };
+  } catch (error) {
+    console.error("Clear Map Layers Tool Error:", error);
+    return {
+      success: false,
+      event: "map_clear",
+      message: "An error occurred while managing map layers."
+    };
+  }
+};
+
 const replaceTemplateVariables = (
   template: string,
   variables: Record<string, unknown>
@@ -842,9 +1085,21 @@ const resolveUserMapApiKeys = async (
         provider: true,
         keyName: true,
         encryptedKey: true,
-        iv: true
+        iv: true,
+        hostId: true,
+        mapconfig_hosts: {
+          select: {
+            id: true,
+            provider: true,
+            hostname: true,
+            baseUrl: true
+          }
+        }
       }
-    });
+    }).then((keys) => keys.map(({ mapconfig_hosts, ...key }) => ({
+      ...key,
+      host: mapconfig_hosts
+    })));
   }
 
   return prisma.user_apikey.findMany({
@@ -858,10 +1113,22 @@ const resolveUserMapApiKeys = async (
       provider: true,
       keyName: true,
       encryptedKey: true,
-      iv: true
+      iv: true,
+      hostId: true,
+      mapconfig_hosts: {
+        select: {
+          id: true,
+          provider: true,
+          hostname: true,
+          baseUrl: true
+        }
+      }
     },
     orderBy: { createdAt: "desc" }
-  });
+  }).then((keys) => keys.map(({ mapconfig_hosts, ...key }) => ({
+    ...key,
+    host: mapconfig_hosts
+  })));
 };
 
 const buildTemplateVariables = (
@@ -1233,6 +1500,14 @@ const normalizeConfigMatchTerm = (value: string): string => {
   return value.toLowerCase().replace(/[\s()[\]{}"'`.,:;|/_-]+/g, "");
 };
 
+const splitConfigMatchTokens = (value: string): string[] => {
+  return value
+    .toLowerCase()
+    .split(/[\s()[\]{}"'`.,:;|/_-]+/g)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 3);
+};
+
 const collectConfigStringValues = (value: unknown): string[] => {
   const cleanValue = toCleanString(value);
   if (cleanValue) return [cleanValue];
@@ -1246,6 +1521,8 @@ const collectConfigStringValues = (value: unknown): string[] => {
 
 const collectConfigMatchTerms = (config: {
   intentName: string;
+  provider?: string;
+  urlTemplate?: string;
   layerConfigTemplate?: unknown;
 }): string[] => {
   const template = pickRecord(config.layerConfigTemplate);
@@ -1253,8 +1530,10 @@ const collectConfigMatchTerms = (config: {
   const itemTypeTerms = collectConfigStringValues(collectionQuery.itemType)
     .filter((value) => normalizeConfigMatchTerm(value).length > 4);
 
-  return Array.from(new Set([
+  const rawTerms = [
     config.intentName,
+    config.provider,
+    config.urlTemplate,
     ...collectConfigStringValues(template.type),
     ...collectConfigStringValues(template.handler),
     ...itemTypeTerms,
@@ -1263,13 +1542,24 @@ const collectConfigMatchTerms = (config: {
     ...collectConfigStringValues(template.matchTerms),
     ...collectConfigStringValues(template.searchTerms),
     ...collectConfigStringValues(template.intentKeywords)
-  ]))
+  ];
+
+  return Array.from(new Set(rawTerms.flatMap((value) => {
+    const cleanValue = toCleanString(value);
+    if (!cleanValue) return [];
+    const tokens = splitConfigMatchTokens(cleanValue);
+    const singularTokens = tokens
+      .filter((token) => token.endsWith("s") && token.length > 4)
+      .map((token) => token.slice(0, -1));
+    return [cleanValue, ...tokens, ...singularTokens];
+  })))
     .map(normalizeConfigMatchTerm)
-    .filter((term) => term.length > 0);
+    .filter((term) => term.length >= 3);
 };
 
 const filterConfigsByQuery = <T extends {
   intentName: string;
+  provider?: string;
   layerConfigTemplate?: unknown;
 }>(
   configs: T[],
@@ -1278,12 +1568,51 @@ const filterConfigsByQuery = <T extends {
   const normalizedQuery = query ? normalizeConfigMatchTerm(query) : "";
   if (!normalizedQuery) return configs;
 
-  const matchedConfigs = configs.filter((config) => {
+  const scoredConfigs = configs.map((config) => {
     const terms = collectConfigMatchTerms(config);
-    return terms.some((term) => normalizedQuery.includes(term));
-  });
+    const score = terms.reduce((total, term) => {
+      if (!normalizedQuery.includes(term)) return total;
+      return total + term.length;
+    }, 0);
 
-  return matchedConfigs.length > 0 ? matchedConfigs : configs;
+    return { config, score };
+  }).filter((item) => item.score > 0);
+
+  if (scoredConfigs.length === 0) return configs;
+
+  const maxScore = Math.max(...scoredConfigs.map((item) => item.score));
+  return scoredConfigs
+    .filter((item) => item.score === maxScore)
+    .map((item) => item.config);
+};
+
+const getExplicitConfigMatchesByQuery = <T extends {
+  intentName: string;
+  provider?: string;
+  layerConfigTemplate?: unknown;
+}>(
+  configs: T[],
+  query?: string
+): T[] => {
+  const normalizedQuery = query ? normalizeConfigMatchTerm(query) : "";
+  if (!normalizedQuery) return [];
+
+  const scoredConfigs = configs.map((config) => {
+    const terms = collectConfigMatchTerms(config);
+    const score = terms.reduce((total, term) => {
+      if (!normalizedQuery.includes(term)) return total;
+      return total + term.length;
+    }, 0);
+
+    return { config, score };
+  }).filter((item) => item.score > 0);
+
+  if (scoredConfigs.length === 0) return [];
+
+  const maxScore = Math.max(...scoredConfigs.map((item) => item.score));
+  return scoredConfigs
+    .filter((item) => item.score === maxScore)
+    .map((item) => item.config);
 };
 
 const buildMapOptionQuestion = (options: MapOptionInfo[]): string | undefined => {
@@ -1559,14 +1888,23 @@ const buildMapOptionUrl = (
   apiKey: string,
   params: Record<string, unknown> = {}
 ): string => {
+  const cleanBaseUrl = baseUrl.trim();
+  const cleanTemplate = template.trim();
+  if (!cleanBaseUrl || !/^https?:\/\//i.test(cleanBaseUrl)) {
+    throw new Error(`Invalid map host baseUrl: ${cleanBaseUrl || "(empty)"}`);
+  }
+  if (!cleanTemplate) {
+    throw new Error("Invalid map urlTemplate: (empty)");
+  }
+
   const usedKeys = new Set<string>();
   const renderedTemplate = Object.entries(params).reduce((url, [key, value]) => {
     const cleanValue = toStringValue(value);
     if (!cleanValue || !url.includes(`{${key}}`)) return url;
     usedKeys.add(key);
     return url.replace(new RegExp(`{${key}}`, "g"), encodeURIComponent(cleanValue));
-  }, template);
-  const base = joinProviderUrl(baseUrl, renderedTemplate);
+  }, cleanTemplate);
+  const base = joinProviderUrl(cleanBaseUrl, renderedTemplate);
   const query = Object.entries(params)
     .filter(([key, value]) => !usedKeys.has(key) && toStringValue(value))
     .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(toStringValue(value) || "")}`)
@@ -2173,6 +2511,52 @@ const buildVallarisStyleChoices = (
   }));
 };
 
+const inferVectorTileLayerIdFromQuery = (
+  query: string | undefined,
+  choices: MapOptionChoice[]
+): string | undefined => {
+  if (!query?.trim() || choices.length === 0) return undefined;
+
+  const normalizedQuery = normalizeMatchText(query);
+  const queryTokens = new Set(tokenizeMatchText(query));
+  const scoredChoices = choices.map((choice) => {
+    const candidateTexts = [
+      choice.label,
+      choice.description,
+      choice.layerTitle
+    ].filter((value): value is string => typeof value === "string" && Boolean(value.trim()));
+
+    let score = 0;
+    for (const text of candidateTexts) {
+      const normalizedText = normalizeMatchText(text);
+      const textTokens = tokenizeMatchText(text);
+      const matchedTokens = textTokens.filter((token) => queryTokens.has(token));
+      const hasExactTextMatch = normalizedText && normalizedQuery.includes(normalizedText);
+      const hasFullTokenMatch = textTokens.length > 0 && matchedTokens.length === textTokens.length;
+
+      if (!hasExactTextMatch && !hasFullTokenMatch) continue;
+
+      if (hasExactTextMatch) score += normalizedText.length * 2;
+
+      for (const token of matchedTokens) {
+        if (!queryTokens.has(token)) continue;
+        score += /^\d+$/.test(token) ? 8 : Math.max(2, token.length);
+      }
+    }
+
+    return { choice, score };
+  }).filter((item) => item.score > 0)
+    .sort((left, right) => right.score - left.score);
+
+  const best = scoredChoices[0];
+  if (!best) return undefined;
+
+  const second = scoredChoices[1];
+  if (second && second.score >= best.score) return undefined;
+
+  return best.choice.value;
+};
+
 const buildVectorTileOptionsPayload = async (
   config: { intentName: string; provider: string; baseUrl: string; urlTemplate: string; layerConfigTemplate: unknown },
   aiArgs: MapToolArgs,
@@ -2198,7 +2582,9 @@ const buildVectorTileOptionsPayload = async (
   const collectionsPayload = await fetchVectorTileJson(collectionsUrl);
   const collections = extractVectorTileCollections(collectionsPayload);
   const pagination = buildMapOptionPaginationResult(collectionsPayload, paginationRequest, collections.length);
-  const selectedLayerId = getVectorTileLayerId(aiArgs, optionKey);
+  const collectionChoices = buildVectorTileChoices(collections, layerType);
+  const selectedLayerId = getVectorTileLayerId(aiArgs, optionKey)
+    || inferVectorTileLayerIdFromQuery(getMapQuery(aiArgs), collectionChoices);
   const selectedCollection = selectedLayerId
     ? collections.find((collection) => collection.id === selectedLayerId)
     : undefined;
@@ -2244,7 +2630,7 @@ const buildVectorTileOptionsPayload = async (
       source: "template",
       label: "Layer",
       description: `Choose the ${layerType} layer to use`,
-      choices: buildVectorTileChoices(collections, layerType)
+      choices: collectionChoices
     };
     return {
       success: true,
@@ -2587,6 +2973,93 @@ const buildVectorTileSampleUrl = (
     .replace(/{y}/g, String(y));
 };
 
+const buildVectorTileSampleUrls = (
+  tileTemplates: string[] | undefined,
+  center: number[] | undefined,
+  bounds: number[] | undefined,
+  minzoom: number | undefined,
+  maxzoom: number | undefined
+): string[] => {
+  const template = tileTemplates?.[0];
+  if (!template) return [];
+
+  const centerZoom = center?.[2];
+  const minZoomValue = minzoom ?? 0;
+  const maxZoomValue = maxzoom ?? Math.max(minZoomValue, Number.isFinite(centerZoom) ? centerZoom as number : minZoomValue);
+  const rawZooms = [
+    Number.isFinite(centerZoom) ? centerZoom as number : undefined,
+    maxZoomValue,
+    Math.floor((minZoomValue + maxZoomValue) / 2),
+    minZoomValue
+  ];
+  const zooms = Array.from(new Set(
+    rawZooms
+      .map((zoom) => zoom === undefined ? undefined : Math.max(minZoomValue, Math.min(maxZoomValue, Math.floor(zoom))))
+      .filter((zoom): zoom is number => zoom !== undefined)
+  ));
+  const normalizedTemplate = template
+    .replace(/%7Bz%7D/gi, "{z}")
+    .replace(/%7Bx%7D/gi, "{x}")
+    .replace(/%7By%7D/gi, "{y}");
+  const urls: string[] = [];
+  const samplePoints: Array<[number, number]> = [];
+
+  if (center?.[0] !== undefined && center?.[1] !== undefined) {
+    samplePoints.push([center[0], center[1]]);
+  }
+
+  if (bounds?.length === 4) {
+    const [minLon, minLat, maxLon, maxLat] = bounds;
+    const lonSteps = [0.25, 0.5, 0.75];
+    const latSteps = [0.25, 0.5, 0.75];
+
+    for (const lonStep of lonSteps) {
+      for (const latStep of latSteps) {
+        samplePoints.push([
+          minLon + (maxLon - minLon) * lonStep,
+          minLat + (maxLat - minLat) * latStep
+        ]);
+      }
+    }
+  }
+
+  const uniqueSamplePoints = Array.from(
+    new Map(samplePoints.map(([lon, lat]) => [`${lon.toFixed(6)},${lat.toFixed(6)}`, [lon, lat] as [number, number]])).values()
+  );
+  if (uniqueSamplePoints.length === 0) return [];
+
+  for (const zoom of zooms) {
+    for (const [lon, lat] of uniqueSamplePoints) {
+      const { x, y } = lonLatToTile(lon, lat, zoom);
+      const maxIndex = 2 ** zoom - 1;
+      const offsets = zoom <= 6
+        ? [[0, 0]]
+        : [
+          [0, 0],
+          [-1, 0],
+          [1, 0],
+          [0, -1],
+          [0, 1]
+        ];
+
+      for (const [dx, dy] of offsets) {
+        const sampleX = x + dx;
+        const sampleY = y + dy;
+        if (sampleX < 0 || sampleY < 0 || sampleX > maxIndex || sampleY > maxIndex) continue;
+
+        urls.push(
+          normalizedTemplate
+            .replace(/{z}/g, String(zoom))
+            .replace(/{x}/g, String(sampleX))
+            .replace(/{y}/g, String(sampleY))
+        );
+      }
+    }
+  }
+
+  return Array.from(new Set(urls)).slice(0, 36);
+};
+
 const fetchVectorTileBytes = async (url: string): Promise<Uint8Array> => {
   const abortController = new AbortController();
   const timeout = setTimeout(() => abortController.abort(), VECTOR_TILE_GEOMETRY_INFER_TIMEOUT_MS);
@@ -2694,6 +3167,7 @@ const inferVectorTileGeometryType = async (
   layerId: string,
   tileTemplates: string[] | undefined,
   center: number[] | undefined,
+  bounds: number[] | undefined,
   minzoom: number | undefined,
   maxzoom: number | undefined
 ): Promise<string | undefined> => {
@@ -2701,11 +3175,23 @@ const inferVectorTileGeometryType = async (
   if (cached && cached.expiresAt > Date.now()) return cached.geometryType;
 
   const sampleUrl = buildVectorTileSampleUrl(tileTemplates, center, minzoom, maxzoom);
-  if (!sampleUrl) return undefined;
+  const sampleUrls = buildVectorTileSampleUrls(tileTemplates, center, bounds, minzoom, maxzoom);
+  const candidateUrls = Array.from(new Set([
+    ...(sampleUrl ? [sampleUrl] : []),
+    ...sampleUrls
+  ]));
+  if (candidateUrls.length === 0) return undefined;
 
   try {
-    const bytes = await fetchVectorTileBytes(sampleUrl);
-    const geometryType = vectorTileFeatureTypeToGeometryType(readFirstVectorTileFeatureType(bytes));
+    const results = await Promise.allSettled(
+      candidateUrls.map(async (url) => {
+        const bytes = await fetchVectorTileBytes(url);
+        return vectorTileFeatureTypeToGeometryType(readFirstVectorTileFeatureType(bytes));
+      })
+    );
+    const geometryType = results.find((result): result is PromiseFulfilledResult<string> => (
+      result.status === "fulfilled" && Boolean(result.value)
+    ))?.value;
     if (geometryType) {
       vectorTileGeometryCache.set(layerId, {
         geometryType,
@@ -2744,14 +3230,15 @@ const buildVectorTileLayerPayload = async (
   const maxzoom = toNumberValue(tileRecord.maxzoom ?? tileRecord.maxZoom);
   const center = toNumberArray(tileRecord.center);
   const bounds = toNumberArray(tileRecord.bounds);
-  const secureTiles = toStringArray(tileRecord.tiles)
+  const secureTiles = (toStringArray(tileRecord.tiles)
     || toStringArray(tileRecord.tileUrls)
-    || toStringArray(tileRecord.tile_urls);
+    || toStringArray(tileRecord.tile_urls))
+    ?.map((url) => appendApiKeyQuery(url, apiKey));
   const tiles = secureTiles?.map(createVectorTilePublicUrl);
   const template = pickRecord(config.layerConfigTemplate);
   const geometryType = getDirectGeometryType(tileRecord)
     || getDirectGeometryType(template)
-    || await inferVectorTileGeometryType(layerId, secureTiles, center, minzoom, maxzoom);
+    || await inferVectorTileGeometryType(layerId, secureTiles, center, bounds, minzoom, maxzoom);
   const sourceLayer = findSourceLayer(tileRecord, layerId);
 
   return {
@@ -2794,6 +3281,7 @@ const buildVallarisLayerPayload = async (
 
   const selectedValues = pickRecord(optionsPayload.selectedValues);
   const styleId = toStringValue(selectedValues.styleId);
+  const styleTitle = toStringValue(selectedValues.styleTitle);
   const selectedType = toStringValue(selectedValues.type);
   const selectedUrl = toStringValue(selectedValues.url);
   const type = selectedType;
@@ -2817,6 +3305,7 @@ const buildVallarisLayerPayload = async (
       event: "layer_catalog",
       layer: {
         styleId,
+        ...(styleTitle ? { title: styleTitle, styleTitle } : {}),
         type,
         url: selectedUrl,
       }
@@ -2986,7 +3475,6 @@ export const mapToolSchema = {
         },
         provider: {
           type: "string",
-          enum: ["GISTDA", "VALLARIS"],
           description: "The provider from map_access that the user is allowed to use"
         },
         params: {
@@ -3089,6 +3577,42 @@ export const editMapStyleToolSchema = {
   }
 };
 
+export const clearMapLayersToolSchema = {
+  type: "function",
+  function: {
+    name: "clear_map_layers",
+    description: "Clear displayed map layers without fetching new map data. Use this when the user wants to clear the current map layer, a selected map layer/style by id or title, multiple selected map layers, or all displayed map layers. The backend resolves titles and styleIds from conversation map state.",
+    parameters: {
+      type: "object",
+      properties: {
+        mode: {
+          type: "string",
+          enum: ["selected", "all"],
+          description: "selected clears one or more displayed map entries and their style/color state. all clears every displayed map entry."
+        },
+        layerId: {
+          type: "string",
+          description: "Specific map identifier to clear when mode is selected. This may be a layerId, styleId, id, title, styleTitle, or sourceLayer from the conversation map state."
+        },
+        layerIds: {
+          type: "array",
+          items: { type: "string" },
+          description: "Specific map identifiers to clear when mode is selected. Values may be layerIds, styleIds, ids, titles, styleTitles, or sourceLayers."
+        },
+        layerTitle: {
+          type: "string",
+          description: "Layer or style title named by the user when clearing a selected map entry."
+        },
+        styleId: {
+          type: "string",
+          description: "Style id named by the user when clearing a style-based map entry."
+        }
+      },
+      required: ["mode"]
+    }
+  }
+};
+
 export const mapOptionToolSchema = {
   type: "function",
   function: {
@@ -3111,7 +3635,6 @@ export const mapOptionToolSchema = {
         },
         provider: {
           type: "string",
-          enum: ["GISTDA", "VALLARIS"],
           description: "The provider from map_access, if known"
         },
         params: {
@@ -3157,6 +3680,8 @@ export const handleMapOptionsTool = async (
       select: {
         intentName: true,
         provider: true,
+        baseUrl: true,
+        urlTemplate: true,
         layerConfigTemplate: true
       },
       orderBy: [
@@ -3164,10 +3689,8 @@ export const handleMapOptionsTool = async (
         { intentName: "asc" }
       ]
     });
-    const configs = filterConfigsByQuery(
-      filterConfigsByProviders(allConfigs, allowedProviders),
-      getMapQuery(aiArgs)
-    );
+    const providerAllowedConfigs = filterConfigsByProviders(allConfigs, allowedProviders);
+    const configs = filterConfigsByQuery(providerAllowedConfigs, getMapQuery(aiArgs));
     let intentName = aiArgs.intentName?.trim();
     let provider = normalizeProvider(aiArgs.provider) || undefined;
 
@@ -3175,10 +3698,32 @@ export const handleMapOptionsTool = async (
       provider = allowedProviders[0];
     }
 
+    const providerScopedConfigs = provider
+      ? configs.filter((config) => sameProvider(config.provider, provider))
+      : configs;
+    const providerScopedAllConfigs = provider
+      ? providerAllowedConfigs.filter((config) => sameProvider(config.provider, provider))
+      : providerAllowedConfigs;
+    const explicitQueryMatches = getExplicitConfigMatchesByQuery(
+      providerScopedConfigs,
+      getMapQuery(aiArgs)
+    );
+    const selectedIntentName = toStringValue(pickRecord(aiArgs.selectedOptions).intentName);
+    const hasSelectedIntentName = Boolean(selectedIntentName && selectedIntentName === intentName);
+
+    if (
+      intentName &&
+      !hasSelectedIntentName &&
+      providerScopedConfigs.length > 1 &&
+      (explicitQueryMatches.length !== 1 || explicitQueryMatches[0]?.intentName !== intentName)
+    ) {
+      intentName = undefined;
+    }
+
     if (!intentName) {
-      const intentMatches = provider
-        ? configs.filter((config) => sameProvider(config.provider, provider))
-        : configs;
+      const intentMatches = explicitQueryMatches.length === 1
+        ? explicitQueryMatches
+        : providerScopedConfigs;
       if (intentMatches.length === 1) {
         intentName = intentMatches[0]?.intentName;
       }
@@ -3200,7 +3745,7 @@ export const handleMapOptionsTool = async (
         label: value,
         value
       }));
-      const intentChoices = configs.map((config) => ({
+      const intentChoices = providerScopedAllConfigs.map((config) => ({
         label: `${config.provider}:${config.intentName}`,
         value: config.intentName,
         description: `provider=${config.provider}`
@@ -3249,7 +3794,7 @@ export const handleMapOptionsTool = async (
     }
 
     if (isVallarisProvider(config.provider) && isCollectionDetailConfig(config.layerConfigTemplate)) {
-      const userApiKey = allowedKeys.find((apiKey) => sameProvider(apiKey.provider, config.provider));
+      const userApiKey = selectApiKeyForProvider(allowedKeys, config.provider);
       if (!userApiKey) {
         return {
           success: false,
@@ -3270,11 +3815,11 @@ export const handleMapOptionsTool = async (
         };
       }
 
-      return buildVectorTileOptionsPayload(config, aiArgs, decryptedApiKey);
+      return buildVectorTileOptionsPayload(withApiKeyHostBaseUrl(config, userApiKey), aiArgs, decryptedApiKey);
     }
 
     if (isVallarisProvider(config.provider)) {
-      const userApiKey = allowedKeys.find((apiKey) => sameProvider(apiKey.provider, config.provider));
+      const userApiKey = selectApiKeyForProvider(allowedKeys, config.provider);
       if (!userApiKey) {
         return {
           success: false,
@@ -3295,7 +3840,7 @@ export const handleMapOptionsTool = async (
         };
       }
 
-      return buildVallarisOptionsPayload(config, aiArgs, decryptedApiKey);
+      return buildVallarisOptionsPayload(withApiKeyHostBaseUrl(config, userApiKey), aiArgs, decryptedApiKey);
     }
 
     const templateVariables = buildTemplateVariables(aiArgs, config.layerConfigTemplate, intentName, config.provider, "");
@@ -3377,8 +3922,10 @@ export const handleMapTool = async (
       };
     }
 
-    const userApiKey = (await resolveUserMapApiKeys(userId, headerApiKey))
-      .find((apiKey) => sameProvider(apiKey.provider, config.provider));
+    const userApiKey = selectApiKeyForProvider(
+      await resolveUserMapApiKeys(userId, headerApiKey),
+      config.provider
+    );
 
     if (!userApiKey) {
       return {
@@ -3397,11 +3944,11 @@ export const handleMapTool = async (
     }
 
     if (isVallarisProvider(config.provider) && isCollectionDetailConfig(config.layerConfigTemplate)) {
-      return buildVectorTileLayerPayload(config, aiArgs, decryptedApiKey);
+      return buildVectorTileLayerPayload(withApiKeyHostBaseUrl(config, userApiKey), aiArgs, decryptedApiKey);
     }
 
     if (isVallarisProvider(config.provider)) {
-      return buildVallarisLayerPayload(config, aiArgs, decryptedApiKey);
+      return buildVallarisLayerPayload(withApiKeyHostBaseUrl(config, userApiKey), aiArgs, decryptedApiKey);
     }
 
     const templateVariables = buildTemplateVariables(
@@ -3437,8 +3984,9 @@ export const handleMapTool = async (
       };
     }
 
+    const runtimeConfig = withApiKeyHostBaseUrl(config, userApiKey);
     const finalUrl = replaceTemplateVariables(
-      `${config.baseUrl}${config.urlTemplate}`,
+      `${runtimeConfig.baseUrl}${runtimeConfig.urlTemplate}`,
       templateVariables
     );
 
@@ -3548,7 +4096,10 @@ export const resolveUserMapToolConfigs = async (
   return filterConfigsByQuery(
     filterConfigsByProviders(configs, allowedProviders),
     query
-  );
+  ).map((config) => ({
+    ...config,
+    type: getConfigType(config.layerConfigTemplate)
+  }));
 };
 
 export const handleCheckMapAccess = async (userId: string, headerApiKey?: string, query?: string) => {
@@ -3559,6 +4110,7 @@ export const handleCheckMapAccess = async (userId: string, headerApiKey?: string
       return {
         success: false,
         allowedProviders: [],
+        allowedHosts: [],
         configs: [],
         message: headerApiKey?.trim()
           ? "The x-api-key header does not match any active API key for this user."
@@ -3567,6 +4119,7 @@ export const handleCheckMapAccess = async (userId: string, headerApiKey?: string
     }
 
     const allowedProviders = getUniqueProviders(userKeys.map((key) => key.provider));
+    const allowedHosts = getAllowedHosts(userKeys);
 
     const allConfigs = await prisma.mapconfig.findMany({
       where: {
@@ -3584,15 +4137,17 @@ export const handleCheckMapAccess = async (userId: string, headerApiKey?: string
         { intentName: "asc" }
       ]
     });
-    const configs = filterConfigsByQuery(
-      filterConfigsByProviders(allConfigs, allowedProviders),
-      query
-    );
+    const providerAllowedConfigs = filterConfigsByProviders(allConfigs, allowedProviders);
+    const explicitQueryMatches = getExplicitConfigMatchesByQuery(providerAllowedConfigs, query);
+    const configs = explicitQueryMatches.length > 0
+      ? explicitQueryMatches
+      : providerAllowedConfigs;
 
     if (configs.length === 0) {
       return {
         success: false,
         allowedProviders,
+        allowedHosts,
         configs: [],
         message: "The user has map API keys, but no active mapconfig exists for those providers."
       };
@@ -3601,13 +4156,19 @@ export const handleCheckMapAccess = async (userId: string, headerApiKey?: string
     return {
       success: true,
       allowedProviders,
-      configs: configs.map(({ layerConfigTemplate, ...config }) => config)
+      allowedHosts,
+      configs: configs.map((config) => ({
+        intentName: config.intentName,
+        type: getConfigType(config.layerConfigTemplate),
+        urlTemplate: config.urlTemplate
+      }))
     };
   } catch (error) {
     console.error("Check Map Access Error:", error);
     return {
       success: false,
       allowedProviders: [],
+      allowedHosts: [],
       configs: [],
       message: "An error occurred while retrieving map access permissions from the database."
     };

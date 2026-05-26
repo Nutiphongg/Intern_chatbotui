@@ -8,10 +8,8 @@ export type DayRange = number;
 //userapikey
 export const CreateApiKeyBody = t.Object({
   provider: t.String({ minLength: 1 }),
-  keyName: t.String({ 
-    minLength: 1,
-    default: 'Production Key'
-  }),
+  hostId: t.Optional(t.String({ minLength: 1 })),
+  keyName: t.String({ }),
   keyValue: t.String({ minLength: 1 })
 });
 
@@ -25,6 +23,7 @@ export type ApiKeyParams = Static<typeof apiKeyParamsSchema>;
 
 export const updateApiKeyBodySchema = t.Object({
   keyName: t.Optional(t.String({ minLength: 1 })),
+  hostId: t.Optional(t.Nullable(t.String({ minLength: 1 }))),
   isActive: t.Optional(t.Boolean())
 });
 export type UpdateApiKeyDTO = Static<typeof updateApiKeyBodySchema>;
@@ -32,6 +31,7 @@ export type UpdateApiKeyDTO = Static<typeof updateApiKeyBodySchema>;
 export const apiKeySummarySchema = t.Object({
   id: t.String(),
   provider: t.String(),
+  hostId: t.Optional(t.Nullable(t.String())),
   keyName: t.String(),
   maskedKey: t.String(),
   isActive: t.Boolean(),
@@ -42,6 +42,7 @@ export type ApiKeySummaryDTO = Static<typeof apiKeySummarySchema>;
 export const createdApiKeySchema = t.Object({
   id: t.String(),
   provider: t.String(),
+  hostId: t.Optional(t.Nullable(t.String())),
   keyName: t.String(),
   isActive: t.Boolean(),
   createdAt: t.Any()
@@ -51,6 +52,7 @@ export type CreatedApiKeyDTO = Static<typeof createdApiKeySchema>;
 export const apiKeyDetailSchema = t.Object({
   id: t.String(),
   provider: t.String(),
+  hostId: t.Optional(t.Nullable(t.String())),
   keyName: t.String(),
   maskedKey: t.String(),
   isActive: t.Boolean(),
@@ -102,5 +104,6 @@ export type MapConfigForTools = {
   intentName: string;
   provider: string;
   urlTemplate: string;
+  type?: string;
   layerConfigTemplate: unknown;
 };
