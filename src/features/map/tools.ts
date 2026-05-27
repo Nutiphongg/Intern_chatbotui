@@ -3520,6 +3520,14 @@ export const editMapStyleToolSchema = {
           type: "string",
           description: "The layerId to edit. If omitted, the latest layer is used."
         },
+        layerTitle: {
+          type: "string",
+          description: "The title/name of the displayed map layer to edit when the user names a layer but does not provide layerId."
+        },
+        sourceLayer: {
+          type: "string",
+          description: "The sourceLayer/name of the map layer to edit when it is known."
+        },
         target: {
           type: "string",
           enum: ["point", "circle", "line", "polygon", "fill", "symbol", "heatmap", "raster"],

@@ -1,6 +1,6 @@
 // src/features/chat/route.ts
 import { Elysia, t } from 'elysia';
-import { chatHistoryQuerySchema, chatRequestSchema, conversationParamsSchema ,editMessageParamsSchema,editMessageBodySchema,updateConvTitleParamsSchema,updateConveTitleBodySchema,mapLayerOrderBodySchema,mapLayerListQuerySchema} from './types';
+import { chatHistoryQuerySchema, chatRequestSchema, conversationParamsSchema ,editMessageParamsSchema,editMessageBodySchema,updateConvTitleParamsSchema,updateConveTitleBodySchema,mapLayerOrderBodySchema} from './types';
 import { processChatMessageStream, getChatHistory, getUserConversations,deleteConversation,editMessage, editConvTitle,getAvailableModels,getConversationMapLayers,updateConversationMapLayerOrder} from './service';
 import { authPlugin } from '../../plugins/plugin';
 import { redis } from '../setup/redis';
@@ -65,11 +65,10 @@ export const chatRoutes = new Elysia({ prefix: '/chat' })
         query: chatHistoryQuerySchema 
     })
     // GET /chat/conversations/:conversationId/map-layers
-    .get('/conversations/:conversationId/map-layers', async ({ params, query, user }) => {
-        return await getConversationMapLayers(user.id, user.role, params.conversationId, query.includePayload ?? false);
+    .get('/conversations/:conversationId/map-layers', async ({ params, user }) => {
+        return await getConversationMapLayers(user.id, user.role, params.conversationId);
     }, {
-        params: conversationParamsSchema,
-        query: mapLayerListQuerySchema
+        params: conversationParamsSchema
     })
     // PATCH /chat/conversations/:conversationId/map-layers
     .patch('/conversations/:conversationId/map-layers', async ({ params, body, user }) => {

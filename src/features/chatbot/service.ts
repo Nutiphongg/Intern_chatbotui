@@ -34,6 +34,7 @@ import {
 const OLLAMA_URL = env.OLLAMA_URL;
 const DEFAULT_CHAT_MODEL = 'qwen2.5';
 const VISION_MODEL = env.VISION_MODEL;
+const MEMORY_SUMMARY_MODEL = env.MEMORY_SUMMARY_MODEL.trim();
 const SUPABASE_URL = env.SUPABASE_URL.trim().replace(/\/+$/, '').replace(/\/rest\/v1$/, '');
 const SUPABASE_SERVICE_ROLE_KEY = env.SUPABASE_SERVICE_ROLE_KEY.trim();
 const CHAT_ATTACHMENTS_BUCKET = env.SUPABASE_CHAT_ATTACHMENTS_BUCKET;
@@ -730,6 +731,215 @@ const asRecord = (value: unknown): Record<string, unknown> => {
         : {};
 };
 
+type ConversationRollingSummary = Record<string, unknown>;
+
+let ensureConversationMemorySummaryColumnsPromise: Promise<void> | undefined;
+
+const ensureConversationMemorySummaryColumns = async () => {
+    ensureConversationMemorySummaryColumnsPromise ??= prisma.$executeRaw`
+        ALTER TABLE "conversations"
+        ADD COLUMN IF NOT EXISTS "memory_summary" JSONB,
+        ADD COLUMN IF NOT EXISTS "memory_summary_updated_at" TIMESTAMP(6)
+    `.then(() => undefined);
+
+    return ensureConversationMemorySummaryColumnsPromise;
+};
+
+const truncateSummaryText = (value: unknown, limit = 4000): string | undefined => {
+    if (typeof value !== 'string') return undefined;
+    const trimmed = value.trim();
+    if (!trimmed) return undefined;
+    return trimmed.length > limit ? `${trimmed.slice(0, limit)}...` : trimmed;
+};
+
+const compactSummaryMetadata = (metadata: unknown): Record<string, unknown> | undefined => {
+    const record = asRecord(metadata);
+    if (Object.keys(record).length === 0) return undefined;
+
+    const layerRecord = asRecord(record.layer);
+    const mapStyleRecord = asRecord(record.mapStyle);
+    const payloadRecord = asRecord(record.payload);
+    const compact = {
+        event: record.event,
+        title: record.title || layerRecord.title || payloadRecord.title,
+        layerId: record.layerId || layerRecord.layerId || mapStyleRecord.layerId || payloadRecord.layerId,
+        type: record.type || layerRecord.type || payloadRecord.type,
+        styleKey: record.styleKey || mapStyleRecord.styleKey,
+        activeStyle: record.activeStyle || mapStyleRecord.activeStyle,
+        geometryType: record.geometryType || layerRecord.geometryType || mapStyleRecord.geometryType
+    };
+
+    return Object.fromEntries(
+        Object.entries(compact).filter(([, value]) => value !== undefined && value !== null && value !== '')
+    );
+};
+
+const parseJsonObjectFromText = (value: string): Record<string, unknown> | undefined => {
+    const trimmed = value.trim()
+        .replace(/^```(?:json)?/i, '')
+        .replace(/```$/i, '')
+        .trim();
+
+    try {
+        const parsed = JSON.parse(trimmed);
+        return asRecord(parsed);
+    } catch {
+        const start = trimmed.indexOf('{');
+        const end = trimmed.lastIndexOf('}');
+        if (start < 0 || end <= start) return undefined;
+
+        try {
+            return asRecord(JSON.parse(trimmed.slice(start, end + 1)));
+        } catch {
+            return undefined;
+        }
+    }
+};
+
+const getConversationRollingSummary = async (
+    conversationId: string
+): Promise<ConversationRollingSummary | undefined> => {
+    await ensureConversationMemorySummaryColumns();
+
+    const rows = await prisma.$queryRaw<Array<{ memorySummary: unknown }>>`
+        SELECT "memory_summary" AS "memorySummary"
+        FROM "conversations"
+        WHERE "id" = ${conversationId}
+            AND "is_deleted" = false
+        LIMIT 1
+    `;
+    const summary = asRecord(rows[0]?.memorySummary);
+
+    return Object.keys(summary).length > 0 ? summary : undefined;
+};
+
+const buildConversationSummaryContext = (
+    summary?: ConversationRollingSummary
+): { role: 'system'; content: string } | undefined => {
+    if (!summary || Object.keys(summary).length === 0) return undefined;
+
+    return {
+        role: 'system',
+        content: [
+            'Rolling summary for this conversation is available below.',
+            'Use it as durable context for goals, decisions, preferences, and open tasks from earlier turns.',
+            'Do not mention this summary unless the user asks how memory works.',
+            `Rolling summary JSON:\n${JSON.stringify(summary)}`
+        ].join('\n')
+    };
+};
+
+const updateConversationRollingSummary = async ({
+    conversationId,
+    previousSummary,
+    latestUserMessage,
+    latestAssistantMessage,
+    latestUserMetadata,
+    latestAssistantMetadata
+}: {
+    conversationId: string;
+    previousSummary?: ConversationRollingSummary;
+    latestUserMessage?: string;
+    latestAssistantMessage?: string;
+    latestUserMetadata?: unknown;
+    latestAssistantMetadata?: unknown;
+}) => {
+    if (!MEMORY_SUMMARY_MODEL) return;
+
+    const response = await fetch(`${OLLAMA_URL}/api/chat`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            model: MEMORY_SUMMARY_MODEL,
+            stream: false,
+            messages: [
+                {
+                    role: 'system',
+                    content: [
+                        'You are a rolling memory summarizer for one chat conversation.',
+                        'Update the previous summary using only durable information from the latest turn.',
+                        'Keep technical decisions, user goals, preferences, open tasks, and important map/API context.',
+                        'Do not copy large payloads, code dumps, raw layer/style JSON, or small talk.',
+                        'Return valid compact JSON only with keys: overview, decisions, openTasks, preferences, notes.',
+                        'Keep arrays short and remove stale/duplicated items.'
+                    ].join('\n')
+                },
+                {
+                    role: 'user',
+                    content: JSON.stringify({
+                        previousSummary: previousSummary || {},
+                        latestTurn: {
+                            user: truncateSummaryText(latestUserMessage),
+                            assistant: truncateSummaryText(latestAssistantMessage),
+                            userMetadata: compactSummaryMetadata(latestUserMetadata),
+                            assistantMetadata: compactSummaryMetadata(latestAssistantMetadata)
+                        }
+                    })
+                }
+            ],
+            options: {
+                temperature: 0.1,
+                top_p: 0.8,
+                num_predict: 700
+            }
+        })
+    });
+
+    if (!response.ok) {
+        throw new Error(`memory_summary_model_failed:${response.status}`);
+    }
+
+    const payload = await response.json();
+    const content = typeof payload?.message?.content === 'string'
+        ? payload.message.content
+        : '';
+    const nextSummary = parseJsonObjectFromText(content);
+    if (!nextSummary || Object.keys(nextSummary).length === 0) return;
+
+    await ensureConversationMemorySummaryColumns();
+    await prisma.$executeRaw`
+        UPDATE "conversations"
+        SET
+            "memory_summary" = CAST(${JSON.stringify(nextSummary)} AS jsonb),
+            "memory_summary_updated_at" = CURRENT_TIMESTAMP,
+            "updated_at" = CURRENT_TIMESTAMP
+        WHERE "id" = ${conversationId}
+            AND "is_deleted" = false
+    `;
+};
+
+const scheduleConversationSummaryUpdate = ({
+    conversationId,
+    latestUserMessage,
+    latestAssistantMessage,
+    latestUserMetadata,
+    latestAssistantMetadata
+}: {
+    conversationId: string;
+    latestUserMessage?: string;
+    latestAssistantMessage?: string;
+    latestUserMetadata?: unknown;
+    latestAssistantMetadata?: unknown;
+}) => {
+    if (!MEMORY_SUMMARY_MODEL) return;
+
+    void (async () => {
+        try {
+            const previousSummary = await getConversationRollingSummary(conversationId);
+            await updateConversationRollingSummary({
+                conversationId,
+                previousSummary,
+                latestUserMessage,
+                latestAssistantMessage,
+                latestUserMetadata,
+                latestAssistantMetadata
+            });
+        } catch (error) {
+            console.error('[memory-summary] failed to update conversation summary:', error);
+        }
+    })();
+};
+
 const mergeVisionAnalysisIntoMetadata = (
     metadata: unknown,
     analysis: VisionAnalysis
@@ -914,14 +1124,8 @@ type ConversationMapLayerRow = {
     updatedAt: Date;
 };
 
-type MapLayerOrderItem = string | Record<string, unknown>;
 type MapLayerOrderPayload = {
-    layerIds?: unknown;
-    layerKeys?: unknown;
-    order?: unknown;
-    layerTitles?: unknown;
-    layers?: unknown;
-    titles?: unknown;
+    layerIds: string[];
 };
 
 let ensureConversationMapLayersTablePromise: Promise<void> | undefined;
@@ -1007,28 +1211,6 @@ const toTrimmedString = (value: unknown): string | undefined => {
     return typeof value === 'string' && value.trim() ? value.trim() : undefined;
 };
 
-const getMapLayerOrderItems = (payload: MapLayerOrderPayload): MapLayerOrderItem[] => {
-    const items: MapLayerOrderItem[] = [];
-
-    for (const value of [payload.order, payload.layerIds, payload.layerKeys, payload.layers, payload.titles, payload.layerTitles]) {
-        if (!Array.isArray(value)) continue;
-
-        for (const item of value) {
-            if (typeof item === 'string' && item.trim()) {
-                items.push(item.trim());
-                continue;
-            }
-
-            const record = asRecord(item);
-            if (Object.keys(record).length > 0) {
-                items.push(record);
-            }
-        }
-    }
-
-    return items;
-};
-
 const getRowTitleCandidates = (row: ConversationMapLayerRow): string[] => {
     return [
         row.title,
@@ -1055,23 +1237,13 @@ const resolveMapLayerOrderIds = (
     const orderedLayerIds: string[] = [];
     const seenLayerIds = new Set<string>();
 
-    for (const item of getMapLayerOrderItems(payload)) {
-        const record = typeof item === 'string' ? {} : item;
-        const idCandidates = typeof item === 'string'
-            ? [item]
-            : [record.layerKey, record.layerId, record.id]
-                .map(toTrimmedString)
-                .filter((value): value is string => Boolean(value));
-        const titleCandidates = typeof item === 'string'
-            ? [item]
-            : [record.title, record.layerTitle, record.styleTitle, record.name]
-                .map(toTrimmedString)
-                .filter((value): value is string => Boolean(value));
+    for (const item of payload.layerIds) {
+        const candidate = toTrimmedString(item);
+        if (!candidate) continue;
 
-        const layerId = idCandidates.find((candidate) => activeLayerKeys.has(candidate))
-            || titleCandidates
-                .map((candidate) => titleToLayerKey.get(normalizeLayerTitle(candidate)))
-                .find((candidate): candidate is string => Boolean(candidate));
+        const layerId = activeLayerKeys.has(candidate)
+            ? candidate
+            : titleToLayerKey.get(normalizeLayerTitle(candidate));
 
         if (layerId && !seenLayerIds.has(layerId)) {
             orderedLayerIds.push(layerId);
@@ -1608,6 +1780,25 @@ const normalizeStyleSwitchText = (value: unknown): string => {
         : '';
 };
 
+const getLayerTextMatchTerms = (value: unknown): string[] => {
+    if (typeof value !== 'string' || !value.trim()) return [];
+
+    const spaced = value
+        .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+        .replace(/([A-Za-z])(\d)/g, '$1 $2')
+        .replace(/(\d)([A-Za-z])/g, '$1 $2');
+    const wholeTerm = normalizeStyleSwitchText(value);
+    const tokenTerms = spaced
+        .split(/[\s()[\]{}"'`.,:;|/_-]+/g)
+        .map(normalizeStyleSwitchText)
+        .filter((term) => term.length >= 3);
+
+    return [
+        ...(wholeTerm.length >= 3 ? [wholeTerm] : []),
+        ...tokenTerms
+    ];
+};
+
 const resolveRequestedMapStyleKey = (
     message: string,
     styles: unknown[],
@@ -1727,7 +1918,7 @@ const getLayerMatchTerms = (
         ];
     });
 
-    return [
+    const values = [
         layerId,
         layerRecord.layerId,
         layerRecord.styleId,
@@ -1749,8 +1940,10 @@ const getLayerMatchTerms = (
         mapPayloadRecord.title,
         mapPayloadRecord.name,
         ...styleValues
-    ]
-        .map(normalizeStyleSwitchText)
+    ];
+
+    return values
+        .flatMap(getLayerTextMatchTerms)
         .filter((term, index, allTerms) => term.length >= 3 && allTerms.indexOf(term) === index);
 };
 
@@ -2919,6 +3112,10 @@ export const processChatMessageStream = (
                     const memoryPayload = isGuest
                         ? {}
                         : await buildConversationMemoryFromDb(convId);
+                    const rollingSummary = isGuest
+                        ? undefined
+                        : await getConversationRollingSummary(convId);
+                    const conversationSummaryContext = buildConversationSummaryContext(rollingSummary);
                     const conversationMapState = (memoryPayload.conversationMapState || buildConversationMapStateFromMessages(messagesForLLM)) as ConversationMapState | undefined;
                     const latestMapStyle = getLatestMapStyleFromState(conversationMapState)
                         || getLatestMapStyleFromMessages(messagesForLLM)
@@ -3044,6 +3241,13 @@ export const processChatMessageStream = (
                             await prisma.conversations.updateMany({
                                 where: { id: convId, user_id: userId },
                                 data: { last_message_at: assistantMessageCreatedAt }
+                            });
+                            scheduleConversationSummaryUpdate({
+                                conversationId: convId,
+                                latestUserMessage: currentUserHistoryMessage?.content,
+                                latestAssistantMessage: content,
+                                latestUserMetadata: userMessageMetadata,
+                                latestAssistantMetadata: metadata
                             });
                         }
 
@@ -3648,6 +3852,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                         systemMessage,
                         ...sanitizedMessagesForLLM,
                         styleReminder,
+                        ...(conversationSummaryContext ? [conversationSummaryContext] : []),
                         ...(conversationMemoryContext ? [conversationMemoryContext] : []),
                         ...(retrievedMemoryContext ? [retrievedMemoryContext] : []),
                         ...(visionContext ? [visionContext] : []),
@@ -4087,8 +4292,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 export const getConversationMapLayers = async (
     userId: string,
     role: string,
-    conversationId: string,
-    includePayload = false
+    conversationId: string
 ) => {
     if (role === 'guest') {
         return { success: true, layers: [] };
@@ -4098,8 +4302,7 @@ export const getConversationMapLayers = async (
     const rows = await getConversationMapLayerRows(conversationId);
 
     return {
-        success: true,
-        layers: rows.map(includePayload ? toPublicConversationMapLayer : toCompactConversationMapLayer)
+        layers: rows.map(toPublicConversationMapLayer)
     };
 };
 
@@ -4110,7 +4313,7 @@ export const updateConversationMapLayerOrder = async (
     payload: MapLayerOrderPayload
 ) => {
     if (role === 'guest') {
-        return { event: 'map_order', layerIds: [], layers: [] };
+        return { event: 'map_order', layerIds: [] };
     }
 
     await verifyConversationAccess(userId, conversationId);
@@ -4137,10 +4340,8 @@ export const updateConversationMapLayerOrder = async (
     const updatedRows = await getConversationMapLayerRows(conversationId);
 
     return {
-        success: true,
         event: 'map_order',
-        layerIds: updatedRows.map((row) => row.layerKey),
-        layers: updatedRows.map(toCompactConversationMapLayer)
+        layerIds: updatedRows.map((row) => row.layerKey)
     };
 };
 
