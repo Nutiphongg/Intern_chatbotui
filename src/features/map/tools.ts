@@ -52,6 +52,9 @@ type EditMapStyleArgs = MapToolArgs & {
   colorKey?: string;
   colorKeys?: unknown;
   colorValue?: string;
+  attributeKey?: string;
+  attributeValue?: string | number;
+  paintKey?: string;
   mix?: unknown;
   opacity?: number | string;
   radius?: number | string;
@@ -752,6 +755,180 @@ const shouldPatchPaintColorKey = (key: string): boolean => {
     && !key.includes("outline");
 };
 
+const normalizeEditText = (value: unknown): string => {
+  return typeof value === "string"
+    ? value.toLowerCase().replace(/[\s()[\]{}"'`.,:;|/_-]+/g, "")
+    : "";
+};
+
+const getExpressionAttributeKey = (value: unknown): string | undefined => {
+  if (!Array.isArray(value)) return undefined;
+
+  const [operator, attributeKey] = value;
+  if (operator === "get") return toStringValue(attributeKey);
+
+  for (const item of value) {
+    const key = getExpressionAttributeKey(item);
+    if (key) return key;
+  }
+
+  return undefined;
+};
+
+const valuesMatchStyleStop = (left: unknown, right: unknown): boolean => {
+  const leftNumber = toNumberValue(left);
+  const rightNumber = toNumberValue(right);
+  if (leftNumber !== undefined && rightNumber !== undefined) {
+    return Math.abs(leftNumber - rightNumber) < 0.000001;
+  }
+
+  return toStringValue(left) === toStringValue(right);
+};
+
+const replaceAttributeExpressionStopOutput = (
+  value: unknown,
+  attributeKey: string,
+  attributeValue: unknown,
+  output: unknown
+): { value: unknown; changed: boolean } => {
+  if (!Array.isArray(value)) return { value, changed: false };
+
+  const next = [...value];
+  let changed = false;
+  const operator = next[0];
+
+  if (operator === "interpolate" && getExpressionAttributeKey(next[2]) === attributeKey) {
+    for (let index = 3; index < next.length - 1; index += 2) {
+      if (valuesMatchStyleStop(next[index], attributeValue)) {
+        next[index + 1] = output;
+        changed = true;
+      }
+    }
+  }
+
+  if (operator === "match" && getExpressionAttributeKey(next[1]) === attributeKey) {
+    for (let index = 2; index < next.length - 1; index += 2) {
+      if (valuesMatchStyleStop(next[index], attributeValue)) {
+        next[index + 1] = output;
+        changed = true;
+      }
+    }
+  }
+
+  for (let index = 0; index < next.length; index += 1) {
+    const nested = replaceAttributeExpressionStopOutput(next[index], attributeKey, attributeValue, output);
+    if (nested.changed) {
+      next[index] = nested.value;
+      changed = true;
+    }
+  }
+
+  return { value: changed ? next : value, changed };
+};
+
+const collectPaintAttributeStops = (
+  value: unknown,
+  stops: Array<{ attributeKey: string; value: unknown }> = []
+): Array<{ attributeKey: string; value: unknown }> => {
+  if (!Array.isArray(value)) {
+    if (isRecord(value)) {
+      for (const nestedValue of Object.values(value)) {
+        collectPaintAttributeStops(nestedValue, stops);
+      }
+    }
+    return stops;
+  }
+
+  const operator = value[0];
+  if (operator === "interpolate") {
+    const attributeKey = getExpressionAttributeKey(value[2]);
+    if (attributeKey) {
+      for (let index = 3; index < value.length - 1; index += 2) {
+        stops.push({ attributeKey, value: value[index] });
+      }
+    }
+  }
+
+  if (operator === "match") {
+    const attributeKey = getExpressionAttributeKey(value[1]);
+    if (attributeKey) {
+      for (let index = 2; index < value.length - 1; index += 2) {
+        stops.push({ attributeKey, value: value[index] });
+      }
+    }
+  }
+
+  for (const item of value) {
+    collectPaintAttributeStops(item, stops);
+  }
+
+  return stops;
+};
+
+const resolveAttributeStopEdit = (
+  paint: Record<string, unknown>,
+  args: EditMapStyleArgs
+): { attributeKey: string; attributeValue: unknown; paintKey?: string } | undefined => {
+  const instruction = normalizeEditText(getEditInstruction(args));
+  const requestedAttributeKey = toStringValue(args.attributeKey);
+  const requestedAttributeValue = args.attributeValue;
+  const requestedPaintKey = toStringValue(args.paintKey);
+
+  if (requestedAttributeKey && requestedAttributeValue !== undefined) {
+    return {
+      attributeKey: requestedAttributeKey,
+      attributeValue: requestedAttributeValue,
+      ...(requestedPaintKey ? { paintKey: requestedPaintKey } : {})
+    };
+  }
+
+  if (!instruction) return undefined;
+
+  const stops = collectPaintAttributeStops(paint);
+  const matchedStop = stops.find((stop) => {
+    const normalizedAttribute = normalizeEditText(stop.attributeKey);
+    const normalizedValue = normalizeEditText(toStringValue(stop.value));
+    return Boolean(
+      normalizedAttribute
+      && normalizedValue
+      && instruction.includes(normalizedAttribute)
+      && instruction.includes(normalizedValue)
+    );
+  });
+  return matchedStop
+    ? {
+      attributeKey: matchedStop.attributeKey,
+      attributeValue: matchedStop.value
+    }
+    : undefined;
+};
+
+const buildAttributeStopPaintPatch = (
+  paint: Record<string, unknown>,
+  args: EditMapStyleArgs,
+  output?: unknown
+): Record<string, unknown> => {
+  if (output === undefined) return {};
+
+  const stopEdit = resolveAttributeStopEdit(paint, args);
+  if (!stopEdit) return {};
+
+  return Object.fromEntries(
+    Object.entries(paint)
+      .filter(([paintKey]) => !stopEdit.paintKey || stopEdit.paintKey === paintKey)
+      .map(([paintKey, paintValue]) => {
+        const patched = replaceAttributeExpressionStopOutput(
+          paintValue,
+          stopEdit.attributeKey,
+          stopEdit.attributeValue,
+          output
+        );
+        return patched.changed ? [paintKey, patched.value] : undefined;
+      })
+      .filter((entry): entry is [string, unknown] => Boolean(entry))
+  );
+};
+
 const buildColorPatchFromPaint = (
   paint: Record<string, unknown>,
   layerType: string,
@@ -790,12 +967,16 @@ const getPaintPatchForLayerType = (
   const explicitPaint = pickRecord(args.paint);
   const opacity = getEditNumber(args, ["opacity"]);
   const normalizedOpacity = opacity !== undefined && opacity > 1 ? opacity / 100 : opacity;
-  const colorPatch = buildColorPatchFromPaint(existingPaint, layerType, color);
+  const attributeStopPatch = buildAttributeStopPaintPatch(existingPaint, args, color);
+  const colorPatch = Object.keys(attributeStopPatch).length > 0
+    ? {}
+    : buildColorPatchFromPaint(existingPaint, layerType, color);
 
   if (layerType === "circle") {
     const radius = getEditNumber(args, ["radius", "size"]);
     return {
       ...explicitPaint,
+      ...attributeStopPatch,
       ...colorPatch,
       ...(radius !== undefined ? { "circle-radius": radius } : {}),
       ...(normalizedOpacity !== undefined ? { "circle-opacity": normalizedOpacity } : {})
@@ -806,6 +987,7 @@ const getPaintPatchForLayerType = (
     const width = getEditNumber(args, ["width", "size"]);
     return {
       ...explicitPaint,
+      ...attributeStopPatch,
       ...colorPatch,
       ...(width !== undefined ? { "line-width": width } : {}),
       ...(normalizedOpacity !== undefined ? { "line-opacity": normalizedOpacity } : {})
@@ -815,6 +997,7 @@ const getPaintPatchForLayerType = (
   if (layerType === "fill") {
     return {
       ...explicitPaint,
+      ...attributeStopPatch,
       ...colorPatch,
       ...(normalizedOpacity !== undefined ? { "fill-opacity": normalizedOpacity } : {})
     };
@@ -823,6 +1006,7 @@ const getPaintPatchForLayerType = (
   if (layerType === "fill-extrusion") {
     return {
       ...explicitPaint,
+      ...attributeStopPatch,
       ...colorPatch,
       ...(normalizedOpacity !== undefined ? { "fill-extrusion-opacity": normalizedOpacity } : {})
     };
@@ -831,6 +1015,7 @@ const getPaintPatchForLayerType = (
   if (layerType === "symbol") {
     return {
       ...explicitPaint,
+      ...attributeStopPatch,
       ...colorPatch,
       ...(normalizedOpacity !== undefined ? { "icon-opacity": normalizedOpacity, "text-opacity": normalizedOpacity } : {})
     };
@@ -839,6 +1024,7 @@ const getPaintPatchForLayerType = (
   if (layerType === "heatmap") {
     return {
       ...explicitPaint,
+      ...attributeStopPatch,
       ...colorPatch,
       ...(normalizedOpacity !== undefined ? { "heatmap-opacity": normalizedOpacity } : {})
     };
@@ -847,6 +1033,7 @@ const getPaintPatchForLayerType = (
   if (layerType === "raster") {
     return {
       ...explicitPaint,
+      ...attributeStopPatch,
       ...colorPatch,
       ...(normalizedOpacity !== undefined ? { "raster-opacity": normalizedOpacity } : {})
     };
@@ -854,6 +1041,7 @@ const getPaintPatchForLayerType = (
 
   return {
     ...explicitPaint,
+    ...attributeStopPatch,
     ...colorPatch
   };
 };
@@ -1924,6 +2112,10 @@ type VectorTileCollection = {
   sourceLayer?: string;
 };
 
+type MapAttributeField = {
+  type: string;
+};
+
 type MapOptionPaginationRequest = {
   enabled: boolean;
   limit?: number;
@@ -1954,6 +2146,82 @@ const normalizeGeometryType = (value: unknown): string | undefined => {
   if (geometry.includes("polygon")) return "polygon";
   if (geometry.includes("raster") || geometry.includes("image") || geometry.includes("coverage")) return "raster";
   return geometry;
+};
+
+const normalizeAttributeFieldType = (value: unknown): string | undefined => {
+  return toStringValue(value);
+};
+
+const normalizeAttributeFields = (fields: unknown): Record<string, MapAttributeField> | undefined => {
+  if (!fields) return undefined;
+
+  const entries = new Map<string, MapAttributeField>();
+  const addField = (name: unknown, type: unknown) => {
+    const fieldName = toStringValue(name);
+    const fieldType = normalizeAttributeFieldType(type);
+    if (!fieldName || !fieldType) return;
+    entries.set(fieldName, { type: fieldType });
+  };
+
+  if (isRecord(fields)) {
+    for (const [fieldName, fieldDefinition] of Object.entries(fields)) {
+      const definition = pickRecord(fieldDefinition);
+      addField(fieldName, toStringValue(fieldDefinition) || definition.type || definition.dataType || definition.fieldType);
+    }
+  }
+
+  if (Array.isArray(fields)) {
+    for (const field of fields) {
+      if (!isRecord(field)) continue;
+      addField(
+        field.name || field.key || field.id || field.field,
+        field.type || field.dataType || field.fieldType
+      );
+    }
+  }
+
+  return entries.size > 0 ? Object.fromEntries(entries) : undefined;
+};
+
+const findAttributeFieldsInPayload = (payload: unknown, depth = 0): Record<string, MapAttributeField> | undefined => {
+  if (depth > 5 || !payload) return undefined;
+
+  if (Array.isArray(payload)) {
+    for (const item of payload) {
+      const fields = findAttributeFieldsInPayload(item, depth + 1);
+      if (fields) return fields;
+    }
+    return undefined;
+  }
+
+  if (!isRecord(payload)) return undefined;
+
+  const attributes = pickRecord(payload.attributes);
+  const directFields = normalizeAttributeFields(attributes.fields)
+    || normalizeAttributeFields(payload.fields)
+    || normalizeAttributeFields(pickRecord(payload.schema).fields)
+    || normalizeAttributeFields(pickRecord(payload.metadata).fields);
+  if (directFields) return directFields;
+
+  for (const value of Object.values(payload)) {
+    const fields = findAttributeFieldsInPayload(value, depth + 1);
+    if (fields) return fields;
+  }
+
+  return undefined;
+};
+
+const getAttributeFieldsFromTileRecord = (
+  tileRecord: Record<string, unknown>,
+  tilePayload?: unknown
+): Record<string, MapAttributeField> | undefined => {
+  const attributes = pickRecord(tileRecord.attributes);
+  return normalizeAttributeFields(attributes.fields)
+    || normalizeAttributeFields(tileRecord.fields)
+    || normalizeAttributeFields(pickRecord(tileRecord.schema).fields)
+    || normalizeAttributeFields(pickRecord(tileRecord.metadata).fields)
+    || findAttributeFieldsInPayload(tilePayload)
+    || findAttributeFieldsInPayload(tileRecord);
 };
 
 const getDirectGeometryType = (value: unknown): string | undefined => {
@@ -3240,6 +3508,7 @@ const buildVectorTileLayerPayload = async (
     || getDirectGeometryType(template)
     || await inferVectorTileGeometryType(layerId, secureTiles, center, bounds, minzoom, maxzoom);
   const sourceLayer = findSourceLayer(tileRecord, layerId);
+  const attributeFields = getAttributeFieldsFromTileRecord(tileRecord, tilePayload);
 
   return {
     success: true,
@@ -3256,7 +3525,8 @@ const buildVectorTileLayerPayload = async (
         ...(center ? { center } : {}),
         ...(bounds ? { bounds } : {}),
         ...(geometryType ? { geometryType } : {}),
-        ...(sourceLayer ? { sourceLayer } : {})
+        ...(sourceLayer ? { sourceLayer } : {}),
+        ...(attributeFields ? { attributes: { fields: attributeFields } } : {})
       }
     }
   };
@@ -3512,13 +3782,21 @@ export const editMapStyleToolSchema = {
   type: "function",
   function: {
     name: "edit_map_style",
-    description: "Edit the latest map style using the existing map_style as the base. Use this when the user wants to change color, size, width, opacity, paint, or layout without calling get_map_layer again. Colors should be provided as catalog colorKeys or a hex colorValue.",
+    description: "Edit the latest map style using the existing map_style as the base. Use this when the user wants to change color, size, width, opacity, paint, or layout without calling get_map_layer again. Colors should be provided as catalog colorKeys or a hex colorValue. To edit one attribute stop, pass attributeKey and attributeValue. To change the whole layer color, omit attributeValue.",
     parameters: {
       type: "object",
       properties: {
         layerId: {
           type: "string",
           description: "The layerId to edit. If omitted, the latest layer is used."
+        },
+        layerTitle: {
+          type: "string",
+          description: "The title/name of the displayed map layer to edit when the user names a layer but does not provide layerId."
+        },
+        sourceLayer: {
+          type: "string",
+          description: "The sourceLayer/name of the map layer to edit when it is known."
         },
         target: {
           type: "string",
@@ -3546,6 +3824,18 @@ export const editMapStyleToolSchema = {
         colorValue: {
           type: "string",
           description: "A validated hex color, such as #1F2937. Use when the user gives a specific color or the chatbot chooses a mixed color."
+        },
+        attributeKey: {
+          type: "string",
+          description: "Attribute field used by an existing paint expression when editing one attribute stop, such as bright_ti5."
+        },
+        attributeValue: {
+          oneOf: [{ type: "string" }, { type: "number" }],
+          description: "The exact stop/category value in an existing attribute paint expression to edit, such as 315."
+        },
+        paintKey: {
+          type: "string",
+          description: "Optional MapLibre paint key to edit for an attribute stop, such as circle-color."
         },
         radius: {
           type: "number",

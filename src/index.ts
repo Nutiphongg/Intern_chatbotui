@@ -16,7 +16,7 @@ const app = new Elysia()
 //ใช้ test
 .use(cors({
   origin:'http://localhost:3000',
-  methods: "GET,HEAD,PUT,POST,DELETE,OPTIONS",
+  methods: "GET,HEAD,PUT,POST,DELETE,OPTIONS,PATCH",
   credentials:true, //ส่ง cookie
   allowedHeaders: ['Content-Type', 'Authorization','ngrok-skip-browser-warning', 'X-API-Key'],
   exposeHeaders: ['X-Conversation-Id', 'conversation_id']

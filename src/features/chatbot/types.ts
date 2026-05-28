@@ -45,37 +45,12 @@ export const chatHistoryQuerySchema = t.Object({
 });
 export type ChatHistoryQuery = Static<typeof chatHistoryQuerySchema>;
 
-const mapLayerOrderItemSchema = t.Union([
-  t.String({ minLength: 1 }),
-  t.Object({
-    id: t.Optional(t.String({ minLength: 1 })),
-    layerId: t.Optional(t.String({ minLength: 1 })),
-    layerKey: t.Optional(t.String({ minLength: 1 })),
-    layerTitle: t.Optional(t.String({ minLength: 1 })),
-    name: t.Optional(t.String({ minLength: 1 })),
-    styleTitle: t.Optional(t.String({ minLength: 1 })),
-    title: t.Optional(t.String({ minLength: 1 }))
-  }, {
-    additionalProperties: true
-  })
-]);
-
 export const mapLayerOrderBodySchema = t.Object({
-  layerIds: t.Optional(t.Array(mapLayerOrderItemSchema)),
-  layerKeys: t.Optional(t.Array(t.String({ minLength: 1 }))),
-  order: t.Optional(t.Array(mapLayerOrderItemSchema)),
-  layerTitles: t.Optional(t.Array(t.String({ minLength: 1 }))),
-  layers: t.Optional(t.Array(mapLayerOrderItemSchema)),
-  titles: t.Optional(t.Array(t.String({ minLength: 1 })))
+  layerIds: t.Array(t.String({ minLength: 1 }))
 }, {
   additionalProperties: false
 });
 export type MapLayerOrderBody = Static<typeof mapLayerOrderBodySchema>;
-
-export const mapLayerListQuerySchema = t.Object({
-  includePayload: t.Optional(t.Boolean())
-});
-export type MapLayerListQuery = Static<typeof mapLayerListQuerySchema>;
 
 export type ChatResponse = ChatResponsePayload;
 export type ChatStreamResponse = ChatStreamPayload;
