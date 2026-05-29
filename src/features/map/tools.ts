@@ -53,13 +53,18 @@ type EditMapStyleArgs = MapToolArgs & {
   colorKeys?: unknown;
   colorValue?: string;
   attributeKey?: string;
+  attributeType?: string;
   attributeValue?: string | number;
+  attributeValues?: unknown;
+  attributeStats?: unknown;
   paintKey?: string;
+  value?: unknown;
   mix?: unknown;
   opacity?: number | string;
   radius?: number | string;
   size?: number | string;
   width?: number | string;
+  strokeWidth?: number | string;
   paint?: unknown;
   layout?: unknown;
 };
@@ -733,6 +738,19 @@ const getEditNumber = (
   return undefined;
 };
 
+const getInstructionNumberAfter = (
+  instruction: string,
+  pattern: RegExp
+): number | undefined => {
+  const match = instruction.match(pattern);
+  if (!match?.[1]) return undefined;
+  return toNumberValue(match[1]);
+};
+
+const getStrokeWidthFromInstruction = (instruction: string): number | undefined => {
+  return getInstructionNumberAfter(instruction, /(?:stroke[\s_-]*width|stroke width|stroke-width)\D+(-?\d+(?:\.\d+)?)/i);
+};
+
 const buildHeatmapColorRamp = (color: string): unknown[] => {
   return [
     "interpolate",
@@ -804,6 +822,20 @@ const replaceAttributeExpressionStopOutput = (
         changed = true;
       }
     }
+
+    const numericAttributeValue = toNumberValue(attributeValue);
+    if (!changed && numericAttributeValue !== undefined) {
+      let insertIndex = next.length;
+      for (let index = 3; index < next.length - 1; index += 2) {
+        const stopValue = toNumberValue(next[index]);
+        if (stopValue !== undefined && stopValue > numericAttributeValue) {
+          insertIndex = index;
+          break;
+        }
+      }
+      next.splice(insertIndex, 0, numericAttributeValue, output);
+      changed = true;
+    }
   }
 
   if (operator === "match" && getExpressionAttributeKey(next[1]) === attributeKey) {
@@ -812,6 +844,11 @@ const replaceAttributeExpressionStopOutput = (
         next[index + 1] = output;
         changed = true;
       }
+    }
+
+    if (!changed) {
+      next.splice(Math.max(2, next.length - 1), 0, attributeValue, output);
+      changed = true;
     }
   }
 
@@ -916,6 +953,10 @@ const buildAttributeStopPaintPatch = (
   return Object.fromEntries(
     Object.entries(paint)
       .filter(([paintKey]) => !stopEdit.paintKey || stopEdit.paintKey === paintKey)
+      .filter(([paintKey]) => {
+        const outputIsColor = typeof output === "string" && Boolean(normalizeColorHex(output));
+        return !outputIsColor || paintKey.endsWith("-color");
+      })
       .map(([paintKey, paintValue]) => {
         const patched = replaceAttributeExpressionStopOutput(
           paintValue,
@@ -958,17 +999,350 @@ const buildColorPatchFromPaint = (
   return {};
 };
 
-const getPaintPatchForLayerType = (
+const resolveColorKeysFromInstruction = (
+  instruction: string,
+  colors: StyleColorEntry[]
+): string[] => {
+  const normalizedInstruction = normalizeEditText(instruction);
+  if (!normalizedInstruction) return [];
+
+  return colors
+    .map((color) => color.key)
+    .filter((key) => {
+      const normalizedKey = normalizeEditText(key);
+      return normalizedKey && normalizedInstruction.includes(normalizedKey);
+    });
+};
+
+const getEditDistance = (left: string, right: string): number => {
+  const distances = Array.from({ length: left.length + 1 }, (_, row) => {
+    return Array.from({ length: right.length + 1 }, (_, column) => {
+      if (row === 0) return column;
+      if (column === 0) return row;
+      return 0;
+    });
+  });
+
+  for (let row = 1; row <= left.length; row += 1) {
+    for (let column = 1; column <= right.length; column += 1) {
+      const cost = left[row - 1] === right[column - 1] ? 0 : 1;
+      distances[row][column] = Math.min(
+        distances[row - 1][column] + 1,
+        distances[row][column - 1] + 1,
+        distances[row - 1][column - 1] + cost
+      );
+    }
+  }
+
+  return distances[left.length][right.length];
+};
+
+const isClosePaintKeyMatch = (candidate: string, term: string): boolean => {
+  if (!candidate || !term) return false;
+  if (candidate === term) return true;
+  if (Math.abs(candidate.length - term.length) > 2) return false;
+  const distance = getEditDistance(candidate, term);
+  return distance <= Math.max(1, Math.floor(candidate.length * 0.15));
+};
+
+const getInstructionTerms = (instruction: string): string[] => {
+  return instruction
+    .split(/[^a-z0-9_-]+/i)
+    .map(normalizeEditText)
+    .filter((term) => term.length >= 4);
+};
+
+const resolveFuzzyPaintKeyFromInstruction = (
+  paintKeys: string[],
+  normalizedInstruction: string,
+  suffix?: string
+): string | undefined => {
+  const terms = getInstructionTerms(normalizedInstruction);
+  if (terms.length === 0) return undefined;
+
+  return paintKeys.find((key) => {
+    if (suffix && !key.endsWith(suffix)) return false;
+    const normalizedKey = normalizeEditText(key);
+    return terms.some((term) => isClosePaintKeyMatch(normalizedKey, term));
+  });
+};
+
+const resolvePaintKeyFromInstruction = (
+  paint: Record<string, unknown>,
+  layerType: string,
+  args: EditMapStyleArgs
+): string | undefined => {
+  const explicitPaintKey = toStringValue(args.paintKey);
+  if (explicitPaintKey) return explicitPaintKey;
+
+  const instruction = normalizeEditText(getEditInstruction(args));
+  if (!instruction) return undefined;
+
+  const existingPaintKey = Object.keys(paint).find((key) => {
+    const normalizedKey = normalizeEditText(key);
+    return normalizedKey && instruction.includes(normalizedKey);
+  });
+  if (existingPaintKey) return existingPaintKey;
+
+  return resolveFuzzyPaintKeyFromInstruction(Object.keys(paint), instruction, "-color");
+};
+
+const buildExplicitPaintColorPatch = (
+  paint: Record<string, unknown>,
+  layerType: string,
+  args: EditMapStyleArgs,
+  color?: string
+): Record<string, unknown> => {
+  if (!color) return {};
+
+  const paintKey = resolvePaintKeyFromInstruction(paint, layerType, args);
+  if (!paintKey || !paintKey.endsWith("-color")) return {};
+
+  return {
+    [paintKey]: color
+  };
+};
+
+const parseGenericPaintValue = (args: EditMapStyleArgs): unknown => {
+  if (args.value !== undefined) return args.value;
+
+  const instruction = getEditInstruction(args);
+  const explicitPaintKey = toStringValue(args.paintKey);
+  if (explicitPaintKey) {
+    const escapedKey = explicitPaintKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const match = instruction.match(new RegExp(`${escapedKey}\\s*(?:is|to|=|เป็น)?\\s*([^\\s,]+)`, "i"));
+    if (match?.[1]) return match[1];
+  }
+
+  return undefined;
+};
+
+const buildExplicitGenericPaintPatch = (
+  paint: Record<string, unknown>,
+  args: EditMapStyleArgs,
+  color?: string
+): Record<string, unknown> => {
+  const paintKey = resolvePaintKeyByInstruction(paint, args);
+  if (!paintKey) return {};
+
+  if (paintKey.endsWith("-color") && color) {
+    return { [paintKey]: color };
+  }
+
+  const value = parseGenericPaintValue(args);
+  const numberValue = toNumberValue(value);
+  if (numberValue !== undefined && typeof paint[paintKey] === "number") {
+    return { [paintKey]: numberValue };
+  }
+
+  const stringValue = toStringValue(value);
+  if (stringValue && typeof paint[paintKey] === "string") {
+    return { [paintKey]: stringValue };
+  }
+
+  return {};
+};
+
+const resolvePaintKeyByInstruction = (
+  paint: Record<string, unknown>,
+  args: EditMapStyleArgs,
+  suffix?: string
+): string | undefined => {
+  const explicitPaintKey = toStringValue(args.paintKey);
+  if (explicitPaintKey && (!suffix || explicitPaintKey.endsWith(suffix))) return explicitPaintKey;
+
+  const instruction = normalizeEditText(getEditInstruction(args));
+  if (!instruction) return undefined;
+
+  const exactPaintKey = Object.keys(paint).find((key) => {
+    if (suffix && !key.endsWith(suffix)) return false;
+    const normalizedKey = normalizeEditText(key);
+    return normalizedKey && instruction.includes(normalizedKey);
+  });
+  if (exactPaintKey) return exactPaintKey;
+
+  return resolveFuzzyPaintKeyFromInstruction(Object.keys(paint), instruction, suffix);
+};
+
+const buildExplicitPaintNumberPatch = (
+  paint: Record<string, unknown>,
+  args: EditMapStyleArgs,
+  value: number | undefined,
+  suffix: string
+): Record<string, unknown> => {
+  if (value === undefined) return {};
+
+  const paintKey = resolvePaintKeyByInstruction(paint, args, suffix);
+  if (!paintKey) return {};
+
+  return {
+    [paintKey]: value
+  };
+};
+
+const getEditablePaintColorKey = (
+  paint: Record<string, unknown>,
+  layerType: string
+): string | undefined => {
+  return Object.keys(paint).find(shouldPatchPaintColorKey)
+    || (layerType === "circle" ? "circle-color" : undefined)
+    || (layerType === "line" ? "line-color" : undefined)
+    || (layerType === "fill" ? "fill-color" : undefined)
+    || (layerType === "fill-extrusion" ? "fill-extrusion-color" : undefined)
+    || (layerType === "symbol" ? "icon-color" : undefined)
+    || (layerType === "background" ? "background-color" : undefined)
+    || (layerType === "heatmap" ? "heatmap-color" : undefined);
+};
+
+const collectExpressionOutputs = (
+  value: unknown,
+  outputs: unknown[] = []
+): unknown[] => {
+  if (!Array.isArray(value)) return outputs;
+
+  const operator = value[0];
+  if (operator === "interpolate") {
+    for (let index = 4; index < value.length; index += 2) {
+      outputs.push(value[index]);
+    }
+  }
+  if (operator === "match") {
+    for (let index = 3; index < value.length; index += 2) {
+      outputs.push(value[index]);
+    }
+    if (value.length > 2) outputs.push(value[value.length - 1]);
+  }
+
+  for (const item of value) {
+    collectExpressionOutputs(item, outputs);
+  }
+
+  return outputs;
+};
+
+const getCatalogColorValues = async (): Promise<string[]> => {
+  const catalog = await handleStyleCatalogTool();
+  const colors = catalog.success && Array.isArray(catalog.colors) ? catalog.colors : [];
+  return colors
+    .map((color) => normalizeColorHex(pickRecord(color).value))
+    .filter((color): color is string => Boolean(color));
+};
+
+const getAttributeStylePalette = async (
+  existingPaint: Record<string, unknown>,
+  color?: string
+): Promise<string[]> => {
+  const existingColors = Object.values(existingPaint)
+    .flatMap((value) => collectExpressionOutputs(value))
+    .map(normalizeColorHex)
+    .filter((item): item is string => Boolean(item));
+  const catalogColors = await getCatalogColorValues();
+
+  return Array.from(new Set([
+    ...(color ? [color] : []),
+    ...existingColors,
+    ...catalogColors
+  ]));
+};
+
+const getAttributeValuesList = (value: unknown): unknown[] => {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .map((item) => {
+      const record = pickRecord(item);
+      return record.value !== undefined ? record.value : item;
+    })
+    .filter((item) => item !== undefined && item !== null && item !== "");
+};
+
+const getAttributeNumericStats = (
+  args: EditMapStyleArgs
+): { min: number; max: number } | undefined => {
+  const stats = pickRecord(args.attributeStats);
+  const min = toNumberValue(stats.min);
+  const max = toNumberValue(stats.max);
+  if (min !== undefined && max !== undefined && min !== max) return { min, max };
+
+  const values = getAttributeValuesList(args.attributeValues)
+    .map(toNumberValue)
+    .filter((value): value is number => value !== undefined)
+    .sort((left, right) => left - right);
+  if (values.length === 0) return undefined;
+
+  const valueMin = values[0];
+  const valueMax = values[values.length - 1];
+  return valueMin !== valueMax ? { min: valueMin, max: valueMax } : undefined;
+};
+
+const buildAttributePaintPatch = async (
+  layerType: string,
+  args: EditMapStyleArgs,
+  color: string | undefined,
+  existingPaint: Record<string, unknown>
+): Promise<Record<string, unknown>> => {
+  const attributeKey = toStringValue(args.attributeKey);
+  if (!attributeKey || args.attributeValue !== undefined) return {};
+
+  const paintKey = toStringValue(args.paintKey) || getEditablePaintColorKey(existingPaint, layerType);
+  if (!paintKey || (typeof color === "string" && normalizeColorHex(color) && !paintKey.endsWith("-color"))) return {};
+
+  const palette = await getAttributeStylePalette(existingPaint, color);
+  if (palette.length === 0) return {};
+
+  const attributeType = toStringValue(args.attributeType)?.toLowerCase();
+  const numericStats = getAttributeNumericStats(args);
+  if (attributeType === "number" && numericStats) {
+    const mid = numericStats.min + ((numericStats.max - numericStats.min) / 2);
+    return {
+      [paintKey]: [
+        "interpolate",
+        ["linear"],
+        ["get", attributeKey],
+        numericStats.min,
+        palette[0],
+        mid,
+        palette[Math.min(1, palette.length - 1)],
+        numericStats.max,
+        palette[Math.min(2, palette.length - 1)]
+      ]
+    };
+  }
+
+  const values = getAttributeValuesList(args.attributeValues).slice(0, 24);
+  if (values.length === 0) return {};
+
+  const matchExpression: unknown[] = ["match", ["get", attributeKey]];
+  values.forEach((value, index) => {
+    matchExpression.push(value, palette[index % palette.length]);
+  });
+  matchExpression.push(palette[palette.length - 1]);
+
+  return {
+    [paintKey]: matchExpression
+  };
+};
+
+const getPaintPatchForLayerType = async (
   layerType: string,
   args: EditMapStyleArgs,
   color?: string,
   existingPaint: Record<string, unknown> = {}
-): Record<string, unknown> => {
+): Promise<Record<string, unknown>> => {
   const explicitPaint = pickRecord(args.paint);
+  const instruction = getEditInstruction(args);
   const opacity = getEditNumber(args, ["opacity"]);
   const normalizedOpacity = opacity !== undefined && opacity > 1 ? opacity / 100 : opacity;
+  const strokeWidth = getEditNumber(args, ["strokeWidth"]) ?? getStrokeWidthFromInstruction(instruction);
   const attributeStopPatch = buildAttributeStopPaintPatch(existingPaint, args, color);
+  const attributePaintPatch = await buildAttributePaintPatch(layerType, args, color, existingPaint);
+  const explicitPaintColorPatch = buildExplicitPaintColorPatch(existingPaint, layerType, args, color);
+  const explicitPaintWidthPatch = buildExplicitPaintNumberPatch(existingPaint, args, strokeWidth, "-stroke-width");
+  const explicitGenericPaintPatch = buildExplicitGenericPaintPatch(existingPaint, args, color);
   const colorPatch = Object.keys(attributeStopPatch).length > 0
+    || Object.keys(attributePaintPatch).length > 0
+    || Object.keys(explicitPaintColorPatch).length > 0
+    || Object.keys(explicitGenericPaintPatch).length > 0
     ? {}
     : buildColorPatchFromPaint(existingPaint, layerType, color);
 
@@ -977,6 +1351,10 @@ const getPaintPatchForLayerType = (
     return {
       ...explicitPaint,
       ...attributeStopPatch,
+      ...attributePaintPatch,
+      ...explicitPaintColorPatch,
+      ...explicitPaintWidthPatch,
+      ...explicitGenericPaintPatch,
       ...colorPatch,
       ...(radius !== undefined ? { "circle-radius": radius } : {}),
       ...(normalizedOpacity !== undefined ? { "circle-opacity": normalizedOpacity } : {})
@@ -988,6 +1366,10 @@ const getPaintPatchForLayerType = (
     return {
       ...explicitPaint,
       ...attributeStopPatch,
+      ...attributePaintPatch,
+      ...explicitPaintColorPatch,
+      ...explicitPaintWidthPatch,
+      ...explicitGenericPaintPatch,
       ...colorPatch,
       ...(width !== undefined ? { "line-width": width } : {}),
       ...(normalizedOpacity !== undefined ? { "line-opacity": normalizedOpacity } : {})
@@ -998,6 +1380,10 @@ const getPaintPatchForLayerType = (
     return {
       ...explicitPaint,
       ...attributeStopPatch,
+      ...attributePaintPatch,
+      ...explicitPaintColorPatch,
+      ...explicitPaintWidthPatch,
+      ...explicitGenericPaintPatch,
       ...colorPatch,
       ...(normalizedOpacity !== undefined ? { "fill-opacity": normalizedOpacity } : {})
     };
@@ -1007,6 +1393,10 @@ const getPaintPatchForLayerType = (
     return {
       ...explicitPaint,
       ...attributeStopPatch,
+      ...attributePaintPatch,
+      ...explicitPaintColorPatch,
+      ...explicitPaintWidthPatch,
+      ...explicitGenericPaintPatch,
       ...colorPatch,
       ...(normalizedOpacity !== undefined ? { "fill-extrusion-opacity": normalizedOpacity } : {})
     };
@@ -1016,6 +1406,10 @@ const getPaintPatchForLayerType = (
     return {
       ...explicitPaint,
       ...attributeStopPatch,
+      ...attributePaintPatch,
+      ...explicitPaintColorPatch,
+      ...explicitPaintWidthPatch,
+      ...explicitGenericPaintPatch,
       ...colorPatch,
       ...(normalizedOpacity !== undefined ? { "icon-opacity": normalizedOpacity, "text-opacity": normalizedOpacity } : {})
     };
@@ -1025,6 +1419,10 @@ const getPaintPatchForLayerType = (
     return {
       ...explicitPaint,
       ...attributeStopPatch,
+      ...attributePaintPatch,
+      ...explicitPaintColorPatch,
+      ...explicitPaintWidthPatch,
+      ...explicitGenericPaintPatch,
       ...colorPatch,
       ...(normalizedOpacity !== undefined ? { "heatmap-opacity": normalizedOpacity } : {})
     };
@@ -1034,6 +1432,10 @@ const getPaintPatchForLayerType = (
     return {
       ...explicitPaint,
       ...attributeStopPatch,
+      ...attributePaintPatch,
+      ...explicitPaintColorPatch,
+      ...explicitPaintWidthPatch,
+      ...explicitGenericPaintPatch,
       ...colorPatch,
       ...(normalizedOpacity !== undefined ? { "raster-opacity": normalizedOpacity } : {})
     };
@@ -1042,6 +1444,10 @@ const getPaintPatchForLayerType = (
   return {
     ...explicitPaint,
     ...attributeStopPatch,
+    ...attributePaintPatch,
+    ...explicitPaintColorPatch,
+    ...explicitPaintWidthPatch,
+    ...explicitGenericPaintPatch,
     ...colorPatch
   };
 };
@@ -1060,13 +1466,16 @@ export const handleEditMapStyleTool = async (
     };
   }
 
-  const colorKeys = [
-    ...toStringList(aiArgs.colorKeys),
-    ...toStringList(aiArgs.colorKey)
-  ];
-  const requestedColorValue = normalizeColorHex(aiArgs.colorValue);
+  const instruction = getEditInstruction(aiArgs);
+  const requestedColorValue = normalizeColorHex(aiArgs.colorValue) || normalizeColorHex(aiArgs.value);
   let catalog = await handleStyleCatalogTool();
   let colors = catalog.success && Array.isArray(catalog.colors) ? catalog.colors : [];
+  const colorKeys = [
+    ...toStringList(aiArgs.colorKeys),
+    ...toStringList(aiArgs.colorKey),
+    ...(toStringValue(aiArgs.paintKey)?.endsWith("-color") ? toStringList(aiArgs.value) : []),
+    ...resolveColorKeysFromInstruction(instruction, colors)
+  ].filter((key, index, keys) => keys.indexOf(key) === index);
   let resolvedColor = requestedColorValue || resolveCatalogColor(colorKeys, colors, aiArgs.mix);
 
   if (!resolvedColor && colorKeys.length > 0) {
@@ -1088,7 +1497,7 @@ export const handleEditMapStyleTool = async (
   const currentMapLayerId = toStringValue(currentStyle.layerId);
   const target = toStringValue(aiArgs.target)?.toLowerCase();
 
-  const patchLayer = (layer: unknown) => {
+  const patchLayer = async (layer: unknown) => {
     const layerRecord = pickRecord(layer);
     const layerType = toStringValue(layerRecord.type) || "";
     const targetMatches = !target
@@ -1098,7 +1507,7 @@ export const handleEditMapStyleTool = async (
 
     if (!targetMatches) return layerRecord;
 
-    const paintPatch = getPaintPatchForLayerType(layerType, aiArgs, resolvedColor, pickRecord(layerRecord.paint));
+    const paintPatch = await getPaintPatchForLayerType(layerType, aiArgs, resolvedColor, pickRecord(layerRecord.paint));
     const layoutPatch = pickRecord(aiArgs.layout);
 
     return {
@@ -1107,14 +1516,25 @@ export const handleEditMapStyleTool = async (
       ...(Object.keys(paintPatch).length > 0 ? { paint: { ...pickRecord(layerRecord.paint), ...paintPatch } } : {})
     };
   };
-  const layers = currentLayers.map((layer) => {
+  const layers = await Promise.all(currentLayers.map((layer) => {
     const layerRecord = pickRecord(layer);
     const layerIdMatches = !requestedLayerId
       || requestedLayerId === currentMapLayerId
       || requestedLayerId === toStringValue(layerRecord.id);
 
     return layerIdMatches ? patchLayer(layerRecord) : layerRecord;
-  });
+  }));
+  const styleChanged = JSON.stringify(layers) !== JSON.stringify(currentLayers);
+
+  if (!styleChanged) {
+    return {
+      ...currentStyle,
+      success: false,
+      event: "map_style",
+      layerId: currentMapLayerId,
+      message: "No matching paint/layout property was changed for this style edit request."
+    };
+  }
 
   return {
     ...currentStyle,
@@ -1122,7 +1542,7 @@ export const handleEditMapStyleTool = async (
     event: "map_style",
     layerId: currentMapLayerId,
     layers,
-    styleInstruction: getEditInstruction(aiArgs),
+    styleInstruction: instruction,
     ...(resolvedColor ? { appliedColor: resolvedColor } : {}),
     ...(colorKeys.length > 0 ? { colorKeys } : {})
   };
@@ -1210,6 +1630,17 @@ const replaceTemplateVariables = (
     if (value === undefined || value === null) return result;
     return result.replace(new RegExp(`{${key}}`, "g"), String(value));
   }, template);
+};
+
+const replaceTemplateValue = (value: unknown, variables: Record<string, unknown>): unknown => {
+  if (typeof value === "string") return replaceTemplateVariables(value, variables);
+  if (Array.isArray(value)) return value.map((item) => replaceTemplateValue(item, variables));
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, item]) => [key, replaceTemplateValue(item, variables)])
+    );
+  }
+  return value;
 };
 
 const extractTemplateKeys = (...templates: string[]): string[] => {
@@ -2222,6 +2653,25 @@ const getAttributeFieldsFromTileRecord = (
     || normalizeAttributeFields(pickRecord(tileRecord.metadata).fields)
     || findAttributeFieldsInPayload(tilePayload)
     || findAttributeFieldsInPayload(tileRecord);
+};
+
+const getVectorTileDatasetId = (
+  tileRecord: Record<string, unknown>,
+  tilePayload?: unknown
+): string | undefined => {
+  const candidates = [
+    pickRecord(pickRecord(tileRecord.tileConfig).data_filter).dataset_id,
+    pickRecord(pickRecord(tileRecord.tileConfig).dataFilter).dataset_id,
+    pickRecord(pickRecord(tileRecord.tile_config).data_filter).dataset_id,
+    pickRecord(tileRecord.data_filter).dataset_id,
+    pickRecord(tileRecord.dataFilter).dataset_id,
+    tileRecord.dataset_id,
+    tileRecord.datasetId,
+    pickRecord(pickRecord(pickRecord(tilePayload).tileConfig).data_filter).dataset_id,
+    pickRecord(pickRecord(pickRecord(tilePayload).tile_config).data_filter).dataset_id
+  ];
+
+  return candidates.map(toStringValue).find(Boolean);
 };
 
 const getDirectGeometryType = (value: unknown): string | undefined => {
@@ -3509,11 +3959,14 @@ const buildVectorTileLayerPayload = async (
     || await inferVectorTileGeometryType(layerId, secureTiles, center, bounds, minzoom, maxzoom);
   const sourceLayer = findSourceLayer(tileRecord, layerId);
   const attributeFields = getAttributeFieldsFromTileRecord(tileRecord, tilePayload);
+  const datasetId = getVectorTileDatasetId(tileRecord, tilePayload);
 
   return {
     success: true,
     payload: {
       event: "layer_catalog",
+      intentName: config.intentName,
+      provider: config.provider,
       layer: {
         type: layerType,
         layerId,
@@ -3526,7 +3979,12 @@ const buildVectorTileLayerPayload = async (
         ...(bounds ? { bounds } : {}),
         ...(geometryType ? { geometryType } : {}),
         ...(sourceLayer ? { sourceLayer } : {}),
-        ...(attributeFields ? { attributes: { fields: attributeFields } } : {})
+        ...(attributeFields || datasetId ? {
+          attributes: {
+            ...(attributeFields ? { fields: attributeFields } : {}),
+            ...(datasetId ? { datasetId } : {})
+          }
+        } : {})
       }
     }
   };
@@ -3573,6 +4031,8 @@ const buildVallarisLayerPayload = async (
     success: true,
     payload: {
       event: "layer_catalog",
+      intentName: config.intentName,
+      provider: config.provider,
       layer: {
         styleId,
         ...(styleTitle ? { title: styleTitle, styleTitle } : {}),
@@ -3581,6 +4041,320 @@ const buildVallarisLayerPayload = async (
       }
     }
   };
+};
+
+const getAttributeValuesConfig = (
+  layerConfigTemplate: unknown
+): Record<string, unknown> => {
+  const template = pickRecord(layerConfigTemplate);
+  return pickRecord(template.attributeValues)
+    || pickRecord(template.attributeValueQuery)
+    || pickRecord(template.valueQuery)
+    || {};
+};
+
+const extractAttributeValueItems = (payload: unknown): Record<string, unknown>[] => {
+  if (Array.isArray(payload)) return payload.filter(isRecord);
+
+  const record = pickRecord(payload);
+  const candidate = record.items || record.data || record.results || record.features;
+  if (!Array.isArray(candidate)) return [];
+
+  return candidate
+    .map((item) => {
+      const itemRecord = pickRecord(item);
+      return isRecord(itemRecord.properties) ? pickRecord(itemRecord.properties) : itemRecord;
+    })
+    .filter((item) => Object.keys(item).length > 0);
+};
+
+const getAttributeValueFromItem = (
+  item: Record<string, unknown>,
+  attributeKey: string,
+  valueKey?: string
+): unknown => {
+  if (valueKey && item[valueKey] !== undefined) return item[valueKey];
+  if (item.value !== undefined) return item.value;
+  return item[attributeKey];
+};
+
+const getAttributeCountFromItem = (
+  item: Record<string, unknown>,
+  attributeKey: string,
+  countKey?: string
+): number | undefined => {
+  const rawValue = countKey && item[countKey] !== undefined
+    ? item[countKey]
+    : item.count ?? item[attributeKey];
+  return toNumberValue(rawValue);
+};
+
+const summarizeAttributeValues = (
+  items: Record<string, unknown>[],
+  attributeKey: string,
+  attributeType?: string,
+  valueKey?: string,
+  countKey?: string,
+  limit = 24
+): {
+  values: Array<Record<string, unknown>>;
+  stats?: { min: number; max: number };
+} => {
+  const normalizedType = attributeType?.toLowerCase();
+  const valuesByKey = new Map<string, { value: unknown; count?: number }>();
+
+  for (const item of items) {
+    const value = getAttributeValueFromItem(item, attributeKey, valueKey);
+    if (value === undefined || value === null || value === "") continue;
+
+    const key = String(value);
+    const count = getAttributeCountFromItem(item, attributeKey, countKey);
+    const existing = valuesByKey.get(key);
+    valuesByKey.set(key, {
+      value,
+      count: (existing?.count || 0) + (count || 0)
+    });
+  }
+
+  const values = Array.from(valuesByKey.values());
+  if (normalizedType !== "number") {
+    return {
+      values: values
+        .sort((left, right) => (right.count || 0) - (left.count || 0) || String(left.value).localeCompare(String(right.value)))
+        .slice(0, limit)
+        .map((item) => ({
+          label: String(item.value),
+          value: item.value,
+          ...(item.count ? { count: item.count } : {})
+        }))
+    };
+  }
+
+  const numericValues = values
+    .map((item) => ({ ...item, numericValue: toNumberValue(item.value) }))
+    .filter((item): item is { value: unknown; count?: number; numericValue: number } => item.numericValue !== undefined)
+    .sort((left, right) => left.numericValue - right.numericValue);
+
+  const selectedValues = numericValues.length <= limit
+    ? numericValues
+    : Array.from({ length: limit }, (_, index) => {
+      const ratio = limit === 1 ? 0 : index / (limit - 1);
+      return numericValues[Math.round(ratio * (numericValues.length - 1))];
+    }).filter((item, index, allItems) => {
+      return item && allItems.findIndex((candidate) => candidate?.numericValue === item.numericValue) === index;
+    });
+
+  return {
+    values: selectedValues.map((item) => ({
+      label: String(item.numericValue),
+      value: item.numericValue,
+      ...(item.count ? { count: item.count } : {})
+    })),
+    ...(numericValues.length > 0
+      ? {
+        stats: {
+          min: numericValues[0].numericValue,
+          max: numericValues[numericValues.length - 1].numericValue
+        }
+      }
+      : {})
+  };
+};
+
+const getConnectionIdFromPayload = (payload: unknown): string | undefined => {
+  const record = pickRecord(payload);
+  const connections = Array.isArray(record.connections)
+    ? record.connections
+    : Array.isArray(record.items)
+      ? record.items
+      : Array.isArray(record.data)
+        ? record.data
+        : [];
+  return connections.map((item) => toStringValue(pickRecord(item).id)).find(Boolean);
+};
+
+const buildAttributeExploreBody = (
+  valueConfig: Record<string, unknown>,
+  variables: Record<string, unknown>,
+  connectionId: string,
+  attributeKey: string
+): Record<string, unknown> => {
+  const configuredBody = pickRecord(replaceTemplateValue(valueConfig.body || valueConfig.requestBody, variables));
+  if (Object.keys(configuredBody).length > 0) {
+    return {
+      ...configuredBody,
+      connectionId: toStringValue(configuredBody.connectionId) || connectionId
+    };
+  }
+
+  const datasourceTemplate = toStringValue(valueConfig.datasourceTemplate);
+  if (!datasourceTemplate) return {};
+  const aggregate = toStringValue(valueConfig.aggregate);
+  const offset = toNumberValue(valueConfig.offset);
+  const limit = toNumberValue(valueConfig.limit);
+
+  return {
+    connectionId,
+    datasource: {
+      id: replaceTemplateVariables(datasourceTemplate, variables)
+    },
+    columns: [
+      {
+        name: attributeKey,
+        alias: "value"
+      }
+    ],
+    aggregate: [
+      ...(aggregate ? [{
+        column: attributeKey,
+        aggregate,
+        alias: attributeKey
+      }] : [])
+    ],
+    ...(offset !== undefined ? { offset } : {}),
+    ...(limit !== undefined ? { limit } : {})
+  };
+};
+
+export const handleMapAttributeValuesTool = async (
+  userId: string,
+  aiArgs: MapToolArgs,
+  headerApiKey?: string
+) => {
+  try {
+    const intentName = toStringValue(aiArgs.intentName);
+    const provider = normalizeProvider(toStringValue(aiArgs.provider));
+    const attributeKey = toStringValue(aiArgs.attributeKey);
+    const attributeType = toStringValue(aiArgs.attributeType);
+    const layerId = toStringValue(aiArgs.layerId) || toStringValue(aiArgs.id);
+    const datasetId = toStringValue(aiArgs.datasetId);
+
+    if (!intentName || !provider || !attributeKey || !datasetId) {
+      return {
+        success: false,
+        event: "map_attribute_values",
+        message: "intentName, provider, datasetId, and attributeKey are required to fetch attribute values."
+      };
+    }
+
+    const configMatches = await prisma.mapconfig.findMany({
+      where: {
+        intentName,
+        isActive: true
+      }
+    });
+    const config = findConfigByIntentProvider(configMatches, intentName, provider);
+    if (!config) {
+      return {
+        success: false,
+        event: "map_attribute_values",
+        message: `No active mapconfig was found for ${provider}:${intentName}.`
+      };
+    }
+
+    const valueConfig = getAttributeValuesConfig(config.layerConfigTemplate);
+    const connectionUrlTemplate = toStringValue(valueConfig.connectionUrlTemplate);
+    const exploreUrlTemplate = toStringValue(valueConfig.exploreUrlTemplate || valueConfig.urlTemplate);
+    if (!connectionUrlTemplate || !exploreUrlTemplate) {
+      return {
+        success: false,
+        event: "map_attribute_values",
+        message: "Attribute value endpoints are not configured."
+      };
+    }
+
+    const userApiKey = selectApiKeyForProvider(
+      await resolveUserMapApiKeys(userId, headerApiKey),
+      config.provider
+    );
+    if (!userApiKey) {
+      return {
+        success: false,
+        event: "map_attribute_values",
+        message: `The user has no usable API key for provider ${config.provider}.`
+      };
+    }
+
+    const apiKey = decryptUserApiKey(userApiKey);
+    const runtimeConfig = withApiKeyHostBaseUrl(config, userApiKey);
+    const variables = buildTemplateVariables(
+      {
+        ...aiArgs,
+        layerId,
+        id: layerId,
+        datasetId,
+        dataset_id: datasetId,
+        attributeKey,
+        column: attributeKey
+      },
+      config.layerConfigTemplate,
+      intentName,
+      config.provider,
+      apiKey
+    );
+    const connectionQuery = pickRecord(replaceTemplateValue(valueConfig.connectionQuery, variables));
+    const connectionUrl = buildMapOptionUrl(runtimeConfig.baseUrl, connectionUrlTemplate, apiKey, connectionQuery);
+    const connectionPayload = await fetchVectorTileJson(connectionUrl);
+    const connectionId = toStringValue(valueConfig.connectionId) || getConnectionIdFromPayload(connectionPayload);
+    if (!connectionId) {
+      return {
+        success: false,
+        event: "map_attribute_values",
+        message: "No analytics connectionId was found."
+      };
+    }
+
+    const exploreBody = buildAttributeExploreBody(valueConfig, variables, connectionId, attributeKey);
+    if (Object.keys(exploreBody).length === 0) {
+      return {
+        success: false,
+        event: "map_attribute_values",
+        message: "layerConfigTemplate.attributeValues.body or datasourceTemplate is not configured."
+      };
+    }
+    const exploreUrl = buildMapOptionUrl(runtimeConfig.baseUrl, exploreUrlTemplate, apiKey);
+    const exploreResponse = await fetch(exploreUrl, {
+      method: (toStringValue(valueConfig.method) || "POST").toUpperCase(),
+      headers: {
+        Accept: "application/json",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(exploreBody)
+    });
+    if (!exploreResponse.ok) {
+      return {
+        success: false,
+        event: "map_attribute_values",
+        message: `${config.provider} attribute values request failed: ${exploreResponse.status} ${exploreResponse.statusText}`
+      };
+    }
+
+    const explorePayload = await exploreResponse.json();
+    const items = extractAttributeValueItems(explorePayload);
+    const valueKey = toStringValue(replaceTemplateValue(valueConfig.valueKey, variables));
+    const countKey = toStringValue(replaceTemplateValue(valueConfig.countKey, variables)) || attributeKey;
+    const suggestionLimit = toNumberValue(valueConfig.suggestionLimit) || toNumberValue(valueConfig.valueLimit) || 24;
+    const summary = summarizeAttributeValues(items, attributeKey, attributeType, valueKey, countKey, suggestionLimit);
+
+    return {
+      success: true,
+      event: "map_attribute_values",
+      attributeKey,
+      ...(attributeType ? { attributeType } : {}),
+      valueSource: "data",
+      values: summary.values,
+      ...(summary.stats ? { stats: summary.stats } : {}),
+      numberReturned: summary.values.length,
+      numberMatched: toNumberValue(pickRecord(explorePayload).numberMatched) || items.length
+    };
+  } catch (error) {
+    console.error("Map Attribute Values Tool Error:", error);
+    return {
+      success: false,
+      event: "map_attribute_values",
+      message: "An error occurred while fetching attribute values."
+    };
+  }
 };
 
 const createStringEnumProperty = (values: string[], description: string) => {
@@ -3829,13 +4603,30 @@ export const editMapStyleToolSchema = {
           type: "string",
           description: "Attribute field used by an existing paint expression when editing one attribute stop, such as bright_ti5."
         },
+        attributeType: {
+          type: "string",
+          description: "Attribute type from layer metadata, such as Number or String."
+        },
         attributeValue: {
           oneOf: [{ type: "string" }, { type: "number" }],
           description: "The exact stop/category value in an existing attribute paint expression to edit, such as 315."
         },
+        attributeValues: {
+          type: "array",
+          items: {},
+          description: "Known attribute values from the backend value lookup. Usually omitted by the model because the backend can fill it."
+        },
+        attributeStats: {
+          type: "object",
+          description: "Known numeric stats such as { min, max }. Usually omitted by the model because the backend can fill it."
+        },
         paintKey: {
           type: "string",
-          description: "Optional MapLibre paint key to edit for an attribute stop, such as circle-color."
+          description: "Optional existing MapLibre paint key to edit, such as circle-stroke-width or circle-stroke-color. The backend only edits keys present in the current style paint unless paint is provided explicitly."
+        },
+        value: {
+          oneOf: [{ type: "string" }, { type: "number" }, { type: "boolean" }],
+          description: "Generic value for paintKey edits, such as 4 for circle-stroke-width or a catalog color key/hex for color paint keys."
         },
         radius: {
           type: "number",
@@ -3848,6 +4639,10 @@ export const editMapStyleToolSchema = {
         width: {
           type: "number",
           description: "line width"
+        },
+        strokeWidth: {
+          type: "number",
+          description: "Stroke width for an existing stroke-width paint key such as circle-stroke-width."
         },
         opacity: {
           type: "number",

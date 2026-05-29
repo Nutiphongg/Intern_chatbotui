@@ -21,7 +21,8 @@ import {
     handleMapOptionsTool,
     buildDynamicMapOptionToolSchema,
     resolveUserMapToolConfigs,
-    buildMapOptionChoiceContext
+    buildMapOptionChoiceContext,
+    handleMapAttributeValuesTool
 } from '../map/tools';
 import { Prisma } from '@prisma/client';
 import {
@@ -2376,18 +2377,65 @@ const collectMapStyleAttributeValues = (
     return valuesByAttribute;
 };
 
+const collectMapStylePaintKeys = (
+    value: unknown,
+    keys = new Set<string>()
+): Set<string> => {
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            collectMapStylePaintKeys(item, keys);
+        }
+        return keys;
+    }
+
+    const record = asRecord(value);
+    for (const [key, nestedValue] of Object.entries(record)) {
+        if (key === 'paint') {
+            for (const paintKey of Object.keys(asRecord(nestedValue))) {
+                keys.add(paintKey);
+            }
+            continue;
+        }
+        collectMapStylePaintKeys(nestedValue, keys);
+    }
+
+    return keys;
+};
+
+const isPaintStyleEditInstruction = (
+    instruction: string,
+    mapStyle: unknown
+): boolean => {
+    const normalizedInstruction = normalizeStyleSwitchText(instruction);
+    if (!normalizedInstruction) return false;
+
+    return Array.from(collectMapStylePaintKeys(mapStyle)).some((paintKey) => {
+        const normalizedPaintKey = normalizeStyleSwitchText(paintKey);
+        return Boolean(normalizedPaintKey && normalizedInstruction.includes(normalizedPaintKey));
+    });
+};
+
 const getSuggestionAttributeFields = (
     mapPayload: unknown,
-    mapStyle: unknown
+    mapStyle: unknown,
+    instruction?: string
 ): Array<{ name: string; type?: string }> => {
     const layer = getSuggestionLayerRecord(mapPayload);
     const fields = asRecord(asRecord(layer.attributes).fields);
     const usedAttributes = collectMapStyleAttributeKeys(mapStyle);
-    if (usedAttributes.size === 0) return [];
+    const normalizedInstruction = normalizeStyleSwitchText(instruction);
 
     return Object.entries(fields)
         .map(([name, definition]) => {
-            if (!usedAttributes.has(name)) return undefined;
+            const normalizedName = normalizeStyleSwitchText(name);
+            const isStyleAttribute = usedAttributes.has(name);
+            const isRequestedAttribute = Boolean(
+                normalizedInstruction
+                && normalizedName
+                && normalizedInstruction.includes(normalizedName)
+            );
+            if (!isStyleAttribute && !isRequestedAttribute) return undefined;
+
             const fieldType = toSuggestionString(asRecord(definition).type);
             return name.trim()
                 ? {
@@ -2437,7 +2485,7 @@ const buildAttributeValueSuggestionItems = (
     mapStyle: unknown,
     instruction?: string
 ) => {
-    const fields = getSuggestionAttributeFields(mapPayload, mapStyle);
+    const fields = getSuggestionAttributeFields(mapPayload, mapStyle, instruction);
     if (fields.length === 0) return [];
 
     const selectedField = resolveRequestedSuggestionAttribute(fields, instruction);
@@ -2464,8 +2512,8 @@ const isAttributeValueStyleEditInstruction = (instruction?: string): boolean => 
 
 const isAttributeValueSuggestionInstruction = (instruction?: string): boolean => {
     if (typeof instruction !== 'string') return false;
-    return /\bstyle\b.*\bby\b.*\battribute\b/i.test(instruction)
-        || /เลือก.*attribute|attribute.*เลือก|แต่ง.*attribute|attribute.*แต่ง/i.test(instruction);
+    return /\bchoose\b.*\battribute\b|\bselect\b.*\battribute\b/i.test(instruction)
+        || /เลือก.*attribute|attribute.*เลือก/i.test(instruction);
 };
 
 const buildMapSuggestionsPayload = (
@@ -2568,6 +2616,152 @@ const buildMapSuggestionsPayload = (
 
     return {
         items
+    };
+};
+
+const enrichMapSuggestionsWithAttributeValues = async (
+    suggestionsPayload: Record<string, unknown> | undefined,
+    mapPayload: unknown,
+    userId: string,
+    headerApiKey?: string
+): Promise<Record<string, unknown> | undefined> => {
+    const items = Array.isArray(asRecord(suggestionsPayload).items)
+        ? asRecord(suggestionsPayload).items as unknown[]
+        : [];
+    if (items.length === 0) return suggestionsPayload;
+
+    const attributeValueIndex = items.findIndex((item) => asRecord(item).key === 'style_attribute_value');
+    if (attributeValueIndex < 0) return suggestionsPayload;
+
+    const attributeValueItem = asRecord(items[attributeValueIndex]);
+    const attributeKey = toSuggestionString(attributeValueItem.attributeKey);
+    if (!attributeKey) return suggestionsPayload;
+
+    const payloadRecord = asRecord(mapPayload);
+    const layerRecord = asRecord(payloadRecord.layer);
+    const attributes = asRecord(layerRecord.attributes);
+    const intentName = toSuggestionString(payloadRecord.intentName || layerRecord.intentName);
+    const provider = toSuggestionString(payloadRecord.provider || layerRecord.provider);
+    const layerId = toSuggestionString(layerRecord.layerId || payloadRecord.layerId || layerRecord.id);
+    const datasetId = toSuggestionString(attributes.datasetId || attributes.dataset_id || layerRecord.datasetId || payloadRecord.datasetId);
+    if (!intentName || !provider || !datasetId) return suggestionsPayload;
+
+    const valuesResult = await handleMapAttributeValuesTool(
+        userId,
+        {
+            intentName,
+            provider,
+            layerId,
+            datasetId,
+            attributeKey,
+            attributeType: attributeValueItem.attributeType
+        },
+        headerApiKey
+    );
+    const dataValues = Array.isArray(asRecord(valuesResult).values)
+        ? asRecord(valuesResult).values as unknown[]
+        : [];
+    if (!asRecord(valuesResult).success || dataValues.length === 0) return suggestionsPayload;
+
+    const nextItems = [...items];
+    nextItems[attributeValueIndex] = {
+        ...attributeValueItem,
+        values: dataValues,
+        valueSource: 'data',
+        ...(asRecord(valuesResult).stats ? { stats: asRecord(valuesResult).stats } : {}),
+        ...(asRecord(valuesResult).numberMatched !== undefined
+            ? { numberMatched: asRecord(valuesResult).numberMatched }
+            : {})
+    };
+
+    return {
+        ...suggestionsPayload,
+        items: nextItems
+    };
+};
+
+const resolveRequestedMapAttribute = (
+    mapPayload: unknown,
+    instruction?: string,
+    explicitAttributeKey?: unknown
+): { name: string; type?: string } | undefined => {
+    const layer = getSuggestionLayerRecord(mapPayload);
+    const fields = asRecord(asRecord(layer.attributes).fields);
+    const explicitKey = toSuggestionString(explicitAttributeKey);
+    const normalizedInstruction = normalizeStyleSwitchText(instruction);
+
+    const entries = Object.entries(fields)
+        .map(([name, definition]) => ({
+            name,
+            type: toSuggestionString(asRecord(definition).type)
+        }))
+        .filter((field) => Boolean(field.name.trim()));
+
+    if (explicitKey) {
+        const normalizedExplicitKey = normalizeStyleSwitchText(explicitKey);
+        const explicitMatch = entries.find((field) => normalizeStyleSwitchText(field.name) === normalizedExplicitKey);
+        if (explicitMatch) return explicitMatch;
+    }
+
+    if (!normalizedInstruction) return undefined;
+
+    return entries
+        .filter((field) => {
+            const normalizedName = normalizeStyleSwitchText(field.name);
+            return normalizedName && normalizedInstruction.includes(normalizedName);
+        })
+        .sort((left, right) => right.name.length - left.name.length)[0];
+};
+
+const buildAttributeEditArgs = async (
+    baseArgs: Record<string, unknown>,
+    mapPayload: unknown,
+    userId: string,
+    instruction?: string,
+    headerApiKey?: string
+): Promise<Record<string, unknown>> => {
+    const requestedAttribute = resolveRequestedMapAttribute(
+        mapPayload,
+        instruction,
+        baseArgs.attributeKey
+    );
+    if (!requestedAttribute) return baseArgs;
+
+    const payloadRecord = asRecord(mapPayload);
+    const layerRecord = asRecord(payloadRecord.layer);
+    const attributes = asRecord(layerRecord.attributes);
+    const intentName = toSuggestionString(payloadRecord.intentName || layerRecord.intentName);
+    const provider = toSuggestionString(payloadRecord.provider || layerRecord.provider);
+    const layerId = toSuggestionString(layerRecord.layerId || payloadRecord.layerId || layerRecord.id);
+    const datasetId = toSuggestionString(attributes.datasetId || attributes.dataset_id || layerRecord.datasetId || payloadRecord.datasetId);
+
+    if (!intentName || !provider || !datasetId) {
+        return {
+            ...baseArgs,
+            attributeKey: requestedAttribute.name,
+            ...(requestedAttribute.type ? { attributeType: requestedAttribute.type } : {})
+        };
+    }
+
+    const valuesResult = await handleMapAttributeValuesTool(
+        userId,
+        {
+            intentName,
+            provider,
+            layerId,
+            datasetId,
+            attributeKey: requestedAttribute.name,
+            attributeType: requestedAttribute.type
+        },
+        headerApiKey
+    );
+
+    return {
+        ...baseArgs,
+        attributeKey: requestedAttribute.name,
+        ...(requestedAttribute.type ? { attributeType: requestedAttribute.type } : {}),
+        ...(Array.isArray(asRecord(valuesResult).values) ? { attributeValues: asRecord(valuesResult).values } : {}),
+        ...(asRecord(valuesResult).stats ? { attributeStats: asRecord(valuesResult).stats } : {})
     };
 };
 
@@ -3420,7 +3614,13 @@ export const processChatMessageStream = (
                             && isAttributeValueSuggestionInstruction(message)
                             && !isAttributeValueStyleEditInstruction(message)
                         ) {
-                            writeSse(controller, 'suggestions', attributeSuggestionPayload);
+                            const enrichedAttributeSuggestionPayload = await enrichMapSuggestionsWithAttributeValues(
+                                attributeSuggestionPayload,
+                                latestMapPayload,
+                                userId,
+                                mapHeaderApiKey
+                            );
+                            writeSse(controller, 'suggestions', enrichedAttributeSuggestionPayload);
                             writeSse(controller, 'done', {
                                 done: true,
                                 tokenUsage: 0,
@@ -3508,9 +3708,15 @@ export const processChatMessageStream = (
                         }
 
                         const styleCatalog = mapStylePayload ? await handleStyleCatalogTool() : undefined;
-                        const suggestionsPayload = mapStylePayload && styleCatalog
+                        let suggestionsPayload = mapStylePayload && styleCatalog
                             ? buildMapSuggestionsPayload(payload, mapStylePayload, styleCatalog, conversationMapState, hasUserMessage ? message : undefined)
                             : buildMapControlSuggestionsPayload();
+                        suggestionsPayload = await enrichMapSuggestionsWithAttributeValues(
+                            suggestionsPayload,
+                            payload,
+                            userId,
+                            mapHeaderApiKey
+                        );
                         if (suggestionsPayload) {
                             writeSse(controller, 'suggestions', suggestionsPayload);
                         }
@@ -3810,7 +4016,8 @@ export const processChatMessageStream = (
 
                     if (latestMapPayload && latestMapStyle && hasUserMessage && !hasMapSelection) {
                         const styleCatalog = await handleStyleCatalogTool();
-                        const requestedStyleKey = styleCatalog.success && Array.isArray(styleCatalog.styles)
+                        const isPaintEditRequest = isPaintStyleEditInstruction(message, latestMapStyle);
+                        const requestedStyleKey = !isPaintEditRequest && styleCatalog.success && Array.isArray(styleCatalog.styles)
                             ? resolveRequestedMapStyleKey(message, styleCatalog.styles, latestMapStyle)
                             : undefined;
 
@@ -3825,7 +4032,12 @@ export const processChatMessageStream = (
                                 if (!isGuest) {
                                     await safeSyncConversationMapStyle(convId, styleResult);
                                 }
-                                const suggestionsPayload = buildMapSuggestionsPayload(latestMapPayload, styleResult, styleCatalog, conversationMapState, hasUserMessage ? message : undefined);
+                                const suggestionsPayload = await enrichMapSuggestionsWithAttributeValues(
+                                    buildMapSuggestionsPayload(latestMapPayload, styleResult, styleCatalog, conversationMapState, hasUserMessage ? message : undefined),
+                                    latestMapPayload,
+                                    userId,
+                                    mapHeaderApiKey
+                                );
                                 if (suggestionsPayload) {
                                     writeSse(controller, 'suggestions', suggestionsPayload);
                                 }
@@ -3887,6 +4099,9 @@ export const processChatMessageStream = (
                                 'Do not call get_map_layer for map layer clear commands.',
                                 ...(shouldOfferMapStyleEdit
                                     ? [
+                                        'If the user asks to style by an attribute/field or names a map attribute, call edit_map_style and include attributeKey when you can. The backend can fetch attribute values/stats and build paint expressions.',
+                                        'If the user names an attribute value/category and a color, call edit_map_style with attributeKey, attributeValue, and colorKey/colorValue when possible.',
+                                        'For direct paint edits such as set circle-stroke-width to 4 or circle-stroke-color to red, call edit_map_style with paintKey and value when possible. The backend validates the paint key against the current style.',
                                         'Normalize user color language into colorKeys from the style color catalog when possible. If the user asks for a mixed color, send colorKeys plus mix weights, or a valid colorValue hex.',
                                         'If the user asks to use colors from a previous image/photo, read latestVision.dominantColors from conversation memory and call edit_map_style with colorValue from the best matching dominant color hex.',
                                         'If the user names a non-active style such as circle, heatmap, fill, line, or 3d_extrusion, call edit_map_style with target/style wording so the backend can edit that saved style instead of only the latest active style.',
@@ -4293,10 +4508,17 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                 const aiArguments = parseToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments);
                                 const selectedMapStyle = selectMapStyleForEdit(conversationMapState, aiArguments, message, latestMapStyle);
                                 const selectedMapPayload = selectMapPayloadForEdit(conversationMapState, aiArguments, latestMapPayload, message);
+                                const enrichedEditArguments = await buildAttributeEditArgs(
+                                    aiArguments,
+                                    selectedMapPayload,
+                                    userId,
+                                    typeof aiArguments.instruction === 'string' ? aiArguments.instruction : message,
+                                    mapHeaderApiKey
+                                );
                                 const editResult = await handleEditMapStyleTool(
                                     {
-                                        ...aiArguments,
-                                        instruction: typeof aiArguments.instruction === 'string' ? aiArguments.instruction : message
+                                        ...enrichedEditArguments,
+                                        instruction: typeof enrichedEditArguments.instruction === 'string' ? enrichedEditArguments.instruction : message
                                     },
                                     selectedMapStyle
                                 );
@@ -4307,7 +4529,12 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                         await safeSyncConversationMapStyle(convId, editResult);
                                     }
                                     const styleCatalog = await handleStyleCatalogTool();
-                                    const suggestionsPayload = buildMapSuggestionsPayload(selectedMapPayload, editResult, styleCatalog, conversationMapState, hasUserMessage ? message : undefined);
+                                    const suggestionsPayload = await enrichMapSuggestionsWithAttributeValues(
+                                        buildMapSuggestionsPayload(selectedMapPayload, editResult, styleCatalog, conversationMapState, hasUserMessage ? message : undefined),
+                                        selectedMapPayload,
+                                        userId,
+                                        mapHeaderApiKey
+                                    );
                                     if (suggestionsPayload) {
                                         writeSse(controller, 'suggestions', suggestionsPayload);
                                     }
