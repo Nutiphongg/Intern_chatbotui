@@ -1,7 +1,18 @@
 // src/routes/mapConfig.route.ts
 import { Elysia } from 'elysia';
-import { CreateApiKeyBody, apiKeyParamsSchema, updateApiKeyBodySchema } from './type';
-import { createApiKey, deleteApiKey, getApiKeyById, getApiKeys, updateApiKey,getActivehosts } from './service';
+import {
+  CreateApiKeyBody,
+  apiKeyParamsSchema,
+  updateApiKeyBodySchema
+} from './type';
+import {
+  createApiKey,
+  deleteApiKey,
+  getApiKeyById,
+  getApiKeys,
+  updateApiKey,
+  getActivehosts
+} from './service';
 import { authPlugin } from '../../plugins/plugin';
 
 export const mapConfigRoutes = new Elysia({ prefix: '/management' })

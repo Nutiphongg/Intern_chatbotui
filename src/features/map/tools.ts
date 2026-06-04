@@ -21,6 +21,7 @@ type ResolvedUserApiKey = {
     provider: string;
     hostname: string;
     baseUrl: string;
+    serviceConfig?: unknown;
   } | null;
 };
 
@@ -48,7 +49,12 @@ type StyleColorEntry = {
 type EditMapStyleArgs = MapToolArgs & {
   layerId?: string;
   instruction?: string;
+  operation?: string;
+  action?: string;
   target?: string;
+  layer?: unknown;
+  layerType?: string;
+  styleLayerId?: string;
   colorKey?: string;
   colorKeys?: unknown;
   colorValue?: string;
@@ -57,17 +63,21 @@ type EditMapStyleArgs = MapToolArgs & {
   attributeValue?: string | number;
   attributeValues?: unknown;
   attributeStats?: unknown;
+  outputs?: unknown;
+  fallbackOutput?: unknown;
   paintKey?: string;
+  layoutKey?: string;
+  removePaintKeys?: unknown;
+  removeLayoutKeys?: unknown;
   value?: unknown;
   mix?: unknown;
-  opacity?: number | string;
-  radius?: number | string;
-  size?: number | string;
-  width?: number | string;
-  strokeWidth?: number | string;
   paint?: unknown;
   layout?: unknown;
 };
+
+type StylePropertyKind = "paint" | "layout";
+
+let mapLibreStyleSpecCache: Record<string, unknown> | null | undefined;
 
 type ClearMapLayersArgs = {
   mode?: string;
@@ -181,6 +191,46 @@ const selectApiKeyForProvider = (
   const providerKeys = apiKeys.filter((apiKey) => sameProvider(apiKey.provider, provider));
   return providerKeys.find((apiKey) => Boolean(apiKey.host?.baseUrl?.trim()))
     || providerKeys[0];
+};
+
+const matchesConfigString = (actual: unknown, expected: unknown): boolean => {
+  const cleanExpected = toStringValue(expected);
+  if (!cleanExpected) return true;
+  const cleanActual = toStringValue(actual);
+  return Boolean(cleanActual && cleanActual.toLowerCase() === cleanExpected.toLowerCase());
+};
+
+const selectApiKeyForConfig = (
+  apiKeys: ResolvedUserApiKey[],
+  fallbackProvider: string,
+  config: Record<string, unknown>
+): ResolvedUserApiKey | undefined => {
+  const provider = toStringValue(config.apiKeyProvider || config.provider) || fallbackProvider;
+  const keyName = config.apiKeyName || config.keyName;
+  const hostKey = config.hostKey || config.hostname || config.hostName;
+  const hostId = config.hostId;
+
+  const candidates = apiKeys.filter((apiKey) => sameProvider(apiKey.provider, provider));
+  const matched = candidates.find((apiKey) => {
+    return matchesConfigString(apiKey.keyName, keyName)
+      && matchesConfigString(apiKey.host?.hostname, hostKey)
+      && matchesConfigString(apiKey.hostId || apiKey.host?.id, hostId);
+  });
+
+  return matched || selectApiKeyForProvider(apiKeys, provider);
+};
+
+const getHostServiceApiKey = (
+  host: ResolvedUserApiKey["host"],
+  keyName: string
+): string | undefined => {
+  const apiKeys = pickRecord(pickRecord(host?.serviceConfig).apiKeys);
+  const keyRecord = pickRecord(apiKeys[keyName]);
+  const encryptedKey = toStringValue(keyRecord.encryptedKey);
+  const iv = toStringValue(keyRecord.iv);
+  if (!encryptedKey || !iv) return undefined;
+
+  return decrypt(encryptedKey, iv);
 };
 
 const pickRecord = (value: unknown): Record<string, unknown> => {
@@ -726,31 +776,6 @@ const getEditInstruction = (args: EditMapStyleArgs): string => {
   ].map(toStringValue).filter(Boolean).join(" ");
 };
 
-const getEditNumber = (
-  args: EditMapStyleArgs,
-  keys: Array<keyof EditMapStyleArgs>
-): number | undefined => {
-  for (const key of keys) {
-    const value = toNumberValue(args[key]);
-    if (value !== undefined) return value;
-  }
-
-  return undefined;
-};
-
-const getInstructionNumberAfter = (
-  instruction: string,
-  pattern: RegExp
-): number | undefined => {
-  const match = instruction.match(pattern);
-  if (!match?.[1]) return undefined;
-  return toNumberValue(match[1]);
-};
-
-const getStrokeWidthFromInstruction = (instruction: string): number | undefined => {
-  return getInstructionNumberAfter(instruction, /(?:stroke[\s_-]*width|stroke width|stroke-width)\D+(-?\d+(?:\.\d+)?)/i);
-};
-
 const buildHeatmapColorRamp = (color: string): unknown[] => {
   return [
     "interpolate",
@@ -972,7 +997,6 @@ const buildAttributeStopPaintPatch = (
 
 const buildColorPatchFromPaint = (
   paint: Record<string, unknown>,
-  layerType: string,
   color?: string
 ): Record<string, unknown> => {
   if (!color) return {};
@@ -987,14 +1011,6 @@ const buildColorPatchFromPaint = (
   );
 
   if (Object.keys(patch).length > 0) return patch;
-
-  if (layerType === "circle") return { "circle-color": color };
-  if (layerType === "line") return { "line-color": color };
-  if (layerType === "fill") return { "fill-color": color };
-  if (layerType === "fill-extrusion") return { "fill-extrusion-color": color };
-  if (layerType === "symbol") return { "icon-color": color, "text-color": color };
-  if (layerType === "background") return { "background-color": color };
-  if (layerType === "heatmap") return { "heatmap-color": buildHeatmapColorRamp(color) };
 
   return {};
 };
@@ -1069,7 +1085,6 @@ const resolveFuzzyPaintKeyFromInstruction = (
 
 const resolvePaintKeyFromInstruction = (
   paint: Record<string, unknown>,
-  layerType: string,
   args: EditMapStyleArgs
 ): string | undefined => {
   const explicitPaintKey = toStringValue(args.paintKey);
@@ -1089,13 +1104,12 @@ const resolvePaintKeyFromInstruction = (
 
 const buildExplicitPaintColorPatch = (
   paint: Record<string, unknown>,
-  layerType: string,
   args: EditMapStyleArgs,
   color?: string
 ): Record<string, unknown> => {
   if (!color) return {};
 
-  const paintKey = resolvePaintKeyFromInstruction(paint, layerType, args);
+  const paintKey = resolvePaintKeyFromInstruction(paint, args);
   if (!paintKey || !paintKey.endsWith("-color")) return {};
 
   return {
@@ -1110,7 +1124,7 @@ const parseGenericPaintValue = (args: EditMapStyleArgs): unknown => {
   const explicitPaintKey = toStringValue(args.paintKey);
   if (explicitPaintKey) {
     const escapedKey = explicitPaintKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const match = instruction.match(new RegExp(`${escapedKey}\\s*(?:is|to|=|เป็น)?\\s*([^\\s,]+)`, "i"));
+    const match = instruction.match(new RegExp(`${escapedKey}\\s*(?:is|to|=|:|เป็น)?\\s*([^\\s,]+)`, "i"));
     if (match?.[1]) return match[1];
   }
 
@@ -1131,12 +1145,18 @@ const buildExplicitGenericPaintPatch = (
 
   const value = parseGenericPaintValue(args);
   const numberValue = toNumberValue(value);
-  if (numberValue !== undefined && typeof paint[paintKey] === "number") {
+  if (
+    numberValue !== undefined
+    && (paint[paintKey] === undefined || typeof paint[paintKey] === "number")
+  ) {
     return { [paintKey]: numberValue };
   }
 
   const stringValue = toStringValue(value);
-  if (stringValue && typeof paint[paintKey] === "string") {
+  if (
+    stringValue
+    && (paint[paintKey] === undefined || typeof paint[paintKey] === "string")
+  ) {
     return { [paintKey]: stringValue };
   }
 
@@ -1164,34 +1184,10 @@ const resolvePaintKeyByInstruction = (
   return resolveFuzzyPaintKeyFromInstruction(Object.keys(paint), instruction, suffix);
 };
 
-const buildExplicitPaintNumberPatch = (
-  paint: Record<string, unknown>,
-  args: EditMapStyleArgs,
-  value: number | undefined,
-  suffix: string
-): Record<string, unknown> => {
-  if (value === undefined) return {};
-
-  const paintKey = resolvePaintKeyByInstruction(paint, args, suffix);
-  if (!paintKey) return {};
-
-  return {
-    [paintKey]: value
-  };
-};
-
 const getEditablePaintColorKey = (
-  paint: Record<string, unknown>,
-  layerType: string
+  paint: Record<string, unknown>
 ): string | undefined => {
-  return Object.keys(paint).find(shouldPatchPaintColorKey)
-    || (layerType === "circle" ? "circle-color" : undefined)
-    || (layerType === "line" ? "line-color" : undefined)
-    || (layerType === "fill" ? "fill-color" : undefined)
-    || (layerType === "fill-extrusion" ? "fill-extrusion-color" : undefined)
-    || (layerType === "symbol" ? "icon-color" : undefined)
-    || (layerType === "background" ? "background-color" : undefined)
-    || (layerType === "heatmap" ? "heatmap-color" : undefined);
+  return Object.keys(paint).find(shouldPatchPaintColorKey);
 };
 
 const collectExpressionOutputs = (
@@ -1245,6 +1241,67 @@ const getAttributeStylePalette = async (
   ]));
 };
 
+const getExplicitAttributeOutputs = (value: unknown): unknown[] => {
+  if (!Array.isArray(value)) return [];
+
+  return value
+    .map((item) => {
+      const record = pickRecord(item);
+      return record.output !== undefined ? record.output : item;
+    })
+    .filter((item) => item !== undefined && item !== null);
+};
+
+const buildNumericAttributeOutputs = (
+  values: number[],
+  count: number
+): number[] => {
+  if (values.length === 0 || count <= 0) return [];
+
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  if (min !== max) {
+    return Array.from({ length: count }, (_, index) => {
+      const ratio = count === 1 ? 1 : index / (count - 1);
+      return Number((min + ((max - min) * ratio)).toFixed(6));
+    });
+  }
+
+  if (max === 0) return Array.from({ length: count }, () => 0);
+  return Array.from({ length: count }, (_, index) => {
+    return Number((max * ((index + 1) / count)).toFixed(6));
+  });
+};
+
+const getAttributeStyleOutputs = async (
+  args: EditMapStyleArgs,
+  paintKey: string,
+  existingPaint: Record<string, unknown>,
+  color: string | undefined,
+  count: number
+): Promise<unknown[]> => {
+  const explicitOutputs = getExplicitAttributeOutputs(args.outputs);
+  if (explicitOutputs.length > 0) return explicitOutputs;
+
+  if (paintKey.endsWith("-color")) {
+    return getAttributeStylePalette(existingPaint, color);
+  }
+
+  const currentValue = existingPaint[paintKey];
+  const expressionOutputs = collectExpressionOutputs(currentValue);
+  const numericOutputs = [
+    ...expressionOutputs,
+    ...(typeof currentValue === "number" ? [currentValue] : [])
+  ]
+    .map(toNumberValue)
+    .filter((value): value is number => value !== undefined);
+  if (numericOutputs.length > 0) {
+    return buildNumericAttributeOutputs(numericOutputs, count);
+  }
+
+  return Array.from(new Set(expressionOutputs));
+};
+
 const getAttributeValuesList = (value: unknown): unknown[] => {
   if (!Array.isArray(value)) return [];
 
@@ -1254,6 +1311,220 @@ const getAttributeValuesList = (value: unknown): unknown[] => {
       return record.value !== undefined ? record.value : item;
     })
     .filter((item) => item !== undefined && item !== null && item !== "");
+};
+
+const getRequestedStylePropertyKeys = (...values: unknown[]): string[] => {
+  return Array.from(new Set(
+    values.flatMap((value) => toStringList(value))
+      .map((value) => value.trim())
+      .filter(Boolean)
+  ));
+};
+
+const normalizeStylePropertyOperation = (value: unknown): "add_property" | "remove_property" | undefined => {
+  const normalized = toStringValue(value)?.trim().toLowerCase().replace(/[\s-]+/g, "_");
+  if (normalized === "add_property") return "add_property";
+  if (normalized === "remove_property") return "remove_property";
+  return undefined;
+};
+
+const inferStylePropertyOperationFromInstruction = (
+  instruction: string
+): "add_property" | "remove_property" | undefined => {
+  if (/\b(remove|delete|drop|clear)\b|ลบ/i.test(instruction)) return "remove_property";
+  if (/\b(add|insert|set|change|update)\b|เพิ่ม|เปลี่ยน|แก้/i.test(instruction)) return "add_property";
+  return undefined;
+};
+
+const getInstructionStylePropertyKey = (instruction: string): string | undefined => {
+  const match = instruction.match(/\b([a-z][a-z0-9]*(?:-[a-z0-9]+)+)\b/i);
+  return match?.[1];
+};
+
+const parseStylePropertyInstruction = (
+  args: EditMapStyleArgs
+): { kind: StylePropertyKind; key: string; value?: unknown } | undefined => {
+  const instruction = getEditInstruction(args);
+  const explicitLayoutKey = toStringValue(args.layoutKey);
+  if (explicitLayoutKey) {
+    return {
+      kind: "layout",
+      key: explicitLayoutKey,
+      ...(args.value !== undefined ? { value: args.value } : {})
+    };
+  }
+
+  const explicitPaintKey = toStringValue(args.paintKey);
+  const key = explicitPaintKey || getInstructionStylePropertyKey(instruction);
+  if (!key) return undefined;
+
+  const value = explicitPaintKey ? parseGenericPaintValue(args) : parseGenericPaintValue({ ...args, paintKey: key });
+  return {
+    kind: "paint",
+    key,
+    ...(value !== undefined ? { value } : {})
+  };
+};
+
+const getStylePropertyPrefix = (key: string): string | undefined => {
+  const index = key.indexOf("-");
+  return index > 0 ? key.slice(0, index) : undefined;
+};
+
+const loadMapLibreStyleSpec = async (): Promise<Record<string, unknown> | undefined> => {
+  if (mapLibreStyleSpecCache !== undefined) return mapLibreStyleSpecCache || undefined;
+
+  try {
+    const packageName = "@maplibre/maplibre-gl-style-spec";
+    const module = await import(packageName);
+    const moduleRecord = pickRecord(module);
+    const defaultRecord = pickRecord(moduleRecord.default);
+    const candidates = [
+      moduleRecord.latest,
+      moduleRecord.v8,
+      defaultRecord.latest,
+      defaultRecord.v8,
+      moduleRecord.default,
+      module
+    ];
+
+    mapLibreStyleSpecCache = candidates
+      .map(pickRecord)
+      .find((candidate) => Object.keys(candidate).length > 0) || null;
+  } catch {
+    mapLibreStyleSpecCache = null;
+  }
+
+  return mapLibreStyleSpecCache || undefined;
+};
+
+const getOfficialStyleSpecBucket = (
+  styleSpec: Record<string, unknown> | undefined,
+  layerType: string | undefined,
+  kind: StylePropertyKind
+): Record<string, unknown> | undefined => {
+  if (!styleSpec || !layerType) return undefined;
+
+  const layerSpecKey = layerType.replace(/-/g, "_");
+  const bucket = pickRecord(styleSpec[`${kind}_${layerSpecKey}`]);
+  return Object.keys(bucket).length > 0 ? bucket : undefined;
+};
+
+const isStylePropertyAllowedByOfficialSpec = (
+  key: string,
+  layer: Record<string, unknown>,
+  kind: StylePropertyKind,
+  officialSpec?: Record<string, unknown>
+): boolean | undefined => {
+  const bucket = getOfficialStyleSpecBucket(officialSpec, toStringValue(layer.type), kind);
+  if (!bucket) return undefined;
+
+  return bucket[key] !== undefined;
+};
+
+const canPatchStyleProperty = (
+  key: string,
+  layer: Record<string, unknown>,
+  kind: StylePropertyKind,
+  officialSpec?: Record<string, unknown>
+): boolean => {
+  const officialResult = isStylePropertyAllowedByOfficialSpec(key, layer, kind, officialSpec);
+  return officialResult === true;
+};
+
+const normalizeStylePropertyValue = (value: unknown): unknown => {
+  const numericValue = toNumberValue(value);
+  if (numericValue !== undefined) return numericValue;
+
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+  }
+
+  return value;
+};
+
+const resolveEditMapStyleOperation = (args: EditMapStyleArgs): "add_property" | "remove_property" | "update_layer" => {
+  const explicit = normalizeStylePropertyOperation(args.operation || args.action);
+  if (explicit) return explicit;
+
+  const instruction = getEditInstruction(args);
+  const inferred = inferStylePropertyOperationFromInstruction(instruction);
+  if (inferred && getInstructionStylePropertyKey(instruction)) return inferred;
+
+  return "update_layer";
+};
+
+const buildPropertyAddPatch = (
+  layer: Record<string, unknown>,
+  args: EditMapStyleArgs,
+  color?: string,
+  officialSpec?: Record<string, unknown>
+): { paint: Record<string, unknown>; layout: Record<string, unknown> } => {
+  const paint = { ...pickRecord(args.paint) };
+  const layout = { ...pickRecord(args.layout) };
+  const parsedProperty = parseStylePropertyInstruction(args);
+  const paintKey = parsedProperty?.kind === "paint" ? parsedProperty.key : toStringValue(args.paintKey);
+  const layoutKey = parsedProperty?.kind === "layout" ? parsedProperty.key : toStringValue(args.layoutKey);
+  const propertyValue = normalizeStylePropertyValue(parsedProperty?.value ?? args.value);
+
+  if (paintKey && paint[paintKey] === undefined && canPatchStyleProperty(paintKey, layer, "paint", officialSpec)) {
+    if (paintKey.endsWith("-color") && color) {
+      paint[paintKey] = color;
+    } else if (propertyValue !== undefined) {
+      paint[paintKey] = propertyValue;
+    }
+  }
+  if (layoutKey && layout[layoutKey] === undefined && propertyValue !== undefined && canPatchStyleProperty(layoutKey, layer, "layout", officialSpec)) {
+    layout[layoutKey] = propertyValue;
+  }
+
+  return { paint, layout };
+};
+
+const applyStylePropertyOperation = (
+  layer: Record<string, unknown>,
+  args: EditMapStyleArgs,
+  operation: "add_property" | "remove_property",
+  color?: string,
+  officialSpec?: Record<string, unknown>
+): Record<string, unknown> => {
+  const existingPaint = pickRecord(layer.paint);
+  const existingLayout = pickRecord(layer.layout);
+
+  if (operation === "remove_property") {
+    const parsedProperty = parseStylePropertyInstruction(args);
+    const parsedPaintKey = parsedProperty?.kind === "paint" ? parsedProperty.key : undefined;
+    const parsedLayoutKey = parsedProperty?.kind === "layout" ? parsedProperty.key : undefined;
+    const paintKeys = getRequestedStylePropertyKeys(args.paintKey, parsedPaintKey, args.removePaintKeys, Object.keys(pickRecord(args.paint)))
+      .filter((key) => canPatchStyleProperty(key, layer, "paint", officialSpec));
+    const layoutKeys = getRequestedStylePropertyKeys(args.layoutKey, parsedLayoutKey, args.removeLayoutKeys, Object.keys(pickRecord(args.layout)))
+      .filter((key) => canPatchStyleProperty(key, layer, "layout", officialSpec));
+    if (paintKeys.length === 0 && layoutKeys.length === 0) return layer;
+
+    const paint = { ...existingPaint };
+    const layout = { ...existingLayout };
+    for (const key of paintKeys) delete paint[key];
+    for (const key of layoutKeys) delete layout[key];
+
+    return {
+      ...layer,
+      paint,
+      ...(Object.keys(layout).length > 0 || Object.keys(existingLayout).length > 0 ? { layout } : {})
+    };
+  }
+
+  const patches = buildPropertyAddPatch(layer, args, color, officialSpec);
+  const paintPatch = patches.paint;
+  const layoutPatch = patches.layout;
+  if (Object.keys(paintPatch).length === 0 && Object.keys(layoutPatch).length === 0) return layer;
+
+  return {
+    ...layer,
+    ...(Object.keys(paintPatch).length > 0 ? { paint: { ...existingPaint, ...paintPatch } } : {}),
+    ...(Object.keys(layoutPatch).length > 0 ? { layout: { ...existingLayout, ...layoutPatch } } : {})
+  };
 };
 
 const getAttributeNumericStats = (
@@ -1276,7 +1547,6 @@ const getAttributeNumericStats = (
 };
 
 const buildAttributePaintPatch = async (
-  layerType: string,
   args: EditMapStyleArgs,
   color: string | undefined,
   existingPaint: Record<string, unknown>
@@ -1284,11 +1554,19 @@ const buildAttributePaintPatch = async (
   const attributeKey = toStringValue(args.attributeKey);
   if (!attributeKey || args.attributeValue !== undefined) return {};
 
-  const paintKey = toStringValue(args.paintKey) || getEditablePaintColorKey(existingPaint, layerType);
+  const paintKey = resolvePaintKeyByInstruction(existingPaint, args)
+    || toStringValue(args.paintKey)
+    || getEditablePaintColorKey(existingPaint);
   if (!paintKey || (typeof color === "string" && normalizeColorHex(color) && !paintKey.endsWith("-color"))) return {};
 
-  const palette = await getAttributeStylePalette(existingPaint, color);
-  if (palette.length === 0) return {};
+  const values = getAttributeValuesList(args.attributeValues).slice(0, 5);
+  const outputs = await getAttributeStyleOutputs(args, paintKey, existingPaint, color, Math.max(values.length, 3));
+  if (outputs.length === 0) return {};
+  const fallbackOutput = args.fallbackOutput !== undefined
+    ? args.fallbackOutput
+    : existingPaint[paintKey] !== undefined && !Array.isArray(existingPaint[paintKey])
+      ? existingPaint[paintKey]
+      : outputs[outputs.length - 1];
 
   const attributeType = toStringValue(args.attributeType)?.toLowerCase();
   const numericStats = getAttributeNumericStats(args);
@@ -1300,23 +1578,22 @@ const buildAttributePaintPatch = async (
         ["linear"],
         ["get", attributeKey],
         numericStats.min,
-        palette[0],
+        outputs[0],
         mid,
-        palette[Math.min(1, palette.length - 1)],
+        outputs[Math.min(1, outputs.length - 1)],
         numericStats.max,
-        palette[Math.min(2, palette.length - 1)]
+        outputs[Math.min(2, outputs.length - 1)]
       ]
     };
   }
 
-  const values = getAttributeValuesList(args.attributeValues).slice(0, 24);
   if (values.length === 0) return {};
 
   const matchExpression: unknown[] = ["match", ["get", attributeKey]];
   values.forEach((value, index) => {
-    matchExpression.push(value, palette[index % palette.length]);
+    matchExpression.push(value, outputs[index % outputs.length]);
   });
-  matchExpression.push(palette[palette.length - 1]);
+  matchExpression.push(fallbackOutput);
 
   return {
     [paintKey]: matchExpression
@@ -1324,131 +1601,37 @@ const buildAttributePaintPatch = async (
 };
 
 const getPaintPatchForLayerType = async (
-  layerType: string,
   args: EditMapStyleArgs,
   color?: string,
   existingPaint: Record<string, unknown> = {}
 ): Promise<Record<string, unknown>> => {
-  const explicitPaint = pickRecord(args.paint);
-  const instruction = getEditInstruction(args);
-  const opacity = getEditNumber(args, ["opacity"]);
-  const normalizedOpacity = opacity !== undefined && opacity > 1 ? opacity / 100 : opacity;
-  const strokeWidth = getEditNumber(args, ["strokeWidth"]) ?? getStrokeWidthFromInstruction(instruction);
-  const attributeStopPatch = buildAttributeStopPaintPatch(existingPaint, args, color);
-  const attributePaintPatch = await buildAttributePaintPatch(layerType, args, color, existingPaint);
-  const explicitPaintColorPatch = buildExplicitPaintColorPatch(existingPaint, layerType, args, color);
-  const explicitPaintWidthPatch = buildExplicitPaintNumberPatch(existingPaint, args, strokeWidth, "-stroke-width");
+  const rawExplicitPaint = pickRecord(args.paint);
+  const explicitPaint = Object.fromEntries(
+    Object.entries(rawExplicitPaint).filter(([key]) => existingPaint[key] !== undefined)
+  );
+  const attributeStopOutput = color ?? normalizeStylePropertyValue(args.value);
+  const attributeStopPatch = buildAttributeStopPaintPatch(existingPaint, args, attributeStopOutput);
+  const attributePaintPatch = await buildAttributePaintPatch(args, color, existingPaint);
+  const isAttributeStyleRequest = Boolean(toStringValue(args.attributeKey) && args.attributeValue === undefined);
+  if (isAttributeStyleRequest && Object.keys(attributePaintPatch).length === 0) {
+    return {};
+  }
+  const explicitPaintColorPatch = buildExplicitPaintColorPatch(existingPaint, args, color);
   const explicitGenericPaintPatch = buildExplicitGenericPaintPatch(existingPaint, args, color);
   const colorPatch = Object.keys(attributeStopPatch).length > 0
     || Object.keys(attributePaintPatch).length > 0
     || Object.keys(explicitPaintColorPatch).length > 0
     || Object.keys(explicitGenericPaintPatch).length > 0
     ? {}
-    : buildColorPatchFromPaint(existingPaint, layerType, color);
-
-  if (layerType === "circle") {
-    const radius = getEditNumber(args, ["radius", "size"]);
-    return {
-      ...explicitPaint,
-      ...attributeStopPatch,
-      ...attributePaintPatch,
-      ...explicitPaintColorPatch,
-      ...explicitPaintWidthPatch,
-      ...explicitGenericPaintPatch,
-      ...colorPatch,
-      ...(radius !== undefined ? { "circle-radius": radius } : {}),
-      ...(normalizedOpacity !== undefined ? { "circle-opacity": normalizedOpacity } : {})
-    };
-  }
-
-  if (layerType === "line") {
-    const width = getEditNumber(args, ["width", "size"]);
-    return {
-      ...explicitPaint,
-      ...attributeStopPatch,
-      ...attributePaintPatch,
-      ...explicitPaintColorPatch,
-      ...explicitPaintWidthPatch,
-      ...explicitGenericPaintPatch,
-      ...colorPatch,
-      ...(width !== undefined ? { "line-width": width } : {}),
-      ...(normalizedOpacity !== undefined ? { "line-opacity": normalizedOpacity } : {})
-    };
-  }
-
-  if (layerType === "fill") {
-    return {
-      ...explicitPaint,
-      ...attributeStopPatch,
-      ...attributePaintPatch,
-      ...explicitPaintColorPatch,
-      ...explicitPaintWidthPatch,
-      ...explicitGenericPaintPatch,
-      ...colorPatch,
-      ...(normalizedOpacity !== undefined ? { "fill-opacity": normalizedOpacity } : {})
-    };
-  }
-
-  if (layerType === "fill-extrusion") {
-    return {
-      ...explicitPaint,
-      ...attributeStopPatch,
-      ...attributePaintPatch,
-      ...explicitPaintColorPatch,
-      ...explicitPaintWidthPatch,
-      ...explicitGenericPaintPatch,
-      ...colorPatch,
-      ...(normalizedOpacity !== undefined ? { "fill-extrusion-opacity": normalizedOpacity } : {})
-    };
-  }
-
-  if (layerType === "symbol") {
-    return {
-      ...explicitPaint,
-      ...attributeStopPatch,
-      ...attributePaintPatch,
-      ...explicitPaintColorPatch,
-      ...explicitPaintWidthPatch,
-      ...explicitGenericPaintPatch,
-      ...colorPatch,
-      ...(normalizedOpacity !== undefined ? { "icon-opacity": normalizedOpacity, "text-opacity": normalizedOpacity } : {})
-    };
-  }
-
-  if (layerType === "heatmap") {
-    return {
-      ...explicitPaint,
-      ...attributeStopPatch,
-      ...attributePaintPatch,
-      ...explicitPaintColorPatch,
-      ...explicitPaintWidthPatch,
-      ...explicitGenericPaintPatch,
-      ...colorPatch,
-      ...(normalizedOpacity !== undefined ? { "heatmap-opacity": normalizedOpacity } : {})
-    };
-  }
-
-  if (layerType === "raster") {
-    return {
-      ...explicitPaint,
-      ...attributeStopPatch,
-      ...attributePaintPatch,
-      ...explicitPaintColorPatch,
-      ...explicitPaintWidthPatch,
-      ...explicitGenericPaintPatch,
-      ...colorPatch,
-      ...(normalizedOpacity !== undefined ? { "raster-opacity": normalizedOpacity } : {})
-    };
-  }
+    : buildColorPatchFromPaint(existingPaint, color);
 
   return {
     ...explicitPaint,
     ...attributeStopPatch,
-    ...attributePaintPatch,
-    ...explicitPaintColorPatch,
-    ...explicitPaintWidthPatch,
-    ...explicitGenericPaintPatch,
-    ...colorPatch
+      ...attributePaintPatch,
+      ...explicitPaintColorPatch,
+      ...explicitGenericPaintPatch,
+      ...colorPatch
   };
 };
 
@@ -1494,20 +1677,27 @@ export const handleEditMapStyleTool = async (
   }
 
   const requestedLayerId = toStringValue(aiArgs.layerId) || toStringValue(pickRecord(aiArgs.params).layerId);
-  const currentMapLayerId = toStringValue(currentStyle.layerId);
+  const currentMapLayerId = toStringValue(currentStyle.layerId) || requestedLayerId;
   const target = toStringValue(aiArgs.target)?.toLowerCase();
+  const operation = resolveEditMapStyleOperation(aiArgs);
+  const officialStyleSpec = await loadMapLibreStyleSpec();
 
   const patchLayer = async (layer: unknown) => {
     const layerRecord = pickRecord(layer);
     const layerType = toStringValue(layerRecord.type) || "";
+    const styleLayerId = toStringValue(aiArgs.styleLayerId);
     const targetMatches = !target
-      || target === layerType
-      || (target === "point" && layerType === "circle")
-      || (target === "polygon" && layerType === "fill");
+      || target === layerType.toLowerCase()
+      || target === toStringValue(layerRecord.id)?.toLowerCase()
+      || (styleLayerId && styleLayerId === toStringValue(layerRecord.id));
 
     if (!targetMatches) return layerRecord;
 
-    const paintPatch = await getPaintPatchForLayerType(layerType, aiArgs, resolvedColor, pickRecord(layerRecord.paint));
+    if (operation === "add_property" || operation === "remove_property") {
+      return applyStylePropertyOperation(layerRecord, aiArgs, operation, resolvedColor, officialStyleSpec);
+    }
+
+    const paintPatch = await getPaintPatchForLayerType(aiArgs, resolvedColor, pickRecord(layerRecord.paint));
     const layoutPatch = pickRecord(aiArgs.layout);
 
     return {
@@ -1543,6 +1733,8 @@ export const handleEditMapStyleTool = async (
     layerId: currentMapLayerId,
     layers,
     styleInstruction: instruction,
+    ...(toStringValue(aiArgs.attributeKey) ? { attributeStyleKey: toStringValue(aiArgs.attributeKey) } : {}),
+    ...(toStringValue(aiArgs.attributeType) ? { attributeStyleType: toStringValue(aiArgs.attributeType) } : {}),
     ...(resolvedColor ? { appliedColor: resolvedColor } : {}),
     ...(colorKeys.length > 0 ? { colorKeys } : {})
   };
@@ -1643,6 +1835,27 @@ const replaceTemplateValue = (value: unknown, variables: Record<string, unknown>
   return value;
 };
 
+const hasUnresolvedTemplateValue = (value: unknown): boolean => {
+  if (typeof value === "string") return /{[^}]+}/.test(value);
+  if (Array.isArray(value)) return value.some(hasUnresolvedTemplateValue);
+  if (isRecord(value)) return Object.values(value).some(hasUnresolvedTemplateValue);
+  return false;
+};
+
+const renderQueryConfig = (
+  value: unknown,
+  variables: Record<string, unknown>
+): Record<string, unknown> => {
+  const rendered = pickRecord(replaceTemplateValue(value, variables));
+
+  return Object.fromEntries(
+    Object.entries(rendered).filter(([, item]) => {
+      if (item === undefined || item === null || item === "") return false;
+      return !hasUnresolvedTemplateValue(item);
+    })
+  );
+};
+
 const extractTemplateKeys = (...templates: string[]): string[] => {
   const keys = new Set<string>();
   const regex = /{([^}]+)}/g;
@@ -1711,7 +1924,8 @@ const resolveUserMapApiKeys = async (
             id: true,
             provider: true,
             hostname: true,
-            baseUrl: true
+            baseUrl: true,
+            serviceConfig: true
           }
         }
       }
@@ -1739,7 +1953,8 @@ const resolveUserMapApiKeys = async (
           id: true,
           provider: true,
           hostname: true,
-          baseUrl: true
+          baseUrl: true,
+          serviceConfig: true
         }
       }
     },
@@ -2501,6 +2716,48 @@ const getVectorTileLayerId = (aiArgs: MapToolArgs, optionKey: string): string | 
   return undefined;
 };
 
+const getVectorTileDatasetIdFromArgs = (aiArgs: MapToolArgs): string | undefined => {
+  const containers = getMapArgsContainers(aiArgs);
+
+  for (const container of containers) {
+    const value = toStringValue(container.datasetId) || toStringValue(container.dataset_id);
+    if (value) return value;
+  }
+
+  return undefined;
+};
+
+const getVectorTileCollectionRequestParams = (
+  aiArgs: MapToolArgs,
+  optionKey: string
+): Record<string, unknown> => {
+  const ignoredKeys = new Set([
+    optionKey,
+    "layerId",
+    "id",
+    "pagination",
+    "limit",
+    "offset",
+    "nextOffset",
+    "currentOffset",
+    "action"
+  ]);
+  const params = {
+    ...pickRecord(aiArgs.params),
+    ...pickRecord(aiArgs.options),
+    ...pickRecord(aiArgs.variables)
+  };
+
+  return Object.fromEntries(
+    Object.entries(params).filter(([key, value]) => {
+      return !ignoredKeys.has(key)
+        && toStringValue(value) !== undefined
+        && !isRecord(value)
+        && !Array.isArray(value);
+    })
+  );
+};
+// 29/05/2026
 const buildMapOptionUrl = (
   baseUrl: string,
   template: string,
@@ -2531,6 +2788,36 @@ const buildMapOptionUrl = (
   return appendApiKeyQuery(query ? `${base}${base.includes("?") ? "&" : "?"}${query}` : base, apiKey);
 };
 
+const buildProviderUrl = (
+  baseUrl: string,
+  template: string,
+  params: Record<string, unknown> = {}
+): string => {
+  const cleanBaseUrl = baseUrl.trim();
+  const cleanTemplate = template.trim();
+  if (!cleanBaseUrl || !/^https?:\/\//i.test(cleanBaseUrl)) {
+    throw new Error(`Invalid map host baseUrl: ${cleanBaseUrl || "(empty)"}`);
+  }
+  if (!cleanTemplate) {
+    throw new Error("Invalid map urlTemplate: (empty)");
+  }
+
+  const usedKeys = new Set<string>();
+  const renderedTemplate = Object.entries(params).reduce((url, [key, value]) => {
+    const cleanValue = toStringValue(value);
+    if (!cleanValue || !url.includes(`{${key}}`)) return url;
+    usedKeys.add(key);
+    return url.replace(new RegExp(`{${key}}`, "g"), encodeURIComponent(cleanValue));
+  }, cleanTemplate);
+  const base = joinProviderUrl(cleanBaseUrl, renderedTemplate);
+  const query = Object.entries(params)
+    .filter(([key, value]) => !usedKeys.has(key) && toStringValue(value))
+    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(toStringValue(value) || "")}`)
+    .join("&");
+
+  return query ? `${base}${base.includes("?") ? "&" : "?"}${query}` : base;
+};
+
 const createVectorTilePublicUrl = (url: string): string => {
   return createPublicVallarisMapUrl(url);
 };
@@ -2541,6 +2828,7 @@ type VectorTileCollection = {
   description?: string;
   geometryType?: string;
   sourceLayer?: string;
+  datasetId?: string;
 };
 
 type MapAttributeField = {
@@ -2655,6 +2943,18 @@ const getAttributeFieldsFromTileRecord = (
     || findAttributeFieldsInPayload(tileRecord);
 };
 
+const inferGeometryTypeFromAttributeFields = (
+  fields: Record<string, MapAttributeField> | undefined
+): string | undefined => {
+  if (!fields) return undefined;
+
+  const fieldNames = new Set(Object.keys(fields).map((name) => name.trim().toLowerCase()));
+  const hasLatitude = fieldNames.has("latitude") || fieldNames.has("lat");
+  const hasLongitude = fieldNames.has("longitude") || fieldNames.has("lon") || fieldNames.has("lng");
+
+  return hasLatitude && hasLongitude ? "point" : undefined;
+};
+
 const getVectorTileDatasetId = (
   tileRecord: Record<string, unknown>,
   tilePayload?: unknown
@@ -2721,7 +3021,8 @@ const extractVectorTileCollections = (payload: unknown): VectorTileCollection[] 
         title: toStringValue(record.title) || toStringValue(record.name) || id,
         description: toStringValue(record.description),
         geometryType: getDirectGeometryType(record),
-        sourceLayer: findSourceLayer(record, id)
+        sourceLayer: findSourceLayer(record, id),
+        datasetId: getVectorTileDatasetId(record, item)
       };
     })
     .filter((item): item is VectorTileCollection => Boolean(item));
@@ -3274,7 +3575,7 @@ const inferVectorTileLayerIdFromQuery = (
 
   return best.choice.value;
 };
-
+ //29/05/2026
 const buildVectorTileOptionsPayload = async (
   config: { intentName: string; provider: string; baseUrl: string; urlTemplate: string; layerConfigTemplate: unknown },
   aiArgs: MapToolArgs,
@@ -3283,7 +3584,15 @@ const buildVectorTileOptionsPayload = async (
   const template = pickRecord(config.layerConfigTemplate);
   const optionKey = getVectorTileOptionKey(config.layerConfigTemplate);
   const layerType = getCollectionDetailType(config.layerConfigTemplate);
-  const collectionQuery = pickRecord(template.collectionQuery);
+  const queryVariables = {
+    ...buildTemplateVariables(aiArgs, template, config.intentName, config.provider, apiKey)
+  };
+  const collectionQuery = renderQueryConfig(template.collectionQuery, queryVariables);
+  const collectionRequestParams = getVectorTileCollectionRequestParams(aiArgs, optionKey);
+  const requestQuery = {
+    ...collectionQuery,
+    ...collectionRequestParams
+  };
   const paginationRequest = getMapOptionPaginationRequest(aiArgs, template,VECTOR_TILE_CHOICE_LIMIT);
   const collectionsUrl = buildMapOptionUrl(
     config.baseUrl,
@@ -3291,18 +3600,20 @@ const buildVectorTileOptionsPayload = async (
     apiKey,
     paginationRequest.enabled
       ? {
-        ...collectionQuery,
+        ...requestQuery,
         limit: paginationRequest.limit,
         offset: paginationRequest.offset
       }
-      : collectionQuery
+      : requestQuery
   );
   const collectionsPayload = await fetchVectorTileJson(collectionsUrl);
   const collections = extractVectorTileCollections(collectionsPayload);
   const pagination = buildMapOptionPaginationResult(collectionsPayload, paginationRequest, collections.length);
   const collectionChoices = buildVectorTileChoices(collections, layerType);
-  const selectedLayerId = getVectorTileLayerId(aiArgs, optionKey)
-    || inferVectorTileLayerIdFromQuery(getMapQuery(aiArgs), collectionChoices);
+  const explicitLayerId = getVectorTileLayerId(aiArgs, optionKey);
+  const shouldInferLayerId = !explicitLayerId && Object.keys(collectionRequestParams).length === 0;
+  const selectedLayerId = explicitLayerId
+    || (shouldInferLayerId ? inferVectorTileLayerIdFromQuery(getMapQuery(aiArgs), collectionChoices) : undefined);
   const selectedCollection = selectedLayerId
     ? collections.find((collection) => collection.id === selectedLayerId)
     : undefined;
@@ -3335,6 +3646,7 @@ const buildVectorTileOptionsPayload = async (
       complete: false,
       intentName: config.intentName,
       provider: config.provider,
+      selectedValues: collectionRequestParams,
       ...(pagination.public ? { pagination: pagination.public } : {}),
       ...(pagination.state ? { paginationState: pagination.state } : {}),
       message: "No VALLARIS vector tile layers were found."
@@ -3356,7 +3668,7 @@ const buildVectorTileOptionsPayload = async (
       missingKeys: [optionKey],
       options: [layerOption],
       choices: [layerOption],
-      selectedValues: {},
+      selectedValues: collectionRequestParams,
       complete: false,
       intentName: config.intentName,
       provider: config.provider,
@@ -3377,6 +3689,7 @@ const buildVectorTileOptionsPayload = async (
       [optionKey]: selectedCollection.id,
       layerId: selectedCollection.id,
       layerTitle: selectedCollection.title,
+      ...(selectedCollection.datasetId ? { datasetId: selectedCollection.datasetId } : {}),
       ...(selectedCollection.description ? { description: selectedCollection.description } : {}),
       ...(selectedCollection.geometryType ? { geometryType: selectedCollection.geometryType } : {}),
       ...(selectedCollection.sourceLayer ? { sourceLayer: selectedCollection.sourceLayer } : {}),
@@ -3849,6 +4162,7 @@ const readFirstVectorTileFeatureType = (bytes: Uint8Array): number | undefined =
           const featureLength = readPbfVarint(bytes, layerOffset);
           const featureEnd = Math.min(layerEnd, featureLength.offset + featureLength.value);
           let featureOffset = featureLength.offset;
+          layerOffset = featureEnd;
 
           while (featureOffset < featureEnd) {
             const featureTag = readPbfVarint(bytes, featureOffset);
@@ -3954,12 +4268,13 @@ const buildVectorTileLayerPayload = async (
     ?.map((url) => appendApiKeyQuery(url, apiKey));
   const tiles = secureTiles?.map(createVectorTilePublicUrl);
   const template = pickRecord(config.layerConfigTemplate);
+  const attributeFields = getAttributeFieldsFromTileRecord(tileRecord, tilePayload);
   const geometryType = getDirectGeometryType(tileRecord)
     || getDirectGeometryType(template)
+    || inferGeometryTypeFromAttributeFields(attributeFields)
     || await inferVectorTileGeometryType(layerId, secureTiles, center, bounds, minzoom, maxzoom);
   const sourceLayer = findSourceLayer(tileRecord, layerId);
-  const attributeFields = getAttributeFieldsFromTileRecord(tileRecord, tilePayload);
-  const datasetId = getVectorTileDatasetId(tileRecord, tilePayload);
+  const datasetId = getVectorTileDatasetId(tileRecord, tilePayload) || getVectorTileDatasetIdFromArgs(aiArgs);
 
   return {
     success: true,
@@ -4095,7 +4410,7 @@ const summarizeAttributeValues = (
   attributeType?: string,
   valueKey?: string,
   countKey?: string,
-  limit = 24
+  limit = 6
 ): {
   values: Array<Record<string, unknown>>;
   stats?: { min: number; max: number };
@@ -4117,15 +4432,15 @@ const summarizeAttributeValues = (
   }
 
   const values = Array.from(valuesByKey.values());
+  const realValueLimit = Math.max(limit - 1, 1);
   if (normalizedType !== "number") {
     return {
       values: values
         .sort((left, right) => (right.count || 0) - (left.count || 0) || String(left.value).localeCompare(String(right.value)))
-        .slice(0, limit)
+        .slice(0, realValueLimit)
         .map((item) => ({
           label: String(item.value),
-          value: item.value,
-          ...(item.count ? { count: item.count } : {})
+          value: item.value
         }))
     };
   }
@@ -4135,10 +4450,10 @@ const summarizeAttributeValues = (
     .filter((item): item is { value: unknown; count?: number; numericValue: number } => item.numericValue !== undefined)
     .sort((left, right) => left.numericValue - right.numericValue);
 
-  const selectedValues = numericValues.length <= limit
+  const selectedValues = numericValues.length <= realValueLimit
     ? numericValues
-    : Array.from({ length: limit }, (_, index) => {
-      const ratio = limit === 1 ? 0 : index / (limit - 1);
+    : Array.from({ length: realValueLimit }, (_, index) => {
+      const ratio = realValueLimit === 1 ? 0 : index / (realValueLimit - 1);
       return numericValues[Math.round(ratio * (numericValues.length - 1))];
     }).filter((item, index, allItems) => {
       return item && allItems.findIndex((candidate) => candidate?.numericValue === item.numericValue) === index;
@@ -4147,8 +4462,7 @@ const summarizeAttributeValues = (
   return {
     values: selectedValues.map((item) => ({
       label: String(item.numericValue),
-      value: item.numericValue,
-      ...(item.count ? { count: item.count } : {})
+      value: item.numericValue
     })),
     ...(numericValues.length > 0
       ? {
@@ -4263,8 +4577,9 @@ export const handleMapAttributeValuesTool = async (
       };
     }
 
+    const userApiKeys = await resolveUserMapApiKeys(userId, headerApiKey);
     const userApiKey = selectApiKeyForProvider(
-      await resolveUserMapApiKeys(userId, headerApiKey),
+      userApiKeys,
       config.provider
     );
     if (!userApiKey) {
@@ -4312,7 +4627,38 @@ export const handleMapAttributeValuesTool = async (
         message: "layerConfigTemplate.attributeValues.body or datasourceTemplate is not configured."
       };
     }
-    const exploreUrl = buildMapOptionUrl(runtimeConfig.baseUrl, exploreUrlTemplate, apiKey);
+    const exploreKeySetting = valueConfig.exploreApiKey ?? valueConfig.apiKey ?? valueConfig.analyticsApiKey;
+    const configuredExploreApiKey = typeof exploreKeySetting === "string"
+      ? toStringValue(replaceTemplateValue(exploreKeySetting, variables))
+      : undefined;
+    const exploreKeyConfig = pickRecord(exploreKeySetting);
+    const hostServiceKeyName = ["host", "mapconfig_host", "mapconfigHost"].includes(toStringValue(exploreKeyConfig.source)?.toLowerCase() || "")
+      ? toStringValue(exploreKeyConfig.key || exploreKeyConfig.keyName || exploreKeyConfig.name)
+      : undefined;
+    const shouldUseCurrentExploreKey = exploreKeySetting === true || toStringValue(exploreKeySetting)?.toLowerCase() === "true";
+    const exploreApiKey = shouldUseCurrentExploreKey
+      ? userApiKey
+      : Object.keys(exploreKeyConfig).length > 0 && !hostServiceKeyName
+        ? selectApiKeyForConfig(userApiKeys, config.provider, exploreKeyConfig)
+        : undefined;
+    const exploreRuntimeConfig = exploreApiKey
+      ? withApiKeyHostBaseUrl(config, exploreApiKey)
+      : runtimeConfig;
+    const exploreApiKeyValue = exploreApiKey ? decryptUserApiKey(exploreApiKey) : undefined;
+    const hostExploreApiKeyValue = hostServiceKeyName
+      ? getHostServiceApiKey(exploreApiKey?.host || userApiKey.host, hostServiceKeyName)
+      : undefined;
+    const finalExploreApiKeyValue = configuredExploreApiKey || hostExploreApiKeyValue || exploreApiKeyValue;
+    const exploreVariables = finalExploreApiKeyValue
+      ? {
+        ...variables,
+        apiKey: finalExploreApiKeyValue,
+        exploreApiKey: finalExploreApiKeyValue
+      }
+      : variables;
+    const exploreQuery = pickRecord(replaceTemplateValue(valueConfig.exploreQuery || valueConfig.query, exploreVariables));
+    const baseExploreUrl = buildProviderUrl(exploreRuntimeConfig.baseUrl, exploreUrlTemplate, exploreQuery);
+    const exploreUrl = finalExploreApiKeyValue ? appendApiKeyQuery(baseExploreUrl, finalExploreApiKeyValue) : baseExploreUrl;
     const exploreResponse = await fetch(exploreUrl, {
       method: (toStringValue(valueConfig.method) || "POST").toUpperCase(),
       headers: {
@@ -4333,8 +4679,12 @@ export const handleMapAttributeValuesTool = async (
     const items = extractAttributeValueItems(explorePayload);
     const valueKey = toStringValue(replaceTemplateValue(valueConfig.valueKey, variables));
     const countKey = toStringValue(replaceTemplateValue(valueConfig.countKey, variables)) || attributeKey;
-    const suggestionLimit = toNumberValue(valueConfig.suggestionLimit) || toNumberValue(valueConfig.valueLimit) || 24;
+    const configuredSuggestionLimit = toNumberValue(valueConfig.suggestionLimit) || toNumberValue(valueConfig.valueLimit);
+    const suggestionLimit = Math.min(configuredSuggestionLimit || 6, 6);
     const summary = summarizeAttributeValues(items, attributeKey, attributeType, valueKey, countKey, suggestionLimit);
+    const fallbackValue = valueConfig.fallbackValue !== undefined
+      ? replaceTemplateValue(valueConfig.fallbackValue, variables)
+      : 0;
 
     return {
       success: true,
@@ -4343,6 +4693,7 @@ export const handleMapAttributeValuesTool = async (
       ...(attributeType ? { attributeType } : {}),
       valueSource: "data",
       values: summary.values,
+      fallbackValue,
       ...(summary.stats ? { stats: summary.stats } : {}),
       numberReturned: summary.values.length,
       numberMatched: toNumberValue(pickRecord(explorePayload).numberMatched) || items.length
@@ -4450,7 +4801,7 @@ export const buildDynamicMapOptionToolSchema = (
           params: {
             type: "object",
             properties: paramsProperties,
-            description: "Values inferred from the user's message or selected from the UI. Put known values here before asking the user for more. Use only DB-backed enums/descriptions."
+            description: "Values inferred from the user's message or selected from the UI. Put known values here before asking the user for more. Use only DB-backed enums/descriptions. Collection-backed options will forward selected params to the collection endpoint."
           },
           options: {
             type: "object",
@@ -4556,7 +4907,7 @@ export const editMapStyleToolSchema = {
   type: "function",
   function: {
     name: "edit_map_style",
-    description: "Edit the latest map style using the existing map_style as the base. Use this when the user wants to change color, size, width, opacity, paint, or layout without calling get_map_layer again. Colors should be provided as catalog colorKeys or a hex colorValue. To edit one attribute stop, pass attributeKey and attributeValue. To change the whole layer color, omit attributeValue.",
+    description: "Edit the latest map style using the existing map_style as the base. Use this when the user wants to change a paint/layout property without calling get_map_layer again. Attributes can drive any compatible existing paint property, not only colors. For example, use attributeKey pv_tn with paintKey circle-opacity or circle-radius. Use paintKey/value, layoutKey/value, paint, or layout for direct property edits. To edit one attribute stop, pass attributeKey and attributeValue.",
     parameters: {
       type: "object",
       properties: {
@@ -4568,14 +4919,35 @@ export const editMapStyleToolSchema = {
           type: "string",
           description: "The title/name of the displayed map layer to edit when the user names a layer but does not provide layerId."
         },
+        operation: {
+          type: "string",
+          enum: ["update_layer", "add_property", "remove_property"],
+          description: "Use update_layer for normal edits, add_property to add a paint/layout key to the existing style layer, or remove_property to delete a paint/layout key from the existing style layer."
+        },
+        action: {
+          type: "string",
+          enum: ["update_layer", "add_property", "remove_property"],
+          description: "Alias for operation."
+        },
+        styleLayerId: {
+          type: "string",
+          description: "The id of a MapLibre style layer inside map_style.layers. Use this to remove or update a specific style layer."
+        },
         sourceLayer: {
           type: "string",
           description: "The sourceLayer/name of the map layer to edit when it is known."
         },
         target: {
           type: "string",
-          enum: ["point", "circle", "line", "polygon", "fill", "symbol", "heatmap", "raster"],
-          description: "The layer type to edit. If omitted, layers from the latest map_style are used."
+          description: "The current style layer type or style layer id to edit. If omitted, layers from the latest map_style are used."
+        },
+        layerType: {
+          type: "string",
+          description: "Optional current MapLibre layer type hint."
+        },
+        layer: {
+          type: "object",
+          description: "Optional object containing paint/layout properties to merge into the current style layer."
         },
         instruction: {
           type: "string",
@@ -4620,33 +4992,35 @@ export const editMapStyleToolSchema = {
           type: "object",
           description: "Known numeric stats such as { min, max }. Usually omitted by the model because the backend can fill it."
         },
+        outputs: {
+          type: "array",
+          items: {},
+          description: "Optional style outputs assigned across attribute values, such as opacity numbers, radius numbers, widths, or colors. If omitted, the backend derives outputs from the selected current paint property."
+        },
+        fallbackOutput: {
+          description: "Optional fallback style output for attribute values without an explicit match."
+        },
         paintKey: {
           type: "string",
-          description: "Optional existing MapLibre paint key to edit, such as circle-stroke-width or circle-stroke-color. The backend only edits keys present in the current style paint unless paint is provided explicitly."
+          description: "MapLibre paint key to edit or drive from attribute values, such as circle-color, circle-opacity, circle-radius, or circle-stroke-width."
+        },
+        layoutKey: {
+          type: "string",
+          description: "MapLibre layout key to edit, add, or remove."
+        },
+        removePaintKeys: {
+          type: "array",
+          items: { type: "string" },
+          description: "Paint keys to remove when operation is remove_property."
+        },
+        removeLayoutKeys: {
+          type: "array",
+          items: { type: "string" },
+          description: "Layout keys to remove when operation is remove_property."
         },
         value: {
           oneOf: [{ type: "string" }, { type: "number" }, { type: "boolean" }],
           description: "Generic value for paintKey edits, such as 4 for circle-stroke-width or a catalog color key/hex for color paint keys."
-        },
-        radius: {
-          type: "number",
-          description: "Circle radius for point/circle layers"
-        },
-        size: {
-          type: "number",
-          description: "Size value, used as circle radius or line width"
-        },
-        width: {
-          type: "number",
-          description: "line width"
-        },
-        strokeWidth: {
-          type: "number",
-          description: "Stroke width for an existing stroke-width paint key such as circle-stroke-width."
-        },
-        opacity: {
-          type: "number",
-          description: "Opacity from 0-1 or 0-100"
         },
         paint: {
           type: "object",

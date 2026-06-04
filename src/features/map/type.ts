@@ -28,6 +28,11 @@ export const updateApiKeyBodySchema = t.Object({
 });
 export type UpdateApiKeyDTO = Static<typeof updateApiKeyBodySchema>;
 
+export const hostParamsSchema = t.Object({
+  hostId: t.String({ minLength: 1 })
+});
+export type HostParamsDTO = Static<typeof hostParamsSchema>;
+
 export const apiKeySummarySchema = t.Object({
   id: t.String(),
   provider: t.String(),

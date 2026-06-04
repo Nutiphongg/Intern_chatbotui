@@ -235,7 +235,10 @@ const classifyMapRequestIntent = async (
                             'Return only JSON with one of these intents: {"intent":"map_access"}, {"intent":"map_control"}, or {"intent":"chat"}.',
                             'Use "map_access" only when the user wants to list, fetch, open, get a URL, get WMS/WMTS/TMS/vector tile, or retrieve map/layer data.',
                             'Use "map_access" when the user asks to list, search, fetch, or choose existing provider map styles/style records/style catalog from the map API.',
-                            'Use "map_control" when the user wants to manage already displayed map state without fetching provider data, such as clearing or hiding existing displayed layers.',
+                            'Use "map_control" when the user wants to manage already displayed map state without fetching provider data, such as clearing, hiding, or editing visual style/paint/layout/colors of existing displayed layers.',
+                            'When hasImages is true, words like image/photo/picture refer to the attached image.',
+                            'Use "map_control" when the user asks to use, add, apply, or change map/layer/style/paint colors from the attached image/photo/picture, including wording like "like image", "same as image", or "based on image".',
+                            'Use "chat" when the user only asks what colors are in the image or asks to describe/analyze the image, even if a map was discussed earlier.',
                             'Use "chat" for general discussion, explanations, image analysis, or visual/map style advice that does not require fetching existing provider data.'
                         ].join('\n')
                     },
@@ -1738,6 +1741,35 @@ const buildConversationMapStateFromMessages = (
     return state;
 };
 
+const buildConversationMapStateFromRows = (
+    rows: ConversationMapLayerRow[]
+): ConversationMapState => {
+    const state: ConversationMapState = { layers: {} };
+
+    for (const row of rows) {
+        if (!row.visible) continue;
+
+        if (row.layerPayload) {
+            applyMapPayloadToState(state, row.layerPayload);
+        } else {
+            ensureMapLayerState(state, row.layerKey);
+        }
+
+        if (row.mapStyle) {
+            applyMapStyleToState(state, row.mapStyle, row.layerKey);
+        }
+    }
+
+    const latestUpdatedRow = rows
+        .filter((row) => row.visible && state.layers[row.layerKey])
+        .sort((left, right) => right.updatedAt.getTime() - left.updatedAt.getTime())[0];
+    if (latestUpdatedRow) {
+        state.activeLayerId = latestUpdatedRow.layerKey;
+    }
+
+    return state;
+};
+
 const getLatestMapStyleFromMessages = (messages: Array<{ role: string; content: string }>): unknown | undefined => {
     const clearedLayerIds = new Set<string>();
 
@@ -1844,9 +1876,21 @@ const buildConversationMemoryFromDb = async (
 
     const messages = dbMessages.reverse();
     const latestVision = getLatestVisionFromMessages(messages);
-    const latestMap = getLatestMapPayloadFromMessages(messages);
-    const latestMapStyle = getLatestMapStyleFromMessages(messages);
-    const conversationMapState = buildConversationMapStateFromMessages(messages);
+    const messageMapState = buildConversationMapStateFromMessages(messages);
+    let mapLayerRows: ConversationMapLayerRow[] = [];
+    try {
+        mapLayerRows = await getConversationMapLayerRows(conversationId);
+    } catch (error) {
+        console.error('[map-state] failed to load conversation map layers:', error);
+    }
+    const dbMapState = buildConversationMapStateFromRows(mapLayerRows);
+    const conversationMapState = Object.keys(dbMapState.layers).length > 0
+        ? dbMapState
+        : messageMapState;
+    const latestMap = getLatestMapPayloadFromState(conversationMapState)
+        || getLatestMapPayloadFromMessages(messages);
+    const latestMapStyle = getLatestMapStyleFromState(conversationMapState)
+        || getLatestMapStyleFromMessages(messages);
     const latestMapClear = getLatestMapClearFromMessages(messages);
     const latestMapOptions = getLatestMapOptionsFromMessages(messages);
 
@@ -2310,6 +2354,103 @@ const collectMapStyleAttributeKeys = (value: unknown, keys = new Set<string>()):
     return keys;
 };
 
+const getMapStyleAttributeVariants = (mapStyle: unknown): Map<string, Record<string, unknown>> => {
+    const variants = asRecord(mapStyle).attributeStyleVariants;
+    const items = new Map<string, Record<string, unknown>>();
+
+    if (Array.isArray(variants)) {
+        for (const item of variants) {
+            const record = asRecord(item);
+            const name = toSuggestionString(record.attributeKey || record.name || record.value);
+            if (name) items.set(name, { ...record, attributeKey: name });
+        }
+        return items;
+    }
+
+    for (const [key, value] of Object.entries(asRecord(variants))) {
+        const record = asRecord(value);
+        const name = toSuggestionString(record.attributeKey || key);
+        if (name) items.set(name, { ...record, attributeKey: name });
+    }
+
+    return items;
+};
+
+const getMapStyleAttributeVariantFields = (mapStyle: unknown): Array<{ name: string; type?: string }> => {
+    return Array.from(getMapStyleAttributeVariants(mapStyle).values())
+        .map((record) => {
+            const name = toSuggestionString(record.attributeKey || record.name || record.value);
+            const type = toSuggestionString(record.attributeType || record.type);
+            return name ? { name, ...(type ? { type } : {}) } : undefined;
+        })
+        .filter((item): item is { name: string; type?: string } => Boolean(item));
+};
+
+const areStyleLayersEqual = (left: unknown, right: unknown): boolean => {
+    if (!Array.isArray(left) || !Array.isArray(right)) return false;
+    try {
+        return JSON.stringify(left) === JSON.stringify(right);
+    } catch {
+        return false;
+    }
+};
+
+const mergeMapStyleAttributeVariants = (
+    mapStyle: unknown,
+    previousMapStyle?: unknown,
+    mapPayload?: unknown
+): Record<string, unknown> => {
+    const styleRecord = asRecord(mapStyle);
+    const variantsByName = getMapStyleAttributeVariants(previousMapStyle);
+    for (const [name, variant] of getMapStyleAttributeVariants(styleRecord)) {
+        variantsByName.set(name, variant);
+    }
+
+    const layer = getSuggestionLayerRecord(mapPayload || styleRecord);
+    const fields = asRecord(asRecord(layer.attributes).fields);
+    const explicitAttribute = toSuggestionString(styleRecord.attributeStyleKey || styleRecord.attributeKey);
+    const usedAttributes = explicitAttribute
+        ? new Set([explicitAttribute])
+        : new Set<string>();
+    const layers = Array.isArray(styleRecord.layers) ? styleRecord.layers : undefined;
+    if (explicitAttribute && layers) {
+        for (const [name, variant] of variantsByName) {
+            if (name !== explicitAttribute && areStyleLayersEqual(asRecord(variant).layers, layers)) {
+                variantsByName.delete(name);
+            }
+        }
+    }
+    for (const name of usedAttributes) {
+        const fieldType = name === explicitAttribute
+            ? toSuggestionString(styleRecord.attributeStyleType || asRecord(fields[name]).type)
+            : toSuggestionString(asRecord(fields[name]).type);
+        const previousVariant = asRecord(variantsByName.get(name));
+        const previousType = toSuggestionString(previousVariant.attributeType || previousVariant.type);
+        variantsByName.set(name, {
+            ...previousVariant,
+            attributeKey: name,
+            ...(fieldType ? { attributeType: fieldType } : previousType ? { attributeType: previousType } : {}),
+            ...(layers ? { layers } : {}),
+            ...(styleRecord.styleKey ? { styleKey: styleRecord.styleKey } : {}),
+            ...(styleRecord.styleName ? { styleName: styleRecord.styleName } : {}),
+            ...(styleRecord.activeStyle ? { activeStyle: styleRecord.activeStyle } : {}),
+            ...(styleRecord.defaultStyle ? { defaultStyle: styleRecord.defaultStyle } : {}),
+            ...(styleRecord.geometryType ? { geometryType: styleRecord.geometryType } : {})
+        });
+    }
+    const firstAttribute = usedAttributes.values().next().value;
+
+    return {
+        ...styleRecord,
+        ...(firstAttribute ? { attributeStyleKey: firstAttribute } : {}),
+        ...(variantsByName.size > 0
+            ? {
+                attributeStyleVariants: Object.fromEntries(variantsByName)
+            }
+            : {})
+    };
+};
+
 const getMapStyleAttributeKey = (value: unknown): string | undefined => {
     if (!Array.isArray(value)) return undefined;
     const [operator, attributeKey] = value;
@@ -2409,6 +2550,10 @@ const isPaintStyleEditInstruction = (
     const normalizedInstruction = normalizeStyleSwitchText(instruction);
     if (!normalizedInstruction) return false;
 
+    if (/[A-Za-z][\w]*-[A-Za-z][\w-]*/.test(instruction)) {
+        return true;
+    }
+
     return Array.from(collectMapStylePaintKeys(mapStyle)).some((paintKey) => {
         const normalizedPaintKey = normalizeStyleSwitchText(paintKey);
         return Boolean(normalizedPaintKey && normalizedInstruction.includes(normalizedPaintKey));
@@ -2423,18 +2568,21 @@ const getSuggestionAttributeFields = (
     const layer = getSuggestionLayerRecord(mapPayload);
     const fields = asRecord(asRecord(layer.attributes).fields);
     const usedAttributes = collectMapStyleAttributeKeys(mapStyle);
+    const variantAttributes = getMapStyleAttributeVariantFields(mapStyle);
+    const variantAttributeNames = new Set(variantAttributes.map((item) => item.name));
     const normalizedInstruction = normalizeStyleSwitchText(instruction);
 
-    return Object.entries(fields)
+    const fieldEntries = Object.entries(fields)
         .map(([name, definition]) => {
             const normalizedName = normalizeStyleSwitchText(name);
             const isStyleAttribute = usedAttributes.has(name);
+            const isVariantAttribute = variantAttributeNames.has(name);
             const isRequestedAttribute = Boolean(
                 normalizedInstruction
                 && normalizedName
                 && normalizedInstruction.includes(normalizedName)
             );
-            if (!isStyleAttribute && !isRequestedAttribute) return undefined;
+            if (!isStyleAttribute && !isVariantAttribute && !isRequestedAttribute) return undefined;
 
             const fieldType = toSuggestionString(asRecord(definition).type);
             return name.trim()
@@ -2444,8 +2592,11 @@ const getSuggestionAttributeFields = (
                 }
                 : undefined;
         })
-        .filter((field): field is { name: string; type?: string } => Boolean(field))
-        .slice(0, 8);
+        .filter((field): field is { name: string; type?: string } => Boolean(field));
+    const fieldNames = new Set(fieldEntries.map((field) => field.name));
+    const variantEntries = variantAttributes.filter((field) => !fieldNames.has(field.name));
+
+    return [...fieldEntries, ...variantEntries].slice(0, 8);
 };
 
 const buildAttributeStyleSuggestionItems = (
@@ -2459,7 +2610,6 @@ const buildAttributeStyleSuggestionItems = (
         key: 'style_by_attribute',
         label: 'Style by attribute ',
         values: fields.map((field) => ({
-            label: field.name,
             value: field.name,
             ...(field.type ? { attributeType: field.type } : {})
         })),
@@ -2507,7 +2657,7 @@ const buildAttributeValueSuggestionItems = (
 const isAttributeValueStyleEditInstruction = (instruction?: string): boolean => {
     if (typeof instruction !== 'string') return false;
     return /\bvalue\s+[-+]?\d+(?:\.\d+)?\b/i.test(instruction)
-        && /\bcolou?r\b|\bsize\b|\bradius\b|สี|ขนาด/i.test(instruction);
+        && /\bcolou?r\b|สี/i.test(instruction);
 };
 
 const isAttributeValueSuggestionInstruction = (instruction?: string): boolean => {
@@ -2662,12 +2812,21 @@ const enrichMapSuggestionsWithAttributeValues = async (
         ? asRecord(valuesResult).values as unknown[]
         : [];
     if (!asRecord(valuesResult).success || dataValues.length === 0) return suggestionsPayload;
+    const suggestionValues = dataValues
+        .map((item) => {
+            const record = asRecord(item);
+            return record.value !== undefined ? record.value : item;
+        })
+        .filter((value) => value !== undefined && value !== null && value !== '');
 
     const nextItems = [...items];
     nextItems[attributeValueIndex] = {
         ...attributeValueItem,
-        values: dataValues,
+        values: suggestionValues,
         valueSource: 'data',
+        ...(asRecord(valuesResult).fallbackValue !== undefined
+            ? { fallbackValue: asRecord(valuesResult).fallbackValue }
+            : {}),
         ...(asRecord(valuesResult).stats ? { stats: asRecord(valuesResult).stats } : {}),
         ...(asRecord(valuesResult).numberMatched !== undefined
             ? { numberMatched: asRecord(valuesResult).numberMatched }
@@ -2726,6 +2885,7 @@ const buildAttributeEditArgs = async (
         baseArgs.attributeKey
     );
     if (!requestedAttribute) return baseArgs;
+    const { attributeValues: _ignoredAttributeValues, attributeStats: _ignoredAttributeStats, ...trustedBaseArgs } = baseArgs;
 
     const payloadRecord = asRecord(mapPayload);
     const layerRecord = asRecord(payloadRecord.layer);
@@ -2737,7 +2897,7 @@ const buildAttributeEditArgs = async (
 
     if (!intentName || !provider || !datasetId) {
         return {
-            ...baseArgs,
+            ...trustedBaseArgs,
             attributeKey: requestedAttribute.name,
             ...(requestedAttribute.type ? { attributeType: requestedAttribute.type } : {})
         };
@@ -2757,10 +2917,10 @@ const buildAttributeEditArgs = async (
     );
 
     return {
-        ...baseArgs,
+        ...trustedBaseArgs,
         attributeKey: requestedAttribute.name,
         ...(requestedAttribute.type ? { attributeType: requestedAttribute.type } : {}),
-        ...(Array.isArray(asRecord(valuesResult).values) ? { attributeValues: asRecord(valuesResult).values } : {}),
+        ...(valuesResult.success === true && Array.isArray(asRecord(valuesResult).values) ? { attributeValues: asRecord(valuesResult).values } : {}),
         ...(asRecord(valuesResult).stats ? { attributeStats: asRecord(valuesResult).stats } : {})
     };
 };
@@ -2790,20 +2950,15 @@ const mergeMapToolArgs = (...argsList: Array<Record<string, unknown> | undefined
 
     return merged;
 };
-
+//function 29/05/2026
 const normalizeMapSelectionArgs = (selection: unknown): Record<string, unknown> | undefined => {
     const record = asRecord(selection);
     if (Object.keys(record).length === 0) return undefined;
 
-    const explicitParams = asRecord(record.params);
-    const explicitOptions = asRecord(record.options);
-    const explicitVariables = asRecord(record.variables);
     const key = typeof record.key === 'string'
         ? record.key
-        : typeof record.currentKey === 'string'
-            ? record.currentKey
             : undefined;
-    const value = record.value ?? record.selectedValue;
+    const value = record.value ;
     const selectedIntentName = key === 'intentName' && typeof value === 'string'
         ? value
         : undefined;
@@ -2819,9 +2974,8 @@ const normalizeMapSelectionArgs = (selection: unknown): Record<string, unknown> 
                 'options',
                 'variables',
                 'key',
-                'currentKey',
                 'value',
-                'selectedValue'
+               
             ].includes(entryKey);
         })
     );
@@ -2836,14 +2990,13 @@ const normalizeMapSelectionArgs = (selection: unknown): Record<string, unknown> 
     const params = {
         ...inlineParams,
         ...selectedParam,
-        ...explicitParams
+    
     };
     const selectedTopLevelOptions = {
         ...(selectedIntentName ? { intentName: selectedIntentName } : {}),
         ...(selectedProvider ? { provider: selectedProvider } : {})
     };
     const selectedOptions = {
-        ...explicitOptions,
         ...selectedTopLevelOptions
     };
 
@@ -2852,7 +3005,6 @@ const normalizeMapSelectionArgs = (selection: unknown): Record<string, unknown> 
         ...(typeof record.provider === 'string' ? { provider: record.provider } : selectedProvider ? { provider: selectedProvider } : {}),
         ...(Object.keys(params).length > 0 ? { params } : {}),
         ...(Object.keys(selectedOptions).length > 0 ? { selectedOptions } : {}),
-        ...(Object.keys(explicitVariables).length > 0 ? { variables: explicitVariables } : {})
     };
 };
 
@@ -3101,8 +3253,10 @@ export const processChatMessageStream = (
     const rawMessage = body?.message ?? '';
     const rawImages = body ? collectChatImages(body) : [];
     const hasImages = rawImages.length > 0;
+    const isGuest = role === 'guest';
+    const mapFeaturesEnabled = !isGuest;
     const mapSelectionPayload = body?.mapselection;
-    const hasMapSelection = Boolean(mapSelectionPayload);
+    const hasMapSelection = mapFeaturesEnabled && Boolean(mapSelectionPayload);
     const hasUserMessage = Boolean(rawMessage.trim());
     const mapSelectionRecord = asRecord(mapSelectionPayload);
     const hasMapSelectionPagination = Object.keys(asRecord(mapSelectionRecord.pagination)).length > 0;
@@ -3120,11 +3274,10 @@ export const processChatMessageStream = (
         throw Errors.badRequest('no message data found');
     }
 
-    const isGuest = role === 'guest';
-    const message = rawMessage.trim() || (hasImages ? 'ช่วยดูรูปนี้ให้หน่อย' : '');
+    const message = rawMessage.trim();
     const selectedModel = body.model?.trim() || DEFAULT_CHAT_MODEL;
     const isSilentRetry = body.is_silent_retry === true;
-    let mapHeaderApiKey = apiKey?.trim() || vectorApiKey?.trim();
+    let mapHeaderApiKey = mapFeaturesEnabled ? apiKey?.trim() || vectorApiKey?.trim() : undefined;
     let hasMapApiKey = Boolean(mapHeaderApiKey);
     const isNewConv = !body.conversationId;
     const convId = body.conversationId || ulid();
@@ -3589,13 +3742,19 @@ export const processChatMessageStream = (
                         ? undefined
                         : await getConversationRollingSummary(convId);
                     const conversationSummaryContext = buildConversationSummaryContext(rollingSummary);
-                    const conversationMapState = (memoryPayload.conversationMapState || buildConversationMapStateFromMessages(messagesForLLM)) as ConversationMapState | undefined;
-                    const latestMapStyle = getLatestMapStyleFromState(conversationMapState)
-                        || getLatestMapStyleFromMessages(messagesForLLM)
-                        || memoryPayload.latestMapStyle;
-                    const latestMapPayload = getLatestMapPayloadFromState(conversationMapState)
-                        || getLatestMapPayloadFromMessages(messagesForLLM)
-                        || memoryPayload.latestMap;
+                    const conversationMapState = mapFeaturesEnabled
+                        ? (memoryPayload.conversationMapState || buildConversationMapStateFromMessages(messagesForLLM)) as ConversationMapState | undefined
+                        : undefined;
+                    const latestMapStyle = mapFeaturesEnabled
+                        ? getLatestMapStyleFromState(conversationMapState)
+                            || getLatestMapStyleFromMessages(messagesForLLM)
+                            || memoryPayload.latestMapStyle
+                        : undefined;
+                    const latestMapPayload = mapFeaturesEnabled
+                        ? getLatestMapPayloadFromState(conversationMapState)
+                            || getLatestMapPayloadFromMessages(messagesForLLM)
+                            || memoryPayload.latestMap
+                        : undefined;
                     if (latestMapPayload && latestMapStyle && hasUserMessage && !hasMapSelection) {
                         const attributeSuggestionPayload = buildMapSuggestionsPayload(
                             latestMapPayload,
@@ -3694,18 +3853,23 @@ export const processChatMessageStream = (
                             layer: publicLayer
                         };
                     };
+                    const toPublicMapStyleStreamPayload = (payload: unknown): unknown => {
+                        const payloadRecord = asRecord(payload);
+                        const { attributeStyleVariants, ...publicPayload } = payloadRecord;
+                        return publicPayload;
+                    };
                     const writeMapResultEvents = async (payload: unknown) => {
                         writeSse(controller, 'map', toPublicMapStreamPayload(payload));
                         const styleResult = await buildMapStylePayload(payload, {
                             instruction: hasUserMessage ? message : undefined
                         });
-                        const mapStylePayload = styleResult.success ? styleResult : undefined;
+                        const mapStylePayload = styleResult.success
+                            ? mergeMapStyleAttributeVariants(styleResult, undefined, payload)
+                            : undefined;
                         if (mapStylePayload) {
-                            writeSse(controller, 'map_style', mapStylePayload);
+                            writeSse(controller, 'map_style', toPublicMapStyleStreamPayload(mapStylePayload));
                         }
-                        if (!isGuest) {
-                            await safeSyncConversationMapLayerCatalog(convId, payload, mapStylePayload);
-                        }
+                        await safeSyncConversationMapLayerCatalog(convId, payload, mapStylePayload);
 
                         const styleCatalog = mapStylePayload ? await handleStyleCatalogTool() : undefined;
                         let suggestionsPayload = mapStylePayload && styleCatalog
@@ -3919,8 +4083,6 @@ export const processChatMessageStream = (
                     };
 
                     const findLatestMapOptionsMessageId = async () => {
-                        if (isGuest) return null;
-
                         const cachedMessageId = typeof savedMapSelectionArgs?.mapOptionsMessageId === 'string'
                             ? savedMapSelectionArgs.mapOptionsMessageId
                             : undefined;
@@ -3971,7 +4133,7 @@ export const processChatMessageStream = (
                     ) => {
                         const metadata = createMapOptionsMetadata(payload);
 
-                        if (!shouldUpdateExisting || isGuest) {
+                        if (!shouldUpdateExisting) {
                             const createdMessageId = await saveAssistantMessage('', metadata);
                             await rememberMapOptionsMessageId(createdMessageId);
                             return createdMessageId;
@@ -4028,12 +4190,11 @@ export const processChatMessageStream = (
                             });
 
                             if (styleResult.success) {
-                                writeSse(controller, 'map_style', styleResult);
-                                if (!isGuest) {
-                                    await safeSyncConversationMapStyle(convId, styleResult);
-                                }
+                                const styleResultWithVariants = mergeMapStyleAttributeVariants(styleResult, latestMapStyle, latestMapPayload);
+                                writeSse(controller, 'map_style', toPublicMapStyleStreamPayload(styleResultWithVariants));
+                                await safeSyncConversationMapStyle(convId, styleResultWithVariants);
                                 const suggestionsPayload = await enrichMapSuggestionsWithAttributeValues(
-                                    buildMapSuggestionsPayload(latestMapPayload, styleResult, styleCatalog, conversationMapState, hasUserMessage ? message : undefined),
+                                    buildMapSuggestionsPayload(latestMapPayload, styleResultWithVariants, styleCatalog, conversationMapState, hasUserMessage ? message : undefined),
                                     latestMapPayload,
                                     userId,
                                     mapHeaderApiKey
@@ -4041,8 +4202,8 @@ export const processChatMessageStream = (
                                 if (suggestionsPayload) {
                                     writeSse(controller, 'suggestions', suggestionsPayload);
                                 }
-                                const styleMetadata = createMapStyleMetadata(styleResult);
-                                const postReply = await streamPostMapEventReply('map_style', styleResult);
+                                const styleMetadata = createMapStyleMetadata(styleResultWithVariants);
+                                const postReply = await streamPostMapEventReply('map_style', styleResultWithVariants);
                                 const assistantMessageId = await saveAssistantMessage(
                                     postReply.reply,
                                     styleMetadata,
@@ -4062,17 +4223,21 @@ export const processChatMessageStream = (
                         }
                     }
 
-                    const hasActiveMapLayers = Object.keys(conversationMapState?.layers || {}).length > 0;
-                    const shouldOfferMapStyleEdit = Boolean(latestMapStyle && hasUserMessage);
-                    const shouldOfferMapLayerClear = Boolean(hasActiveMapLayers && hasUserMessage);
                     const mapRequestIntent: MapRequestIntent = hasMapSelection
                         ? 'map_access'
-                        : hasUserMessage
+                        : mapFeaturesEnabled && hasUserMessage
                             ? await classifyMapRequestIntent(message, hasImages, selectedModel)
                             : 'chat';
                     const wantsMapAccess = mapRequestIntent === 'map_access';
-                    const shouldRequireMapApiKey = wantsMapAccess && !hasMapApiKey && !shouldOfferMapStyleEdit;
-                    const shouldHandleMap = hasMapSelection || (wantsMapAccess && hasMapApiKey);
+                    const wantsMapControl = mapRequestIntent === 'map_control';
+                    const shouldIsolateVisionChat = hasImages
+                        && mapRequestIntent === 'chat'
+                        && !hasMapSelection;
+                    const hasActiveMapLayers = mapFeaturesEnabled && Object.keys(conversationMapState?.layers || {}).length > 0;
+                    const shouldOfferMapStyleEdit = Boolean(mapFeaturesEnabled && wantsMapControl && latestMapStyle && hasUserMessage);
+                    const shouldOfferMapLayerClear = Boolean(mapFeaturesEnabled && wantsMapControl && hasActiveMapLayers && hasUserMessage);
+                    const shouldRequireMapApiKey = mapFeaturesEnabled && wantsMapAccess && !hasMapApiKey;
+                    const shouldHandleMap = mapFeaturesEnabled && (hasMapSelection || (wantsMapAccess && hasMapApiKey));
 
                     if (
                         shouldOfferMapStyleEdit
@@ -4092,7 +4257,7 @@ export const processChatMessageStream = (
                             role: 'system',
                             content: [
                                 ...(shouldOfferMapStyleEdit
-                                    ? ['Latest active map_style is available. If the user asks to change map visual style, color, size, width, opacity, symbol, heatmap, or paint/layout, call edit_map_style.']
+                                    ? ['Latest active map_style is available. If the user asks to change a map paint/layout property, call edit_map_style.']
                                     : []),
                                 'If the user asks to clear displayed map layers or styles, call clear_map_layers. Use mode "selected" for one or more named entries, or mode "all" for every displayed entry. You may pass layerId, styleId, layerTitle, or layerIds; the backend resolves them against conversation map state.',
                                 'Do not call get_map_layer for style-only edits.',
@@ -4100,10 +4265,15 @@ export const processChatMessageStream = (
                                 ...(shouldOfferMapStyleEdit
                                     ? [
                                         'If the user asks to style by an attribute/field or names a map attribute, call edit_map_style and include attributeKey when you can. The backend can fetch attribute values/stats and build paint expressions.',
+                                        'An attribute may drive any compatible paint property already present in Current map_style, not only color. When the user names opacity, radius, width, stroke, or another paint property, call edit_map_style with attributeKey and the matching exact paintKey from Current map_style.',
                                         'If the user names an attribute value/category and a color, call edit_map_style with attributeKey, attributeValue, and colorKey/colorValue when possible.',
-                                        'For direct paint edits such as set circle-stroke-width to 4 or circle-stroke-color to red, call edit_map_style with paintKey and value when possible. The backend validates the paint key against the current style.',
+                                        'If the user changes one attribute value for a non-color paint property, call edit_map_style with attributeKey, attributeValue, the exact paintKey, and the requested numeric/string value.',
+                                        'If the user asks to change an attribute or map style color like/from/same as/based on the current image, call edit_map_style with colorValue from Latest vision memory dominantColors. Include attributeKey when the user names one.',
+                                        'For direct paint/layout edits, call edit_map_style with paintKey or layoutKey plus value when possible.',
+                                        'If the user asks to add any style property to the current layer, call edit_map_style with operation "add_property" and use the exact paintKey or layoutKey named in the prompt plus value/colorKey/colorValue.',
+                                        'If the user asks to remove any style property from the current layer, call edit_map_style with operation "remove_property" and use the exact paintKey/layoutKey named in the prompt, or removePaintKeys/removeLayoutKeys.',
                                         'Normalize user color language into colorKeys from the style color catalog when possible. If the user asks for a mixed color, send colorKeys plus mix weights, or a valid colorValue hex.',
-                                        'If the user asks to use colors from a previous image/photo, read latestVision.dominantColors from conversation memory and call edit_map_style with colorValue from the best matching dominant color hex.',
+                                        'If the user asks to use/add/apply/change colors from the current or previous image/photo, including wording like "like image", read Latest vision memory dominantColors and call edit_map_style with colorValue from the best matching dominant color hex. Do not answer text-only for this request.',
                                         'If the user names a non-active style such as circle, heatmap, fill, line, or 3d_extrusion, call edit_map_style with target/style wording so the backend can edit that saved style instead of only the latest active style.',
                                         `Available colorKeys: ${JSON.stringify(colorKeys)}`,
                                         `Latest vision memory: ${JSON.stringify(latestVisionForStyle)}`,
@@ -4173,7 +4343,7 @@ export const processChatMessageStream = (
                                 }
                             }
 
-                            if (!savedMapSelectionArgs && isMapOptionPaginationAction && !isGuest) {
+                            if (!savedMapSelectionArgs && isMapOptionPaginationAction) {
                                 const latestMapOptions = await prisma.messages.findFirst({
                                     where: {
                                         conversation_id: convId,
@@ -4264,9 +4434,23 @@ export const processChatMessageStream = (
                             ? await resolveUserMapToolConfigs(userId, mapHeaderApiKey, hasUserMessage ? message : undefined)
                             : [];
                         const mapChoiceContext = buildMapOptionChoiceContext(mapConfigs);
-                        inferredMapArgs = hasUserMessage && mapChoiceContext.length > 0
+                        const inferredFromMessage = hasUserMessage && mapChoiceContext.length > 0
                             ? inferMapArgsFromDbChoiceText(message, mapChoiceContext)
                             : undefined;
+                        const singleResolvedConfig = mapConfigs.length === 1 ? mapConfigs[0] : undefined;
+                        inferredMapArgs = mergeMapToolArgs(
+                            inferredFromMessage,
+                            singleResolvedConfig
+                                ? {
+                                    intentName: singleResolvedConfig.intentName,
+                                    provider: singleResolvedConfig.provider,
+                                    selectedOptions: {
+                                        intentName: singleResolvedConfig.intentName,
+                                        provider: singleResolvedConfig.provider
+                                    }
+                                }
+                                : undefined
+                        );
                         dynamicMapOptionToolSchema = mapConfigs.length > 0
                             ? buildDynamicMapOptionToolSchema(mapConfigs)
                             : mapOptionToolSchema;
@@ -4276,7 +4460,7 @@ export const processChatMessageStream = (
 If the user asks for map/layer data and there is no complete mapSelection yet, do not ask a normal text follow-up first. Call the map_options tool immediately so the backend can return DB/API-backed choices.
 DB-backed map choice context for semantic matching: ${JSON.stringify(mapChoiceContext)}
 Inferred params already extracted from the latest user message by the map inference pass: ${JSON.stringify(inferredMapArgs || {})}
-For VALLARIS, always include the latest user message in query/message when calling map_options or get_map_layer. Pick the intentName by matching the user request with each config's intentName, type, handler, itemType, and optionKey from the DB-backed context. If the config handler is collection_detail or has an itemType such as Tile/CoverageTile, call map_options for layerId choices from the collection endpoint. If the config is a style catalog, the backend will match styleId and ask for map type links. Never expose provider API keys in map_options choices.
+For VALLARIS, always include the latest user message in query/message when calling map_options or get_map_layer. Pick the intentName by matching the user request with each config's intentName, type, handler, itemType, and optionKey from the DB-backed context. If the config handler is collection_detail or has an itemType such as Tile/CoverageTile, call map_options for layerId choices from the collection endpoint. If the UI sends mapSelection key/value filters, keep those selected params so the backend can forward them to the collection endpoint. If the config is a style catalog, the backend will match styleId and ask for map type links. Never expose provider API keys in map_options choices.
 Infer params from the user's wording and the DB-backed enum descriptions in the map_options tool schema, including natural day/date wording into the matching dayPath choice value. Include inferred values in map_options.params. Do not call map_options with empty params when the user's wording already matches a choice. If the user already selected values in mapSelection, keep those values and continue with the next missing option.
 For URL/template placeholders, ask the user using only the DB-backed map_options choices. When hazard/dayPath/type or other required placeholders are complete, call get_map_layer with params.`
                         };
@@ -4366,7 +4550,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             }
                         }
                     }
-                    const mapSelectionContext = mapSelectionPayload
+                    const mapSelectionContext = hasMapSelection
                         ? {
                             role: 'system',
                             content: `The user selected these map options in the UI. Treat these as DB-backed params/options for get_map_layer, validate via map_options if uncertain, and call get_map_layer when every required placeholder is present: ${JSON.stringify(mapSelectionPayload)}`
@@ -4387,16 +4571,16 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                     const messagesForOllama = [
                         systemMessage,
-                        ...sanitizedMessagesForLLM,
+                        ...(shouldIsolateVisionChat ? [] : sanitizedMessagesForLLM),
                         styleReminder,
-                        ...(conversationSummaryContext ? [conversationSummaryContext] : []),
-                        ...(conversationMemoryContext ? [conversationMemoryContext] : []),
-                        ...(retrievedMemoryContext ? [retrievedMemoryContext] : []),
+                        ...(!shouldIsolateVisionChat && conversationSummaryContext ? [conversationSummaryContext] : []),
+                        ...(!shouldIsolateVisionChat && conversationMemoryContext ? [conversationMemoryContext] : []),
+                        ...(!shouldIsolateVisionChat && retrievedMemoryContext ? [retrievedMemoryContext] : []),
                         ...(visionContext ? [visionContext] : []),
-                        ...(mapAccessContext ? [mapAccessContext] : []),
-                        ...(mapSelectionContext ? [mapSelectionContext] : []),
-                        ...(mapToolContext ? [mapToolContext] : []),
-                        ...(mapStyleContext ? [mapStyleContext] : []),
+                        ...(!shouldIsolateVisionChat && mapAccessContext ? [mapAccessContext] : []),
+                        ...(!shouldIsolateVisionChat && mapSelectionContext ? [mapSelectionContext] : []),
+                        ...(!shouldIsolateVisionChat && mapToolContext ? [mapToolContext] : []),
+                        ...(!shouldIsolateVisionChat && mapStyleContext ? [mapStyleContext] : []),
                         ...(lastMessageForLLM ? [lastMessageForLLM] : [])
                     ];
                     // เรียก Ollama แบบ stream เพื่อรับ token ทีละส่วน
@@ -4488,9 +4672,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                                 if (controlResult.success) {
                                     writeSse(controller, 'map_clear', controlResult);
-                                    if (!isGuest) {
-                                        await safeSyncConversationMapClear(convId, controlResult);
-                                    }
+                                    await safeSyncConversationMapClear(convId, controlResult);
                                     mapMetadata = toPrismaJsonObject(controlResult);
 
                                     const postReply = await streamPostMapEventReply('map_clear', controlResult);
@@ -4515,18 +4697,27 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                     typeof aiArguments.instruction === 'string' ? aiArguments.instruction : message,
                                     mapHeaderApiKey
                                 );
-                                const editResult = await handleEditMapStyleTool(
+                                const rawEditResult = await handleEditMapStyleTool(
                                     {
                                         ...enrichedEditArguments,
                                         instruction: typeof enrichedEditArguments.instruction === 'string' ? enrichedEditArguments.instruction : message
                                     },
                                     selectedMapStyle
                                 );
+                                const editResult = rawEditResult.success
+                                    ? mergeMapStyleAttributeVariants(rawEditResult, selectedMapStyle, selectedMapPayload)
+                                    : rawEditResult;
 
                                 if (editResult.success) {
-                                    writeSse(controller, 'map_style', editResult);
-                                    if (!isGuest) {
-                                        await safeSyncConversationMapStyle(convId, editResult);
+                                    writeSse(controller, 'map_style', toPublicMapStyleStreamPayload(editResult));
+                                    const selectedLayerId = getLayerIdFromMapPayload(selectedMapPayload);
+                                    if (conversationMapState) {
+                                        applyMapStyleToState(conversationMapState, editResult, selectedLayerId);
+                                    }
+                                    await safeSyncConversationMapStyle(convId, editResult);
+                                    const editedLayerId = getMapStyleLayerId(editResult);
+                                    if (selectedLayerId && (!editedLayerId || selectedLayerId === editedLayerId)) {
+                                        await safeSyncConversationMapLayerCatalog(convId, selectedMapPayload, editResult);
                                     }
                                     const styleCatalog = await handleStyleCatalogTool();
                                     const suggestionsPayload = await enrichMapSuggestionsWithAttributeValues(

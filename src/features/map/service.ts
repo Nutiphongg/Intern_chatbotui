@@ -30,6 +30,20 @@ const maskApiKey = (apiKey: string): string => {
   return `${cleanApiKey.slice(0, 4)}${"*".repeat(Math.max(cleanApiKey.length - 8, 8))}${cleanApiKey.slice(-4)}`;
 };
 
+const asRecord = (value: unknown): Record<string, unknown> => {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+};
+
+const getHostServiceKeyNames = (serviceConfig: unknown): string[] => {
+  const apiKeys = asRecord(asRecord(serviceConfig).apiKeys);
+  return Object.keys(apiKeys).filter((key) => {
+    const record = asRecord(apiKeys[key]);
+    return typeof record.encryptedKey === "string" && typeof record.iv === "string";
+  });
+};
+
 const toSafeApiKeyResponse = (apiKey: EncryptedApiKeyRecord): ApiKeySummaryResponse => {
   const keyValue = decrypt(apiKey.encryptedKey, apiKey.iv);
 
@@ -44,11 +58,17 @@ const toSafeApiKeyResponse = (apiKey: EncryptedApiKeyRecord): ApiKeySummaryRespo
   };
 };
 export const getActivehosts = async () => {
-  return await prisma.mapconfig_hosts.findMany({
+  const hosts = await prisma.mapconfig_hosts.findMany({
     where: { isActive: true },
-    select: { id: true, provider: true, hostname: true }
+    select: { id: true, provider: true, hostname: true, serviceConfig: true }
   });
+
+  return hosts.map(({ serviceConfig, ...host }) => ({
+    ...host,
+    serviceKeys: getHostServiceKeyNames(serviceConfig)
+  }));
 }
+
 // userapikey
 export const createApiKey = async (data: CreateApiKeyPayload): Promise<CreatedApiKeyResponse> => {
   const provider = normalizeProvider(data.provider);
