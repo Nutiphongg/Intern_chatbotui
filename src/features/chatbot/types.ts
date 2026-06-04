@@ -25,7 +25,12 @@ export const chatRequestSchema = t.Object({
     default: [],
     description: "รูปภาพแบบ data URL/base64 เช่น data:image/jpeg;base64,..."
   })),
-  mapselection: t.Optional(t.Any())
+  mapselection: t.Optional(t.Any()),
+  capabilities: t.Optional(t.Object({
+    mapStylePatch: t.Optional(t.Boolean())
+  }, {
+    additionalProperties: true
+  }))
 }, {
   // ปิดรับ field อื่นที่ไม่กำหนดใน schema  userId
   additionalProperties: false
@@ -55,7 +60,7 @@ export type MapLayerOrderBody = Static<typeof mapLayerOrderBodySchema>;
 export type ChatResponse = ChatResponsePayload;
 export type ChatStreamResponse = ChatStreamPayload;
 
-export type ChatStreamEventName = "meta" | "token" | "ping" | "done" | "error" | "map" | "map_error" | "map_access" | "map_options" | "option_info";
+export type ChatStreamEventName = "meta" | "token" | "ping" | "done" | "error" | "map" | "map_error" | "map_access" | "map_options" | "option_info" | "map_style" | "map_style_patch" | "attribute_values" | "suggestions";
 export type ChatStreamEventData =
   | ChatMetaEvent
   | ChatTokenEvent

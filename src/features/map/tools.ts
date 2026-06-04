@@ -56,11 +56,11 @@ type EditMapStyleArgs = MapToolArgs & {
   layerType?: string;
   styleLayerId?: string;
   colorKey?: string;
-  colorKeys?: unknown;
   colorValue?: string;
   attributeKey?: string;
   attributeType?: string;
   attributeValue?: string | number;
+  attributePatches?: unknown;
   attributeValues?: unknown;
   attributeStats?: unknown;
   outputs?: unknown;
@@ -70,7 +70,6 @@ type EditMapStyleArgs = MapToolArgs & {
   removePaintKeys?: unknown;
   removeLayoutKeys?: unknown;
   value?: unknown;
-  mix?: unknown;
   paint?: unknown;
   layout?: unknown;
 };
@@ -699,23 +698,6 @@ const normalizeColorHex = (value: unknown): string | undefined => {
   return /^#[0-9a-f]{6}$/i.test(color) ? color.toUpperCase() : undefined;
 };
 
-const hexToRgb = (hex: string): [number, number, number] | undefined => {
-  const normalized = normalizeColorHex(hex);
-  if (!normalized) return undefined;
-  return [
-    Number.parseInt(normalized.slice(1, 3), 16),
-    Number.parseInt(normalized.slice(3, 5), 16),
-    Number.parseInt(normalized.slice(5, 7), 16)
-  ];
-};
-
-const rgbToHex = ([red, green, blue]: [number, number, number]): string => {
-  return `#${[red, green, blue]
-    .map((value) => Math.max(0, Math.min(255, Math.round(value))).toString(16).padStart(2, "0"))
-    .join("")
-    .toUpperCase()}`;
-};
-
 const toStringList = (value: unknown): string[] => {
   if (Array.isArray(value)) {
     return value.map(toStringValue).filter((item): item is string => Boolean(item));
@@ -728,43 +710,13 @@ const toUniqueStringList = (...values: unknown[]): string[] => {
   return Array.from(new Set(values.flatMap(toStringList).filter(Boolean)));
 };
 
-const toNumberList = (value: unknown, length: number): number[] => {
-  const values = Array.isArray(value)
-    ? value.map(toNumberValue).filter((item): item is number => item !== undefined)
-    : [];
-  if (values.length !== length) return Array.from({ length }, () => 1 / Math.max(1, length));
-
-  const total = values.reduce((sum, item) => sum + item, 0);
-  if (total <= 0) return Array.from({ length }, () => 1 / Math.max(1, length));
-  return values.map((item) => item / total);
-};
-
 const resolveCatalogColor = (
-  colorKeys: string[],
-  colors: StyleColorEntry[],
-  mix?: unknown
+  colorKey: string | undefined,
+  colors: StyleColorEntry[]
 ): string | undefined => {
+  if (!colorKey) return undefined;
   const palette = new Map(colors.map((color) => [color.key.toLowerCase(), color.value]));
-  const resolvedColors = colorKeys
-    .map((key) => normalizeColorHex(palette.get(key.toLowerCase())))
-    .filter((value): value is string => Boolean(value));
-
-  if (resolvedColors.length === 0) return undefined;
-  if (resolvedColors.length === 1) return resolvedColors[0];
-
-  const weights = toNumberList(mix, resolvedColors.length);
-  const mixed = resolvedColors.reduce<[number, number, number]>((sum, color, index) => {
-    const rgb = hexToRgb(color);
-    if (!rgb) return sum;
-    const weight = weights[index] ?? 0;
-    return [
-      sum[0] + rgb[0] * weight,
-      sum[1] + rgb[1] * weight,
-      sum[2] + rgb[2] * weight
-    ];
-  }, [0, 0, 0]);
-
-  return rgbToHex(mixed);
+  return normalizeColorHex(palette.get(colorKey.toLowerCase()));
 };
 
 const getEditInstruction = (args: EditMapStyleArgs): string => {
@@ -970,26 +922,62 @@ const buildAttributeStopPaintPatch = (
   args: EditMapStyleArgs,
   output?: unknown
 ): Record<string, unknown> => {
-  if (output === undefined) return {};
-
-  const stopEdit = resolveAttributeStopEdit(paint, args);
-  if (!stopEdit) return {};
+  const primaryEdit = output !== undefined ? resolveAttributeStopEdit(paint, args) : undefined;
+  const explicitEdits: Array<{
+    attributeKey: string;
+    attributeValue: unknown;
+    output: unknown;
+    paintKey?: string;
+  }> = Array.isArray(args.attributePatches)
+    ? args.attributePatches
+        .map((item) => pickRecord(item))
+        .reduce<Array<{
+          attributeKey: string;
+          attributeValue: unknown;
+          output: unknown;
+          paintKey?: string;
+        }>>((patches, item) => {
+          const attributeKey = toStringValue(item.attributeKey) || toStringValue(args.attributeKey);
+          const paintKey = toStringValue(item.paintKey) || toStringValue(args.paintKey);
+          const attributeValue = item.attributeValue;
+          const patchOutput = normalizeColorHex(item.colorValue)
+            || normalizeStylePropertyValue(item.output ?? item.value);
+          if (attributeKey && attributeValue !== undefined && patchOutput !== undefined) {
+            patches.push({
+              attributeKey,
+              attributeValue,
+              output: patchOutput,
+              ...(paintKey ? { paintKey } : {})
+            });
+          }
+          return patches;
+        }, [])
+    : [];
+  const edits = [
+    ...(primaryEdit && output !== undefined ? [{ ...primaryEdit, output }] : []),
+    ...explicitEdits
+  ];
+  if (edits.length === 0) return {};
 
   return Object.fromEntries(
     Object.entries(paint)
-      .filter(([paintKey]) => !stopEdit.paintKey || stopEdit.paintKey === paintKey)
-      .filter(([paintKey]) => {
-        const outputIsColor = typeof output === "string" && Boolean(normalizeColorHex(output));
-        return !outputIsColor || paintKey.endsWith("-color");
-      })
       .map(([paintKey, paintValue]) => {
-        const patched = replaceAttributeExpressionStopOutput(
-          paintValue,
-          stopEdit.attributeKey,
-          stopEdit.attributeValue,
-          output
-        );
-        return patched.changed ? [paintKey, patched.value] : undefined;
+        let nextValue = paintValue;
+        let changed = false;
+        for (const edit of edits) {
+          if (edit.paintKey && edit.paintKey !== paintKey) continue;
+          const outputIsColor = typeof edit.output === "string" && Boolean(normalizeColorHex(edit.output));
+          if (outputIsColor && !paintKey.endsWith("-color")) continue;
+          const patched = replaceAttributeExpressionStopOutput(
+            nextValue,
+            edit.attributeKey,
+            edit.attributeValue,
+            edit.output
+          );
+          nextValue = patched.value;
+          changed = changed || patched.changed;
+        }
+        return changed ? [paintKey, nextValue] : undefined;
       })
       .filter((entry): entry is [string, unknown] => Boolean(entry))
   );
@@ -1447,10 +1435,16 @@ const normalizeStylePropertyValue = (value: unknown): unknown => {
 
 const resolveEditMapStyleOperation = (args: EditMapStyleArgs): "add_property" | "remove_property" | "update_layer" => {
   const explicit = normalizeStylePropertyOperation(args.operation || args.action);
-  if (explicit) return explicit;
-
   const instruction = getEditInstruction(args);
   const inferred = inferStylePropertyOperationFromInstruction(instruction);
+
+  if (explicit === "remove_property" || inferred === "remove_property") {
+    return "remove_property";
+  }
+  if (toStringValue(args.attributeKey)) {
+    return "update_layer";
+  }
+  if (explicit) return explicit;
   if (inferred && getInstructionStylePropertyKey(instruction)) return inferred;
 
   return "update_layer";
@@ -1552,7 +1546,7 @@ const buildAttributePaintPatch = async (
   existingPaint: Record<string, unknown>
 ): Promise<Record<string, unknown>> => {
   const attributeKey = toStringValue(args.attributeKey);
-  if (!attributeKey || args.attributeValue !== undefined) return {};
+  if (!attributeKey || args.attributeValue !== undefined || (Array.isArray(args.attributePatches) && args.attributePatches.length > 0)) return {};
 
   const paintKey = resolvePaintKeyByInstruction(existingPaint, args)
     || toStringValue(args.paintKey)
@@ -1612,7 +1606,21 @@ const getPaintPatchForLayerType = async (
   const attributeStopOutput = color ?? normalizeStylePropertyValue(args.value);
   const attributeStopPatch = buildAttributeStopPaintPatch(existingPaint, args, attributeStopOutput);
   const attributePaintPatch = await buildAttributePaintPatch(args, color, existingPaint);
-  const isAttributeStyleRequest = Boolean(toStringValue(args.attributeKey) && args.attributeValue === undefined);
+  const isAttributeValueEdit = Boolean(
+    toStringValue(args.attributeKey)
+    && (
+      args.attributeValue !== undefined
+      || (Array.isArray(args.attributePatches) && args.attributePatches.length > 0)
+    )
+  );
+  if (isAttributeValueEdit) {
+    return attributeStopPatch;
+  }
+  const isAttributeStyleRequest = Boolean(
+    toStringValue(args.attributeKey)
+    && args.attributeValue === undefined
+    && (!Array.isArray(args.attributePatches) || args.attributePatches.length === 0)
+  );
   if (isAttributeStyleRequest && Object.keys(attributePaintPatch).length === 0) {
     return {};
   }
@@ -1653,26 +1661,36 @@ export const handleEditMapStyleTool = async (
   const requestedColorValue = normalizeColorHex(aiArgs.colorValue) || normalizeColorHex(aiArgs.value);
   let catalog = await handleStyleCatalogTool();
   let colors = catalog.success && Array.isArray(catalog.colors) ? catalog.colors : [];
-  const colorKeys = [
-    ...toStringList(aiArgs.colorKeys),
+  const matchedColorKeys = [
     ...toStringList(aiArgs.colorKey),
     ...(toStringValue(aiArgs.paintKey)?.endsWith("-color") ? toStringList(aiArgs.value) : []),
     ...resolveColorKeysFromInstruction(instruction, colors)
   ].filter((key, index, keys) => keys.indexOf(key) === index);
-  let resolvedColor = requestedColorValue || resolveCatalogColor(colorKeys, colors, aiArgs.mix);
-
-  if (!resolvedColor && colorKeys.length > 0) {
-    catalog = await refreshStyleCatalogTool();
-    colors = catalog.success && Array.isArray(catalog.colors) ? catalog.colors : [];
-    resolvedColor = resolveCatalogColor(colorKeys, colors, aiArgs.mix);
-  }
-
-  if (!resolvedColor && colorKeys.length > 0) {
+  const hasAttributePatches = Array.isArray(aiArgs.attributePatches) && aiArgs.attributePatches.length > 0;
+  if (!requestedColorValue && matchedColorKeys.length > 1 && !hasAttributePatches) {
     return {
       success: false,
       event: "map_style",
-      colorKeys,
-      message: `Color ${colorKeys.join(", ")} was not found in the style catalog colors.`
+      message: "Multiple colors require attribute value patches or separate style edit requests."
+    };
+  }
+  let resolvedColor = requestedColorValue || resolveCatalogColor(
+    matchedColorKeys.length === 1 ? matchedColorKeys[0] : undefined,
+    colors
+  );
+
+  if (!resolvedColor && matchedColorKeys.length === 1) {
+    catalog = await refreshStyleCatalogTool();
+    colors = catalog.success && Array.isArray(catalog.colors) ? catalog.colors : [];
+    resolvedColor = resolveCatalogColor(matchedColorKeys[0], colors);
+  }
+
+  if (!resolvedColor && matchedColorKeys.length === 1 && !hasAttributePatches) {
+    return {
+      success: false,
+      event: "map_style",
+      colorKey: matchedColorKeys[0],
+      message: `Color ${matchedColorKeys[0]} was not found in the style catalog colors.`
     };
   }
 
@@ -1717,12 +1735,16 @@ export const handleEditMapStyleTool = async (
   const styleChanged = JSON.stringify(layers) !== JSON.stringify(currentLayers);
 
   if (!styleChanged) {
+    const attributeKey = toStringValue(aiArgs.attributeKey);
+    const attributeValues = getAttributeValuesList(aiArgs.attributeValues);
     return {
       ...currentStyle,
       success: false,
       event: "map_style",
       layerId: currentMapLayerId,
-      message: "No matching paint/layout property was changed for this style edit request."
+      message: attributeKey && aiArgs.attributeValue === undefined && attributeValues.length === 0
+        ? `No values were available to build a style expression for attribute ${attributeKey}.`
+        : "No matching paint/layout property was changed for this style edit request."
     };
   }
 
@@ -1736,7 +1758,7 @@ export const handleEditMapStyleTool = async (
     ...(toStringValue(aiArgs.attributeKey) ? { attributeStyleKey: toStringValue(aiArgs.attributeKey) } : {}),
     ...(toStringValue(aiArgs.attributeType) ? { attributeStyleType: toStringValue(aiArgs.attributeType) } : {}),
     ...(resolvedColor ? { appliedColor: resolvedColor } : {}),
-    ...(colorKeys.length > 0 ? { colorKeys } : {})
+    ...(matchedColorKeys.length === 1 ? { colorKey: matchedColorKeys[0] } : {})
   };
 };
 
@@ -4410,7 +4432,7 @@ const summarizeAttributeValues = (
   attributeType?: string,
   valueKey?: string,
   countKey?: string,
-  limit = 6
+  limit?: number
 ): {
   values: Array<Record<string, unknown>>;
   stats?: { min: number; max: number };
@@ -4432,7 +4454,7 @@ const summarizeAttributeValues = (
   }
 
   const values = Array.from(valuesByKey.values());
-  const realValueLimit = Math.max(limit - 1, 1);
+  const realValueLimit = limit !== undefined ? Math.max(Math.floor(limit), 1) : values.length;
   if (normalizedType !== "number") {
     return {
       values: values
@@ -4679,9 +4701,10 @@ export const handleMapAttributeValuesTool = async (
     const items = extractAttributeValueItems(explorePayload);
     const valueKey = toStringValue(replaceTemplateValue(valueConfig.valueKey, variables));
     const countKey = toStringValue(replaceTemplateValue(valueConfig.countKey, variables)) || attributeKey;
-    const configuredSuggestionLimit = toNumberValue(valueConfig.suggestionLimit) || toNumberValue(valueConfig.valueLimit);
-    const suggestionLimit = Math.min(configuredSuggestionLimit || 6, 6);
-    const summary = summarizeAttributeValues(items, attributeKey, attributeType, valueKey, countKey, suggestionLimit);
+    const configuredValueLimit = attributeType?.toLowerCase() === "number"
+      ? toNumberValue(valueConfig.numericValueLimit) || toNumberValue(valueConfig.valueLimit) || toNumberValue(valueConfig.suggestionLimit)
+      : toNumberValue(valueConfig.valueLimit);
+    const summary = summarizeAttributeValues(items, attributeKey, attributeType, valueKey, countKey, configuredValueLimit);
     const fallbackValue = valueConfig.fallbackValue !== undefined
       ? replaceTemplateValue(valueConfig.fallbackValue, variables)
       : 0;
@@ -4907,7 +4930,7 @@ export const editMapStyleToolSchema = {
   type: "function",
   function: {
     name: "edit_map_style",
-    description: "Edit the latest map style using the existing map_style as the base. Use this when the user wants to change a paint/layout property without calling get_map_layer again. Attributes can drive any compatible existing paint property, not only colors. For example, use attributeKey pv_tn with paintKey circle-opacity or circle-radius. Use paintKey/value, layoutKey/value, paint, or layout for direct property edits. To edit one attribute stop, pass attributeKey and attributeValue.",
+    description: "Edit the latest map style using the existing map_style as the base. Use this when the user wants to change a paint/layout property without calling get_map_layer again. Attributes can drive any compatible existing paint property, not only colors. Use the closest semantically matching exact property key from the current map_style when the user describes a property in natural language. Use paintKey/value, layoutKey/value, paint, or layout for direct property edits. To edit one attribute stop, pass attributeKey and attributeValue.",
     parameters: {
       type: "object",
       properties: {
@@ -4922,7 +4945,7 @@ export const editMapStyleToolSchema = {
         operation: {
           type: "string",
           enum: ["update_layer", "add_property", "remove_property"],
-          description: "Use update_layer for normal edits, add_property to add a paint/layout key to the existing style layer, or remove_property to delete a paint/layout key from the existing style layer."
+          description: "Use update_layer for normal edits, add_property to add a paint/layout key, or remove_property to delete an existing paint/layout key. For remove_property, ignore any value mentioned after the property."
         },
         action: {
           type: "string",
@@ -4957,19 +4980,9 @@ export const editMapStyleToolSchema = {
           type: "string",
           description: "Primary color from the catalog, such as black, red, or gray"
         },
-        colorKeys: {
-          type: "array",
-          items: { type: "string" },
-          description: "Multiple catalog colors for mixing, such as [black, gray]"
-        },
-        mix: {
-          type: "array",
-          items: { type: "number" },
-          description: "Color mixing weights, such as [0.75, 0.25]"
-        },
         colorValue: {
           type: "string",
-          description: "A validated hex color, such as #1F2937. Use when the user gives a specific color or the chatbot chooses a mixed color."
+          description: "A validated hex color, such as #1F2937."
         },
         attributeKey: {
           type: "string",
@@ -4982,6 +4995,22 @@ export const editMapStyleToolSchema = {
         attributeValue: {
           oneOf: [{ type: "string" }, { type: "number" }],
           description: "The exact stop/category value in an existing attribute paint expression to edit, such as 315."
+        },
+        attributePatches: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              attributeKey: { type: "string" },
+              attributeValue: { oneOf: [{ type: "string" }, { type: "number" }] },
+              paintKey: { type: "string" },
+              output: {},
+              value: {},
+              colorValue: { type: "string" }
+            },
+            required: ["attributeValue"]
+          },
+          description: "Multiple attribute stop/category edits applied in one call. Each item supplies attributeValue and output/value/colorValue; attributeKey and paintKey inherit from the top-level arguments when omitted."
         },
         attributeValues: {
           type: "array",
@@ -5002,7 +5031,7 @@ export const editMapStyleToolSchema = {
         },
         paintKey: {
           type: "string",
-          description: "MapLibre paint key to edit or drive from attribute values, such as circle-color, circle-opacity, circle-radius, or circle-stroke-width."
+          description: "Exact MapLibre paint key from the current map_style to edit, remove, or drive from attribute values. When the user uses a natural-language visual term, choose the closest semantically matching existing paint key."
         },
         layoutKey: {
           type: "string",
