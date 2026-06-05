@@ -1,6 +1,7 @@
 ﻿import { prisma } from "../setup/prisma";
 import { decrypt, hashApiKey } from "../setup/encryption";
 import { env } from "../../lib/env";
+import { createExpression } from "@maplibre/maplibre-gl-style-spec";
 import type {
   MapToolArgs,
   MapOptionInfo,
@@ -72,9 +73,14 @@ type EditMapStyleArgs = MapToolArgs & {
   value?: unknown;
   paint?: unknown;
   layout?: unknown;
+  filter?: unknown;
+  filterLogic?: string;
+  filterConditions?: unknown;
+  attributeFields?: unknown;
 };
 
 type StylePropertyKind = "paint" | "layout";
+type EditMapStyleOperation = "add_property" | "remove_property" | "update_layer" | "set_filter" | "add_filter" | "remove_filter" | "clear_filter";
 
 let mapLibreStyleSpecCache: Record<string, unknown> | null | undefined;
 
@@ -1101,7 +1107,7 @@ const buildExplicitPaintColorPatch = (
   if (!paintKey || !paintKey.endsWith("-color")) return {};
 
   return {
-    [paintKey]: color
+    [paintKey]: paintKey === "heatmap-color" ? buildHeatmapColorRamp(color) : color
   };
 };
 
@@ -1128,7 +1134,7 @@ const buildExplicitGenericPaintPatch = (
   if (!paintKey) return {};
 
   if (paintKey.endsWith("-color") && color) {
-    return { [paintKey]: color };
+    return { [paintKey]: paintKey === "heatmap-color" ? buildHeatmapColorRamp(color) : color };
   }
 
   const value = parseGenericPaintValue(args);
@@ -1309,10 +1315,17 @@ const getRequestedStylePropertyKeys = (...values: unknown[]): string[] => {
   ));
 };
 
-const normalizeStylePropertyOperation = (value: unknown): "add_property" | "remove_property" | undefined => {
+const normalizeStylePropertyOperation = (value: unknown): EditMapStyleOperation | undefined => {
   const normalized = toStringValue(value)?.trim().toLowerCase().replace(/[\s-]+/g, "_");
-  if (normalized === "add_property") return "add_property";
-  if (normalized === "remove_property") return "remove_property";
+  if (
+    normalized === "add_property"
+    || normalized === "remove_property"
+    || normalized === "update_layer"
+    || normalized === "set_filter"
+    || normalized === "add_filter"
+    || normalized === "remove_filter"
+    || normalized === "clear_filter"
+  ) return normalized;
   return undefined;
 };
 
@@ -1433,11 +1446,14 @@ const normalizeStylePropertyValue = (value: unknown): unknown => {
   return value;
 };
 
-const resolveEditMapStyleOperation = (args: EditMapStyleArgs): "add_property" | "remove_property" | "update_layer" => {
+const resolveEditMapStyleOperation = (args: EditMapStyleArgs): EditMapStyleOperation => {
   const explicit = normalizeStylePropertyOperation(args.operation || args.action);
   const instruction = getEditInstruction(args);
   const inferred = inferStylePropertyOperationFromInstruction(instruction);
 
+  if (explicit === "set_filter" || explicit === "add_filter" || explicit === "remove_filter" || explicit === "clear_filter") {
+    return explicit;
+  }
   if (explicit === "remove_property" || inferred === "remove_property") {
     return "remove_property";
   }
@@ -1448,6 +1464,164 @@ const resolveEditMapStyleOperation = (args: EditMapStyleArgs): "add_property" | 
   if (inferred && getInstructionStylePropertyKey(instruction)) return inferred;
 
   return "update_layer";
+};
+
+const FILTER_COMPARISON_OPERATORS = new Set(["==", "!=", ">", ">=", "<", "<=", "in", "!in"]);
+const FILTER_LOGIC_OPERATORS = new Set(["all", "any"]);
+
+const normalizeFilterLogic = (value: unknown): "all" | "any" => {
+  const logic = toStringValue(value)?.toLowerCase();
+  return logic && FILTER_LOGIC_OPERATORS.has(logic) ? logic as "all" | "any" : "all";
+};
+
+const normalizeFilterConditionValue = (value: unknown, fieldType: string | undefined): unknown => {
+  const normalizedType = fieldType?.trim().toLowerCase();
+  if (normalizedType === "number") return toNumberValue(value);
+  if (normalizedType === "boolean") {
+    if (typeof value === "boolean") return value;
+    const normalized = toStringValue(value)?.toLowerCase();
+    if (normalized === "true") return true;
+    if (normalized === "false") return false;
+    return undefined;
+  }
+  return value;
+};
+
+const getFilterAttributeFields = (args: EditMapStyleArgs): Record<string, string> => {
+  return Object.fromEntries(
+    Object.entries(pickRecord(args.attributeFields)).flatMap(([key, definition]) => {
+      const type = typeof definition === "string"
+        ? definition
+        : toStringValue(pickRecord(definition).type);
+      return type ? [[key, type]] : [];
+    })
+  );
+};
+
+const buildFilterConditionExpression = (
+  condition: unknown,
+  attributeFields: Record<string, string>
+): unknown[] | undefined => {
+  const record = pickRecord(condition);
+  const attributeKey = toStringValue(record.attributeKey || record.field || record.key);
+  const operator = toStringValue(record.operator);
+  if (!attributeKey || !operator || !FILTER_COMPARISON_OPERATORS.has(operator)) return undefined;
+
+  const fieldType = attributeFields[attributeKey];
+  if (!fieldType) return undefined;
+
+  if (operator === "in" || operator === "!in") {
+    const rawValues = Array.isArray(record.values)
+      ? record.values
+      : Array.isArray(record.value)
+        ? record.value
+        : [record.value];
+    const values = rawValues
+      .map((value) => normalizeFilterConditionValue(value, fieldType))
+      .filter((value) => value !== undefined);
+    return values.length > 0 ? [operator, ["get", attributeKey], ["literal", values]] : undefined;
+  }
+
+  const value = normalizeFilterConditionValue(record.value, fieldType);
+  return value !== undefined ? [operator, ["get", attributeKey], value] : undefined;
+};
+
+const buildStructuredFilterExpression = (args: EditMapStyleArgs): unknown[] | undefined => {
+  const conditions = Array.isArray(args.filterConditions) ? args.filterConditions : [];
+  const attributeFields = getFilterAttributeFields(args);
+  if (conditions.length === 0 || Object.keys(attributeFields).length === 0) return undefined;
+
+  const expressions = conditions
+    .map((condition) => buildFilterConditionExpression(condition, attributeFields))
+    .filter((condition): condition is unknown[] => Boolean(condition));
+  if (expressions.length !== conditions.length || expressions.length === 0) return undefined;
+  if (expressions.length === 1) return expressions[0];
+
+  return [normalizeFilterLogic(args.filterLogic), ...expressions];
+};
+
+const getFilterExpressionAttributes = (filter: unknown): string[] => {
+  if (!Array.isArray(filter)) return [];
+  const attributes: string[] = [];
+  if (filter[0] === "get") {
+    const attribute = toStringValue(filter[1]);
+    if (attribute) attributes.push(attribute);
+  }
+  for (const item of filter) attributes.push(...getFilterExpressionAttributes(item));
+  return Array.from(new Set(attributes));
+};
+
+const isValidFilterExpression = (filter: unknown, attributeFields: Record<string, string>): filter is unknown[] => {
+  if (!Array.isArray(filter) || filter.length === 0) return false;
+  const attributes = getFilterExpressionAttributes(filter);
+  if (attributes.length === 0 || !attributes.every((attribute) => attributeFields[attribute] !== undefined)) return false;
+  return createExpression(filter).result === "success";
+};
+
+const flattenFilterConditions = (filter: unknown): unknown[][] => {
+  if (!Array.isArray(filter) || filter.length === 0) return [];
+  return FILTER_LOGIC_OPERATORS.has(String(filter[0]))
+    ? filter.slice(1).filter(Array.isArray) as unknown[][]
+    : [filter];
+};
+
+const getFilterLogic = (filter: unknown, requestedLogic: unknown): "all" | "any" => {
+  const explicitLogic = toStringValue(requestedLogic)?.toLowerCase();
+  if (explicitLogic && FILTER_LOGIC_OPERATORS.has(explicitLogic)) {
+    return explicitLogic as "all" | "any";
+  }
+  const currentLogic = Array.isArray(filter) ? toStringValue(filter[0])?.toLowerCase() : undefined;
+  return currentLogic && FILTER_LOGIC_OPERATORS.has(currentLogic)
+    ? currentLogic as "all" | "any"
+    : "all";
+};
+
+const applyFilterOperation = (
+  layer: Record<string, unknown>,
+  args: EditMapStyleArgs,
+  operation: Extract<EditMapStyleOperation, "set_filter" | "add_filter" | "remove_filter" | "clear_filter">
+): Record<string, unknown> => {
+  if (operation === "clear_filter") {
+    const { filter: _removedFilter, ...rest } = layer;
+    return rest;
+  }
+
+  const attributeFields = getFilterAttributeFields(args);
+  const directFilter = args.filter;
+  const candidateFilter = isValidFilterExpression(directFilter, attributeFields)
+    ? directFilter
+    : buildStructuredFilterExpression(args);
+  const requestedFilter = isValidFilterExpression(candidateFilter, attributeFields) ? candidateFilter : undefined;
+  if (!requestedFilter) return layer;
+
+  if (operation === "set_filter") return { ...layer, filter: requestedFilter };
+
+  const currentConditions = flattenFilterConditions(layer.filter);
+  const requestedConditions = flattenFilterConditions(requestedFilter);
+  const filterLogic = getFilterLogic(layer.filter, args.filterLogic);
+  if (operation === "add_filter") {
+    const combined = [...currentConditions];
+    for (const condition of requestedConditions) {
+      if (!combined.some((item) => JSON.stringify(item) === JSON.stringify(condition))) combined.push(condition);
+    }
+    return {
+      ...layer,
+      filter: combined.length === 1 ? combined[0] : [filterLogic, ...combined]
+    };
+  }
+
+  const remaining = currentConditions.filter((condition) => (
+    !requestedConditions.some((requested) => JSON.stringify(requested) === JSON.stringify(condition))
+  ));
+  if (remaining.length === currentConditions.length) return layer;
+  if (remaining.length === 0) {
+    const { filter: _removedFilter, ...rest } = layer;
+    return rest;
+  }
+  return {
+    ...layer,
+    filter: remaining.length === 1 ? remaining[0] : [filterLogic, ...remaining]
+  };
 };
 
 const buildPropertyAddPatch = (
@@ -1658,58 +1832,73 @@ export const handleEditMapStyleTool = async (
   }
 
   const instruction = getEditInstruction(aiArgs);
+  const operation = resolveEditMapStyleOperation(aiArgs);
+  const isFilterOperation = operation === "set_filter"
+    || operation === "add_filter"
+    || operation === "remove_filter"
+    || operation === "clear_filter";
   const requestedColorValue = normalizeColorHex(aiArgs.colorValue) || normalizeColorHex(aiArgs.value);
-  let catalog = await handleStyleCatalogTool();
-  let colors = catalog.success && Array.isArray(catalog.colors) ? catalog.colors : [];
-  const matchedColorKeys = [
-    ...toStringList(aiArgs.colorKey),
-    ...(toStringValue(aiArgs.paintKey)?.endsWith("-color") ? toStringList(aiArgs.value) : []),
-    ...resolveColorKeysFromInstruction(instruction, colors)
-  ].filter((key, index, keys) => keys.indexOf(key) === index);
   const hasAttributePatches = Array.isArray(aiArgs.attributePatches) && aiArgs.attributePatches.length > 0;
-  if (!requestedColorValue && matchedColorKeys.length > 1 && !hasAttributePatches) {
-    return {
-      success: false,
-      event: "map_style",
-      message: "Multiple colors require attribute value patches or separate style edit requests."
-    };
-  }
-  let resolvedColor = requestedColorValue || resolveCatalogColor(
-    matchedColorKeys.length === 1 ? matchedColorKeys[0] : undefined,
-    colors
-  );
+  let matchedColorKeys: string[] = [];
+  let resolvedColor = requestedColorValue;
+  if (!isFilterOperation) {
+    let catalog = await handleStyleCatalogTool();
+    let colors = catalog.success && Array.isArray(catalog.colors) ? catalog.colors : [];
+    matchedColorKeys = [
+      ...toStringList(aiArgs.colorKey),
+      ...(toStringValue(aiArgs.paintKey)?.endsWith("-color") ? toStringList(aiArgs.value) : []),
+      ...resolveColorKeysFromInstruction(instruction, colors)
+    ].filter((key, index, keys) => keys.indexOf(key) === index);
+    if (!requestedColorValue && matchedColorKeys.length > 1 && !hasAttributePatches) {
+      return {
+        success: false,
+        event: "map_style",
+        message: "Multiple colors require attribute value patches or separate style edit requests."
+      };
+    }
+    resolvedColor = requestedColorValue || resolveCatalogColor(
+      matchedColorKeys.length === 1 ? matchedColorKeys[0] : undefined,
+      colors
+    );
 
-  if (!resolvedColor && matchedColorKeys.length === 1) {
-    catalog = await refreshStyleCatalogTool();
-    colors = catalog.success && Array.isArray(catalog.colors) ? catalog.colors : [];
-    resolvedColor = resolveCatalogColor(matchedColorKeys[0], colors);
-  }
+    if (!resolvedColor && matchedColorKeys.length === 1) {
+      catalog = await refreshStyleCatalogTool();
+      colors = catalog.success && Array.isArray(catalog.colors) ? catalog.colors : [];
+      resolvedColor = resolveCatalogColor(matchedColorKeys[0], colors);
+    }
 
-  if (!resolvedColor && matchedColorKeys.length === 1 && !hasAttributePatches) {
-    return {
-      success: false,
-      event: "map_style",
-      colorKey: matchedColorKeys[0],
-      message: `Color ${matchedColorKeys[0]} was not found in the style catalog colors.`
-    };
+    if (!resolvedColor && matchedColorKeys.length === 1 && !hasAttributePatches) {
+      return {
+        success: false,
+        event: "map_style",
+        colorKey: matchedColorKeys[0],
+        message: `Color ${matchedColorKeys[0]} was not found in the style catalog colors.`
+      };
+    }
   }
 
   const requestedLayerId = toStringValue(aiArgs.layerId) || toStringValue(pickRecord(aiArgs.params).layerId);
   const currentMapLayerId = toStringValue(currentStyle.layerId) || requestedLayerId;
   const target = toStringValue(aiArgs.target)?.toLowerCase();
-  const operation = resolveEditMapStyleOperation(aiArgs);
-  const officialStyleSpec = await loadMapLibreStyleSpec();
+  const officialStyleSpec = isFilterOperation ? undefined : await loadMapLibreStyleSpec();
+  let matchedFilterLayer = false;
 
   const patchLayer = async (layer: unknown) => {
     const layerRecord = pickRecord(layer);
     const layerType = toStringValue(layerRecord.type) || "";
     const styleLayerId = toStringValue(aiArgs.styleLayerId);
-    const targetMatches = !target
-      || target === layerType.toLowerCase()
-      || target === toStringValue(layerRecord.id)?.toLowerCase()
-      || (styleLayerId && styleLayerId === toStringValue(layerRecord.id));
+    const targetMatches = styleLayerId
+      ? styleLayerId === toStringValue(layerRecord.id)
+      : !target
+        || target === layerType.toLowerCase()
+        || target === toStringValue(layerRecord.id)?.toLowerCase();
 
     if (!targetMatches) return layerRecord;
+
+    if (operation === "set_filter" || operation === "add_filter" || operation === "remove_filter" || operation === "clear_filter") {
+      matchedFilterLayer = true;
+      return applyFilterOperation(layerRecord, aiArgs, operation);
+    }
 
     if (operation === "add_property" || operation === "remove_property") {
       return applyStylePropertyOperation(layerRecord, aiArgs, operation, resolvedColor, officialStyleSpec);
@@ -1734,6 +1923,17 @@ export const handleEditMapStyleTool = async (
   }));
   const styleChanged = JSON.stringify(layers) !== JSON.stringify(currentLayers);
 
+  if (!styleChanged && operation === "clear_filter" && matchedFilterLayer) {
+    return {
+      ...currentStyle,
+      success: true,
+      event: "map_style",
+      layerId: currentMapLayerId,
+      layers,
+      styleInstruction: instruction
+    };
+  }
+
   if (!styleChanged) {
     const attributeKey = toStringValue(aiArgs.attributeKey);
     const attributeValues = getAttributeValuesList(aiArgs.attributeValues);
@@ -1744,7 +1944,9 @@ export const handleEditMapStyleTool = async (
       layerId: currentMapLayerId,
       message: attributeKey && aiArgs.attributeValue === undefined && attributeValues.length === 0
         ? `No values were available to build a style expression for attribute ${attributeKey}.`
-        : "No matching paint/layout property was changed for this style edit request."
+        : operation.endsWith("_filter")
+          ? "No matching map filter was changed for this request."
+          : "No matching paint/layout property was changed for this style edit request."
     };
   }
 
@@ -4930,7 +5132,7 @@ export const editMapStyleToolSchema = {
   type: "function",
   function: {
     name: "edit_map_style",
-    description: "Edit the latest map style using the existing map_style as the base. Use this when the user wants to change a paint/layout property without calling get_map_layer again. Attributes can drive any compatible existing paint property, not only colors. Use the closest semantically matching exact property key from the current map_style when the user describes a property in natural language. Use paintKey/value, layoutKey/value, paint, or layout for direct property edits. To edit one attribute stop, pass attributeKey and attributeValue.",
+    description: "Edit the latest map style using the existing map_style as the base. Use this for paint/layout edits and feature filter operations without calling get_map_layer again. Attributes can drive compatible paint properties or structured filter conditions. Use paintKey/value, layoutKey/value, paint, or layout for direct property edits. Use set_filter/add_filter/remove_filter/clear_filter with filterConditions to control which features render.",
     parameters: {
       type: "object",
       properties: {
@@ -4944,12 +5146,12 @@ export const editMapStyleToolSchema = {
         },
         operation: {
           type: "string",
-          enum: ["update_layer", "add_property", "remove_property"],
-          description: "Use update_layer for normal edits, add_property to add a paint/layout key, or remove_property to delete an existing paint/layout key. For remove_property, ignore any value mentioned after the property."
+          enum: ["update_layer", "add_property", "remove_property", "set_filter", "add_filter", "remove_filter", "clear_filter"],
+          description: "Use update_layer for normal edits, add_property/remove_property for paint/layout keys, and set_filter/add_filter/remove_filter/clear_filter for feature visibility filters."
         },
         action: {
           type: "string",
-          enum: ["update_layer", "add_property", "remove_property"],
+          enum: ["update_layer", "add_property", "remove_property", "set_filter", "add_filter", "remove_filter", "clear_filter"],
           description: "Alias for operation."
         },
         styleLayerId: {
@@ -5058,6 +5260,33 @@ export const editMapStyleToolSchema = {
         layout: {
           type: "object",
           description: "MapLibre layout properties to merge directly"
+        },
+        filter: {
+          type: "array",
+          items: {},
+          description: "Optional complete MapLibre filter expression. Prefer filterConditions when possible."
+        },
+        filterLogic: {
+          type: "string",
+          enum: ["all", "any"],
+          description: "Logic used to combine multiple filter conditions."
+        },
+        filterConditions: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              attributeKey: { type: "string" },
+              operator: {
+                type: "string",
+                enum: ["==", "!=", ">", ">=", "<", "<=", "in", "!in"]
+              },
+              value: {},
+              values: { type: "array", items: {} }
+            },
+            required: ["attributeKey", "operator"]
+          },
+          description: "Structured feature filter conditions. Attribute names and types are validated against the selected layer catalog."
         }
       },
       required: []
