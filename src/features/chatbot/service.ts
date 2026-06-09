@@ -1802,6 +1802,22 @@ const getLatestMapStyleFromMessages = (messages: Array<{ role: string; content: 
     return undefined;
 };
 
+const getMapStyleFromMessageMetadata = (metadata: unknown): Record<string, unknown> | undefined => {
+    const record = asRecord(metadata);
+    const mapStyle = record.mapStyle || (record.event === 'map_style' ? record : undefined);
+    const mapStyleRecord = asRecord(mapStyle);
+    const layers = Array.isArray(mapStyleRecord.layers) ? mapStyleRecord.layers : [];
+    return Object.keys(mapStyleRecord).length > 0 && layers.length > 0
+        ? mapStyleRecord
+        : undefined;
+};
+
+const toPublicMapStylePayload = (payload: unknown): unknown => {
+    const payloadRecord = asRecord(payload);
+    const { attributeStyleVariants, ...publicPayload } = payloadRecord;
+    return publicPayload;
+};
+
 const getLatestMapPayloadFromMessages = (messages: Array<{ role: string; content: string }>): unknown | undefined => {
     const removedLayerIds = new Set<string>();
 
@@ -2309,18 +2325,79 @@ const normalizeSuggestionColorValue = (value: unknown): string | undefined => {
     return undefined;
 };
 
-const getPrimaryColorFromPaintValue = (value: unknown): string | undefined => {
+const normalizeStyleOutputColorValue = (value: unknown): string | undefined => {
     const directColor = normalizeSuggestionColorValue(value);
     if (directColor) return directColor;
 
-    if (!Array.isArray(value)) return undefined;
-
-    for (let index = value.length - 1; index >= 0; index -= 1) {
-        const color = normalizeSuggestionColorValue(value[index]);
+    const record = asRecord(value);
+    for (const key of ['colorValue', 'color', 'value', 'output']) {
+        const color = normalizeSuggestionColorValue(record[key]);
         if (color) return color;
     }
 
     return undefined;
+};
+
+const getPrimaryColorFromPaintValue = (value: unknown): string | undefined => {
+    const directColor = normalizeStyleOutputColorValue(value);
+    if (directColor) return directColor;
+
+    if (!Array.isArray(value)) return undefined;
+
+    const colors = value
+        .map((item) => isTransparentColorValue(item) ? undefined : normalizeStyleOutputColorValue(item))
+        .filter((item): item is string => Boolean(item));
+    if (colors.length === 0) return undefined;
+    const colorCounts = colors.map((color) => ({
+        color,
+        count: colors.filter((item) => item === color).length
+    }));
+    const repeatedColor = colorCounts.find((item) => item.count > 1);
+    if (repeatedColor) return repeatedColor.color;
+
+    for (let index = value.length - 1; index >= 0; index -= 1) {
+        const color = isTransparentColorValue(value[index]) ? undefined : normalizeStyleOutputColorValue(value[index]);
+        if (color) return color;
+    }
+
+    return undefined;
+};
+
+const isTransparentColorValue = (value: unknown): boolean => {
+    if (typeof value !== 'string') return false;
+    const normalized = value.trim().toLowerCase().replace(/\s+/g, '');
+    if (normalized === 'transparent') return true;
+    const rgbaMatch = normalized.match(/^rgba\([^,]+,[^,]+,[^,]+,([^)]+)\)$/);
+    return rgbaMatch ? Number(rgbaMatch[1]) === 0 : false;
+};
+
+const replacePaintColors = (value: unknown, color: string): unknown => {
+    if (typeof value === 'string') {
+        if (isTransparentColorValue(value)) return value;
+        return normalizeSuggestionColorValue(value) || /^rgba?\(/i.test(value.trim())
+            ? color
+            : value;
+    }
+
+    if (Array.isArray(value)) {
+        return value.map((item) => replacePaintColors(item, color));
+    }
+
+    const record = asRecord(value);
+    if (Object.keys(record).length > 0) {
+        let changed = false;
+        const next = Object.fromEntries(
+            Object.entries(record).map(([key, nestedValue]) => {
+                const nestedColor = normalizeStyleOutputColorValue(nestedValue);
+                if (!nestedColor) return [key, nestedValue];
+                changed = true;
+                return [key, color];
+            })
+        );
+        return changed ? next : value;
+    }
+
+    return value;
 };
 
 const getCurrentMapStyleColor = (mapStyle: unknown): string | undefined => {
@@ -2526,9 +2603,440 @@ const getMapStyleAttributeKey = (value: unknown): string | undefined => {
     return undefined;
 };
 
+const getMapStyleExpressionOutputKind = (value: unknown): 'color' | 'number' | 'boolean' | 'string' | undefined => {
+    if (typeof value === 'number') return 'number';
+    if (typeof value === 'boolean') return 'boolean';
+    if (typeof value === 'string') return normalizeSuggestionColorValue(value) ? 'color' : 'string';
+    if (!Array.isArray(value)) return undefined;
+
+    const outputs: Array<'color' | 'number' | 'boolean' | 'string'> = [];
+    const [operator] = value;
+    const startIndex = operator === 'interpolate' ? 3 : operator === 'match' ? 2 : -1;
+    if (startIndex >= 0) {
+        for (let index = startIndex + 1; index < value.length; index += 2) {
+            const outputKind = getMapStyleExpressionOutputKind(value[index]);
+            if (outputKind) outputs.push(outputKind);
+        }
+    }
+
+    if (outputs.length === 0) return undefined;
+    return outputs.every((item) => item === outputs[0]) ? outputs[0] : undefined;
+};
+
+const isMapStyleAttributeExpression = (value: unknown): boolean => {
+    return Array.isArray(value) && Boolean(getMapStyleAttributeKey(value));
+};
+
+const getPaintKeyRole = (paintKey: string, value: unknown): string | undefined => {
+    const outputKind = getMapStyleExpressionOutputKind(value);
+    const parts = paintKey.split('-').filter(Boolean);
+    const keyRole = parts.length > 1 ? parts[parts.length - 1] : undefined;
+    if (outputKind === 'color') return 'color';
+    return keyRole || outputKind;
+};
+
+const collectAttributePaintExpressions = (
+    paint: Record<string, unknown>
+): Array<{ paintKey: string; value: unknown; role?: string }> => {
+    return Object.entries(paint)
+        .filter(([, value]) => isMapStyleAttributeExpression(value))
+        .map(([paintKey, value]) => ({
+            paintKey,
+            value,
+            role: getPaintKeyRole(paintKey, value)
+        }));
+};
+
+const findPresetPaintTargetKey = (
+    source: { paintKey: string; value: unknown; role?: string },
+    presetPaint: Record<string, unknown>,
+    usedTargets: Set<string>
+): string | undefined => {
+    if (presetPaint[source.paintKey] !== undefined && !usedTargets.has(source.paintKey)) {
+        return source.paintKey;
+    }
+
+    if (!source.role) return undefined;
+
+    return Object.entries(presetPaint)
+        .find(([candidateKey, candidateValue]) => (
+            !usedTargets.has(candidateKey)
+            && (!Array.isArray(candidateValue) || isMapStyleAttributeExpression(candidateValue))
+            && getPaintKeyRole(candidateKey, candidateValue) === source.role
+        ))?.[0];
+};
+
+const getFilterEqualityAttributeValue = (
+    filter: unknown
+): { attributeKey: string; value: unknown } | undefined => {
+    if (!Array.isArray(filter)) return undefined;
+    const [operator, left, right] = filter;
+    if (operator === '==' && getMapStyleAttributeKey(left) && right !== undefined) {
+        return {
+            attributeKey: getMapStyleAttributeKey(left)!,
+            value: right
+        };
+    }
+
+    for (const item of filter.slice(1)) {
+        const found = getFilterEqualityAttributeValue(item);
+        if (found) return found;
+    }
+
+    return undefined;
+};
+
+const getLayerPrimaryColor = (layer: Record<string, unknown>): string | undefined => {
+    const paint = asRecord(layer.paint);
+    for (const [key, value] of Object.entries(paint)) {
+        if (!key.endsWith('-color')) continue;
+        const color = getPrimaryColorFromPaintValue(value);
+        if (color) return color;
+    }
+    return undefined;
+};
+
+const collectFilteredAttributeColorStops = (
+    layers: Array<Record<string, unknown>>
+): Map<string, Array<{ value: unknown; color: string }>> => {
+    const stopsByAttribute = new Map<string, Array<{ value: unknown; color: string }>>();
+    for (const layer of layers) {
+        const filterMatch = getFilterEqualityAttributeValue(layer.filter);
+        const color = getLayerPrimaryColor(layer);
+        if (!filterMatch || !color) continue;
+
+        const stops = stopsByAttribute.get(filterMatch.attributeKey) || [];
+        const serializedValue = JSON.stringify(filterMatch.value);
+        if (!stops.some((item) => JSON.stringify(item.value) === serializedValue)) {
+            stops.push({ value: filterMatch.value, color });
+        }
+        stopsByAttribute.set(filterMatch.attributeKey, stops);
+    }
+    return stopsByAttribute;
+};
+
+const collectExpressionAttributeColorStops = (
+    mapStyle: unknown,
+    preferredAttribute?: string
+): { attributeKey: string; stops: Array<{ value: unknown; color: string }>; fallbackColor?: string } | undefined => {
+    const styleRecord = asRecord(mapStyle);
+    const activeLayers = Array.isArray(styleRecord.layers) ? styleRecord.layers : [];
+    const valuesByAttribute = collectMapStyleAttributeValues({ layers: activeLayers });
+    const attributeKeys = [
+        ...(preferredAttribute ? [preferredAttribute] : []),
+        ...Array.from(valuesByAttribute.keys())
+    ].filter((key, index, keys) => keys.indexOf(key) === index);
+
+    for (const attributeKey of attributeKeys) {
+        const values = valuesByAttribute.get(attributeKey) || [];
+        const stops = values
+            .map((item) => {
+                const color = normalizeStyleOutputColorValue(item.output);
+                return color ? { value: item.value, color } : undefined;
+            })
+            .filter((item): item is { value: unknown; color: string } => Boolean(item))
+            .filter((item, index, items) => {
+                const serializedValue = JSON.stringify(item.value);
+                return items.findIndex((candidate) => JSON.stringify(candidate.value) === serializedValue) === index;
+            });
+        if (stops.length > 0) {
+            const fallbackColor = activeLayers
+                .map((layer) => getAttributeColorExpressionFallback(asRecord(layer).paint, attributeKey))
+                .find(Boolean);
+            return {
+                attributeKey,
+                stops,
+                ...(fallbackColor ? { fallbackColor } : {})
+            };
+        }
+    }
+
+    return undefined;
+};
+
+const getAttributeColorExpressionFallback = (
+    value: unknown,
+    attributeKey: string
+): string | undefined => {
+    if (Array.isArray(value)) {
+        const [operator] = value;
+        const expressionAttribute = operator === 'match'
+            ? getMapStyleAttributeKey(value[1])
+            : operator === 'interpolate'
+                ? getMapStyleAttributeKey(value[2])
+                : undefined;
+        if (expressionAttribute === attributeKey) {
+            const fallbackColor = operator === 'match'
+                ? normalizeStyleOutputColorValue(value[value.length - 1])
+                : undefined;
+            if (fallbackColor) return fallbackColor;
+        }
+
+        for (const item of value) {
+            const fallbackColor = getAttributeColorExpressionFallback(item, attributeKey);
+            if (fallbackColor) return fallbackColor;
+        }
+        return undefined;
+    }
+
+    const record = asRecord(value);
+    for (const nestedValue of Object.values(record)) {
+        const fallbackColor = getAttributeColorExpressionFallback(nestedValue, attributeKey);
+        if (fallbackColor) return fallbackColor;
+    }
+
+    return undefined;
+};
+
+const combineMapStyleFilters = (existingFilter: unknown, nextFilter: unknown): unknown => {
+    if (existingFilter === undefined || existingFilter === null) return nextFilter;
+    return ['all', existingFilter, nextFilter];
+};
+
+const buildExcludeAttributeValuesFilter = (
+    attributeKey: string,
+    values: unknown[]
+): unknown | undefined => {
+    const conditions = values.map((value) => ['!=', ['get', attributeKey], value]);
+    if (conditions.length === 0) return undefined;
+    return conditions.length === 1 ? conditions[0] : ['all', ...conditions];
+};
+
+const buildStyleLayerIdSuffix = (value: unknown, index: number): string => {
+    const text = toSuggestionString(value) || String(index);
+    return text.toLowerCase().replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '') || String(index);
+};
+
+const buildFallbackLayerPaint = (
+    paint: Record<string, unknown>,
+    colorPaintKey: string,
+    colorPaintValue: unknown,
+    color: string
+): Record<string, unknown> => {
+    return Object.fromEntries(
+        Object.entries({
+            ...paint,
+            [colorPaintKey]: replacePaintColors(colorPaintValue, color)
+        }).map(([key, value]) => {
+            if (!key.endsWith('-opacity') || typeof value !== 'number') return [key, value];
+            return [key, Math.max(0, Math.min(1, value / 4))];
+        })
+    );
+};
+
+const buildFilteredAttributeColorLayers = (
+    layer: Record<string, unknown>,
+    currentStyle: unknown,
+    preferredAttribute?: string
+): Array<Record<string, unknown>> | undefined => {
+    const attributeStops = collectExpressionAttributeColorStops(currentStyle, preferredAttribute);
+    if (!attributeStops) return undefined;
+
+    const paint = asRecord(layer.paint);
+    const targetEntry = Object.entries(paint).find(([paintKey, paintValue]) => (
+        paintKey.endsWith('-color')
+        && Array.isArray(paintValue)
+        && !isMapStyleAttributeExpression(paintValue)
+    ));
+    if (!targetEntry) return undefined;
+
+    const [paintKey, paintValue] = targetEntry;
+    const baseId = toSuggestionString(layer.id)
+        || [
+            toSuggestionString(asRecord(currentStyle).layerId),
+            toSuggestionString(asRecord(currentStyle).styleKey || asRecord(currentStyle).activeStyle),
+            toSuggestionString(layer.type)
+        ].filter(Boolean).join('-')
+        || 'map-style-layer';
+    const filteredLayers = attributeStops.stops.map((stop, index) => ({
+        ...layer,
+        id: `${baseId}-${attributeStops.attributeKey}-${buildStyleLayerIdSuffix(stop.value, index)}`,
+        filter: combineMapStyleFilters(layer.filter, ['==', ['get', attributeStops.attributeKey], stop.value]),
+        paint: {
+            ...paint,
+            [paintKey]: replacePaintColors(paintValue, stop.color)
+        }
+    }));
+    const fallbackFilter = buildExcludeAttributeValuesFilter(
+        attributeStops.attributeKey,
+        attributeStops.stops.map((stop) => stop.value)
+    );
+    const fallbackColor = attributeStops.fallbackColor || getPrimaryColorFromPaintValue(paintValue);
+    if (!fallbackFilter || !fallbackColor) return filteredLayers;
+
+    return [
+        {
+            ...layer,
+            id: `${baseId}-${attributeStops.attributeKey}-fallback`,
+            filter: combineMapStyleFilters(layer.filter, fallbackFilter),
+            paint: buildFallbackLayerPaint(paint, paintKey, paintValue, fallbackColor)
+        },
+        ...filteredLayers
+    ];
+};
+
+const mergeFilteredAttributeColorsIntoLayer = (
+    layer: Record<string, unknown>,
+    currentLayers: Array<Record<string, unknown>>,
+    preferredAttribute?: string
+): Record<string, unknown> => {
+    const stopsByAttribute = collectFilteredAttributeColorStops(currentLayers);
+    if (stopsByAttribute.size === 0) return layer;
+
+    const attributeKey = preferredAttribute && stopsByAttribute.has(preferredAttribute)
+        ? preferredAttribute
+        : Array.from(stopsByAttribute.keys())[0];
+    const stops = stopsByAttribute.get(attributeKey) || [];
+    if (!attributeKey || stops.length === 0) return layer;
+
+    const paint = asRecord(layer.paint);
+    const targetKey = findPresetPaintTargetKey(
+        { paintKey: '', value: stops[0]?.color, role: 'color' },
+        paint,
+        new Set()
+    );
+    if (!targetKey) return layer;
+
+    const fallbackColor = getPrimaryColorFromPaintValue(paint[targetKey]) || stops[stops.length - 1]?.color;
+    const expression: unknown[] = ['match', ['get', attributeKey]];
+    for (const stop of stops) {
+        expression.push(stop.value, stop.color);
+    }
+    expression.push(fallbackColor);
+
+    return {
+        ...layer,
+        paint: {
+            ...paint,
+            [targetKey]: expression
+        }
+    };
+};
+
+const getLayerAttributeFieldNames = (mapPayload?: unknown): Set<string> => {
+    if (!mapPayload) return new Set();
+
+    const layer = getSuggestionLayerRecord(mapPayload);
+    const fields = asRecord(asRecord(layer.attributes).fields);
+    return new Set(Object.keys(fields));
+};
+
+const collectExpressionOutputsForFallback = (value: unknown, outputs: unknown[] = []): unknown[] => {
+    if (!Array.isArray(value)) return outputs;
+
+    const [operator] = value;
+    if (operator === 'interpolate') {
+        for (let index = 4; index < value.length; index += 2) {
+            outputs.push(value[index]);
+        }
+    }
+    if (operator === 'match') {
+        for (let index = 3; index < value.length; index += 2) {
+            outputs.push(value[index]);
+        }
+        if (value.length > 2) outputs.push(value[value.length - 1]);
+    }
+
+    for (const item of value) {
+        collectExpressionOutputsForFallback(item, outputs);
+    }
+
+    return outputs;
+};
+
+const getExpressionFallbackOutput = (value: unknown): unknown => {
+    const outputs = collectExpressionOutputsForFallback(value);
+    const numbers = outputs
+        .map((item) => typeof item === 'number' ? item : undefined)
+        .filter((item): item is number => item !== undefined);
+    if (numbers.length > 0) return Math.max(...numbers);
+
+    return outputs.find((item) => item !== undefined && item !== null);
+};
+
+const replaceUnavailableAttributeExpressions = (
+    value: unknown,
+    fieldNames: Set<string>
+): unknown => {
+    if (fieldNames.size === 0) return value;
+
+    if (Array.isArray(value)) {
+        const referencedAttributes = Array.from(collectMapStyleAttributeKeys(value));
+        if (referencedAttributes.some((attribute) => !fieldNames.has(attribute))) {
+            const fallbackOutput = getExpressionFallbackOutput(value);
+            if (fallbackOutput !== undefined) return fallbackOutput;
+        }
+
+        return value.map((item) => replaceUnavailableAttributeExpressions(item, fieldNames));
+    }
+
+    const record = asRecord(value);
+    if (Object.keys(record).length > 0) {
+        return Object.fromEntries(
+            Object.entries(record).map(([key, nestedValue]) => [
+                key,
+                replaceUnavailableAttributeExpressions(nestedValue, fieldNames)
+            ])
+        );
+    }
+
+    return value;
+};
+
+const filterReferencesUnavailableAttribute = (
+    filter: unknown,
+    fieldNames: Set<string>
+): boolean => {
+    if (fieldNames.size === 0 || filter === undefined || filter === null) return false;
+    const referencedAttributes = Array.from(collectMapStyleAttributeKeys(filter));
+    return referencedAttributes.some((attribute) => !fieldNames.has(attribute));
+};
+
+const sanitizeMapStyleLayerForPayload = (
+    layer: Record<string, unknown>,
+    mapPayload?: unknown
+): Record<string, unknown> => {
+    const fieldNames = getLayerAttributeFieldNames(mapPayload);
+    if (fieldNames.size === 0) return layer;
+
+    const paint = asRecord(layer.paint);
+    const layout = asRecord(layer.layout);
+    const nextLayer: Record<string, unknown> = {
+        ...layer,
+        ...(Object.keys(paint).length > 0
+            ? {
+                paint: Object.fromEntries(
+                    Object.entries(paint).map(([key, value]) => [
+                        key,
+                        replaceUnavailableAttributeExpressions(value, fieldNames)
+                    ])
+                )
+            }
+            : {}),
+        ...(Object.keys(layout).length > 0
+            ? {
+                layout: Object.fromEntries(
+                    Object.entries(layout).map(([key, value]) => [
+                        key,
+                        replaceUnavailableAttributeExpressions(value, fieldNames)
+                    ])
+                )
+            }
+            : {})
+    };
+
+    if (filterReferencesUnavailableAttribute(layer.filter, fieldNames)) {
+        const { filter: _removedFilter, ...withoutFilter } = nextLayer;
+        return withoutFilter;
+    }
+
+    return nextLayer;
+};
+
 const mergeLayerEditsIntoPresetLayer = (
     currentLayer: Record<string, unknown>,
-    presetLayer: Record<string, unknown>
+    presetLayer: Record<string, unknown>,
+    currentColor?: string
 ): Record<string, unknown> => {
     const currentPaint = asRecord(currentLayer.paint);
     const presetPaint = asRecord(presetLayer.paint);
@@ -2539,6 +3047,20 @@ const mergeLayerEditsIntoPresetLayer = (
 
     for (const [key, value] of Object.entries(currentPaint)) {
         if (paint[key] !== undefined) paint[key] = value;
+    }
+    const usedPaintTargets = new Set(Object.keys(currentPaint).filter((key) => presetPaint[key] !== undefined));
+    for (const source of collectAttributePaintExpressions(currentPaint)) {
+        const targetKey = findPresetPaintTargetKey(source, presetPaint, usedPaintTargets);
+        if (!targetKey) continue;
+        paint[targetKey] = source.value;
+        usedPaintTargets.add(targetKey);
+    }
+    if (currentColor) {
+        for (const [key, value] of Object.entries(presetPaint)) {
+            if (!key.endsWith('-color') || usedPaintTargets.has(key)) continue;
+            paint[key] = replacePaintColors(value, currentColor);
+            usedPaintTargets.add(key);
+        }
     }
     for (const [key, value] of Object.entries(currentLayout)) {
         if (layout[key] !== undefined) layout[key] = value;
@@ -2554,23 +3076,45 @@ const mergeLayerEditsIntoPresetLayer = (
 
 const mergeCurrentMapStyleIntoPreset = (
     presetStyle: unknown,
-    currentStyle?: unknown
+    currentStyle?: unknown,
+    mapPayload?: unknown
 ): Record<string, unknown> => {
     const presetRecord = asRecord(presetStyle);
     const currentRecord = asRecord(currentStyle);
     const presetLayers = Array.isArray(presetRecord.layers) ? presetRecord.layers.map(asRecord) : [];
     const currentLayers = Array.isArray(currentRecord.layers) ? currentRecord.layers.map(asRecord) : [];
     if (presetLayers.length === 0 || currentLayers.length === 0) return presetRecord;
+    const currentColor = getCurrentMapStyleColor(currentStyle);
+    const activeAttribute = toSuggestionString(currentRecord.attributeStyleKey || currentRecord.attributeKey);
 
     return {
         ...presetRecord,
-        layers: presetLayers.map((presetLayer, index) => {
+        layers: presetLayers.flatMap((presetLayer, index) => {
             const presetId = toSuggestionString(presetLayer.id);
             const currentLayer = presetId
                 ? currentLayers.find((layer) => toSuggestionString(layer.id) === presetId)
                 : currentLayers[index];
-            return currentLayer ? mergeLayerEditsIntoPresetLayer(currentLayer, presetLayer) : presetLayer;
+            const baseMergedLayer = currentLayer
+                ? mergeLayerEditsIntoPresetLayer(currentLayer, presetLayer)
+                : presetLayer;
+            const filteredAttributeLayers = buildFilteredAttributeColorLayers(baseMergedLayer, currentStyle, activeAttribute);
+            if (filteredAttributeLayers) {
+                return filteredAttributeLayers.map((layer) => sanitizeMapStyleLayerForPayload(layer, mapPayload));
+            }
+            const mergedLayer = currentLayer
+                ? mergeLayerEditsIntoPresetLayer(currentLayer, presetLayer, currentColor)
+                : presetLayer;
+            return [
+                sanitizeMapStyleLayerForPayload(
+                    mergeFilteredAttributeColorsIntoLayer(mergedLayer, currentLayers, activeAttribute),
+                    mapPayload
+                )
+            ];
         }),
+        ...(currentRecord.attributeStyleKey ? { attributeStyleKey: currentRecord.attributeStyleKey } : {}),
+        ...(currentRecord.attributeStyleType ? { attributeStyleType: currentRecord.attributeStyleType } : {}),
+        ...(currentRecord.attributeKey ? { attributeKey: currentRecord.attributeKey } : {}),
+        ...(currentRecord.attributeType ? { attributeType: currentRecord.attributeType } : {}),
         ...(currentRecord.attributeStyleVariants ? { attributeStyleVariants: currentRecord.attributeStyleVariants } : {})
     };
 };
@@ -2798,7 +3342,7 @@ const buildAttributeStyleSuggestionItems = (
     return [{
         key: 'style_by_attribute',
         label: 'Add attribute for map style',
-        promptTemplate: 'Style the map by attribute '
+        promptTemplate: 'edit style the map by attribute '
     }];
 };
 
@@ -3219,6 +3763,85 @@ const resolveRequestedMapAttribute = (
         .sort((left, right) => right.name.length - left.name.length)[0];
 };
 
+const getMapPayloadAttributeFieldByName = (
+    mapPayload: unknown,
+    attributeKey: string
+): { name: string; type?: string } => {
+    const layer = getSuggestionLayerRecord(mapPayload);
+    const fields = asRecord(asRecord(layer.attributes).fields);
+    const fieldType = toSuggestionString(asRecord(fields[attributeKey]).type);
+    return {
+        name: attributeKey,
+        ...(fieldType ? { type: fieldType } : {})
+    };
+};
+
+const getStyleAttributeValueItems = (
+    mapStyle: unknown,
+    attributeKey: string
+): Array<Record<string, unknown>> => {
+    const values = [
+        ...(collectMapStyleAttributeValues(mapStyle).get(attributeKey) || []),
+        ...(collectMapStyleAttributeValues(getMapStyleAttributeVariants(mapStyle).get(attributeKey)).get(attributeKey) || [])
+    ];
+    return values.filter((item, index) => {
+        const serialized = JSON.stringify(asRecord(item).value ?? item);
+        return values.findIndex((candidate) => {
+            return JSON.stringify(asRecord(candidate).value ?? candidate) === serialized;
+        }) === index;
+    });
+};
+
+const instructionMentionsStyleAttributeValue = (
+    instruction: string | undefined,
+    values: Array<Record<string, unknown>>
+): boolean => {
+    const normalizedInstruction = normalizeStyleSwitchText(instruction);
+    if (!normalizedInstruction) return false;
+
+    return values.some((item) => {
+        const value = asRecord(item).value ?? item;
+        const terms = typeof value === 'string'
+            ? getLayerTextMatchTerms(value)
+            : [normalizeStyleSwitchText(value)].filter(Boolean);
+        return terms.some((term) => normalizedInstruction.includes(term));
+    });
+};
+
+const resolveRequestedMapAttributeFromStyleValues = (
+    mapPayload: unknown,
+    mapStyle: unknown,
+    instruction?: string
+): { name: string; type?: string } | undefined => {
+    const normalizedInstruction = normalizeStyleSwitchText(instruction);
+    if (!normalizedInstruction) return undefined;
+
+    const styleRecord = asRecord(mapStyle);
+    const activeAttribute = toSuggestionString(styleRecord.attributeStyleKey || styleRecord.attributeKey);
+    const attributesByName = collectMapStyleAttributeValues(mapStyle);
+    const variants = getMapStyleAttributeVariants(mapStyle);
+    const candidateNames = [
+        ...(activeAttribute ? [activeAttribute] : []),
+        ...Array.from(variants.keys()),
+        ...Array.from(attributesByName.keys())
+    ].filter((name, index, names) => names.indexOf(name) === index);
+
+    for (const name of candidateNames) {
+        const values = getStyleAttributeValueItems(mapStyle, name);
+        if (!instructionMentionsStyleAttributeValue(instruction, values)) continue;
+
+        const variant = asRecord(variants.get(name));
+        const variantType = toSuggestionString(variant.attributeType || variant.type);
+        const field = getMapPayloadAttributeFieldByName(mapPayload, name);
+        return {
+            ...field,
+            ...(field.type ? {} : variantType ? { type: variantType } : {})
+        };
+    }
+
+    return undefined;
+};
+
 const buildAttributePatchesFromInstruction = async (
     instruction: string | undefined,
     attributeKey: string,
@@ -3280,7 +3903,7 @@ const buildAttributeEditArgs = async (
         mapPayload,
         instruction,
         baseArgs.attributeKey
-    );
+    ) || resolveRequestedMapAttributeFromStyleValues(mapPayload, mapStyle, instruction);
     if (!requestedAttribute) return baseArgs;
     const { attributeValues: _ignoredAttributeValues, attributeStats: _ignoredAttributeStats, ...trustedBaseArgs } = baseArgs;
 
@@ -3814,6 +4437,132 @@ const buildMapOptionsFingerprint = (payload: ReturnType<typeof buildMapOptionsEv
     });
 };
 
+const hasCurrentMapSelectionParam = (selection: unknown): boolean => {
+    const record = asRecord(selection);
+    if (Object.keys(record).length === 0) return false;
+
+    const key = typeof record.key === 'string'
+        ? record.key
+        : typeof record.currentKey === 'string'
+            ? record.currentKey
+            : undefined;
+    const value = record.value ?? record.selectedValue;
+    const isOptionsRequest = (key === 'options' || key === 'list')
+        && (value === true || value === 'true' || value === '' || value === undefined);
+    if (isOptionsRequest) return false;
+
+    if (
+        key
+        && key !== 'intentName'
+        && key !== 'provider'
+        && value !== undefined
+        && value !== null
+        && value !== ''
+    ) {
+        return true;
+    }
+
+    return Object.entries(record).some(([entryKey, entryValue]) => {
+        if ([
+            'intentName',
+            'provider',
+            'params',
+            'options',
+            'variables',
+            'key',
+            'currentKey',
+            'value',
+            'selectedValue',
+            'pagination'
+        ].includes(entryKey)) {
+            return false;
+        }
+
+        return entryValue !== undefined && entryValue !== null && entryValue !== '';
+    });
+};
+
+const isMapOptionsSelectionRequest = (selection: unknown): boolean => {
+    const record = asRecord(selection);
+    const key = typeof record.key === 'string'
+        ? record.key
+        : typeof record.currentKey === 'string'
+            ? record.currentKey
+            : undefined;
+    const value = record.value ?? record.selectedValue;
+
+    return (key === 'options' || key === 'list')
+        && (value === true || value === 'true' || value === '' || value === undefined);
+};
+
+const stripMapChoiceSelectionArgs = (args: Record<string, unknown>): Record<string, unknown> => {
+    const selectionKeys = new Set([
+        'layerId',
+        'styleId',
+        'layerTitle',
+        'styleTitle',
+        'url',
+        'href',
+        'selectedValue',
+        'value',
+        'options',
+        'list'
+    ]);
+    const cleanRecord = (record: Record<string, unknown>) => Object.fromEntries(
+        Object.entries(record).filter(([key]) => !selectionKeys.has(key))
+    );
+    const cleaned = cleanRecord(args);
+    const params = cleanRecord(asRecord(args.params));
+    const options = cleanRecord(asRecord(args.options));
+    const selectedOptions = cleanRecord(asRecord(args.selectedOptions));
+    const variables = cleanRecord(asRecord(args.variables));
+
+    return {
+        ...cleaned,
+        ...(Object.keys(params).length > 0 ? { params } : {}),
+        ...(Object.keys(options).length > 0 ? { options } : {}),
+        ...(Object.keys(selectedOptions).length > 0 ? { selectedOptions } : {}),
+        ...(Object.keys(variables).length > 0 ? { variables } : {})
+    };
+};
+
+const getMapChoiceSelectionValues = (args: Record<string, unknown>): string[] => {
+    const selectionKeys = [
+        'layerId',
+        'styleId',
+        'url',
+        'href'
+    ];
+    const containers = [
+        args,
+        asRecord(args.params),
+        asRecord(args.options),
+        asRecord(args.selectedOptions),
+        asRecord(args.variables)
+    ];
+    const values = containers.flatMap((container) => {
+        return selectionKeys.flatMap((key) => {
+            const value = container[key];
+            return typeof value === 'string' && value.trim() ? [value.trim()] : [];
+        });
+    });
+
+    return Array.from(new Set(values));
+};
+
+const hasMapChoiceSelectionFromMessage = (
+    args: Record<string, unknown>,
+    message: string
+): boolean => {
+    const normalizedMessage = normalizeMapSearchText(message);
+    if (!normalizedMessage) return false;
+
+    return getMapChoiceSelectionValues(args).some((value) => {
+        const normalizedValue = normalizeMapSearchText(value);
+        return normalizedValue.length > 0 && normalizedMessage.includes(normalizedValue);
+    });
+};
+
 const normalizeMapSearchText = (value: unknown): string => {
     return typeof value === 'string'
         ? value.toLowerCase().replace(/[\s()[\]{}"'`.,:;|/_-]+/g, '')
@@ -3893,6 +4642,9 @@ export const processChatMessageStream = (
     const mapFeaturesEnabled = !isGuest;
     const mapSelectionPayload = body?.mapselection;
     const hasMapSelection = mapFeaturesEnabled && Boolean(mapSelectionPayload);
+    const mapStyleHistorySelection = mapFeaturesEnabled
+        ? getMapStyleHistorySelection(mapSelectionPayload)
+        : undefined;
     const hasUserMessage = Boolean(rawMessage.trim());
     const mapSelectionRecord = asRecord(mapSelectionPayload);
     const hasMapSelectionPagination = Object.keys(asRecord(mapSelectionRecord.pagination)).length > 0;
@@ -3991,6 +4743,60 @@ export const processChatMessageStream = (
                      
                     // Keep long vision/model requests alive through proxies and API clients.
                     startHeartbeat(controller);
+                    if (mapStyleHistorySelection) {
+                        try {
+                            const historyResult = await restoreConversationMapLayerStyleFromHistory(
+                                userId,
+                                role,
+                                convId,
+                                mapStyleHistorySelection.layerId
+                            );
+                            if (historyResult.success && asRecord(historyResult).mapStyle) {
+                                const restoredMapStyle = asRecord(historyResult).mapStyle;
+                                writeSse(controller, 'map_style', toPublicMapStylePayload(restoredMapStyle));
+
+                                const restoredLayer = asRecord(asRecord(historyResult).layer);
+                                const restoredMapPayload = restoredLayer.layer;
+                                if (restoredMapPayload) {
+                                    const styleCatalog = await handleStyleCatalogTool();
+                                    const suggestionsPayload = await enrichMapSuggestionsWithAttributeValues(
+                                        buildMapSuggestionsPayload(restoredMapPayload, restoredMapStyle, styleCatalog, undefined, message),
+                                        restoredMapPayload,
+                                        userId,
+                                        mapHeaderApiKey,
+                                        false
+                                    );
+                                    const splitSuggestions = splitMapSuggestionsPayload(suggestionsPayload);
+                                    if (splitSuggestions.suggestions) {
+                                        writeSse(controller, 'suggestions', splitSuggestions.suggestions);
+                                    }
+                                }
+                            } else {
+                                writeSse(controller, 'map_error', {
+                                    message: asRecord(historyResult).message || 'No map style history change was applied.'
+                                });
+                            }
+                            writeSse(controller, 'done', {
+                                done: true,
+                                tokenUsage: 0,
+                                assistantmessage_Id: null,
+                                reason: 'map_style_history'
+                            });
+                            closeSafely();
+                            return;
+                        } catch (error) {
+                            const message = error instanceof Error ? error.message : 'Unable to restore map style history.';
+                            writeSse(controller, 'map_error', { message });
+                            writeSse(controller, 'done', {
+                                done: true,
+                                tokenUsage: 0,
+                                assistantmessage_Id: null,
+                                reason: 'map_style_history_error'
+                            });
+                            closeSafely();
+                            return;
+                        }
+                    }
                     const imageAttachments = rawImages.slice(0, MAX_CHAT_IMAGES).map(parseChatImage);
                     if (rawImages.length > MAX_CHAT_IMAGES) {
                         throw Errors.badRequest(`too many images; max ${MAX_CHAT_IMAGES}`);
@@ -4404,6 +5210,9 @@ export const processChatMessageStream = (
                     )
                         ? 'map_control'
                         : classifiedMapRequestIntent;
+                    const shouldStartFreshMapOptions = mapRequestIntent === 'map_access'
+                        && isMapOptionsSelectionRequest(mapSelectionPayload)
+                        && hasUserMessage;
                     if (
                         mapRequestIntent === 'map_control'
                         && latestMapPayload
@@ -4862,7 +5671,7 @@ export const processChatMessageStream = (
                             });
 
                             if (styleResult.success) {
-                                const preservedStyleResult = mergeCurrentMapStyleIntoPreset(styleResult, latestMapStyle);
+                                const preservedStyleResult = mergeCurrentMapStyleIntoPreset(styleResult, latestMapStyle, latestMapPayload);
                                 const styleResultWithVariants = mergeMapStyleAttributeVariants(preservedStyleResult, latestMapStyle, latestMapPayload);
                                 writeSse(controller, 'map_style', toPublicMapStyleStreamPayload(styleResultWithVariants));
                                 await safeSyncConversationMapStyle(convId, styleResultWithVariants);
@@ -5067,7 +5876,16 @@ export const processChatMessageStream = (
                         const latestQueryArgs = hasUserMessage
                             ? { query: message, message }
                             : undefined;
-                        return mergeMapToolArgs(savedMapSelectionArgs, mapSelectionArgs, inferredMapArgs, latestQueryArgs, aiArguments);
+                        const mergedArgs = mergeMapToolArgs(savedMapSelectionArgs, mapSelectionArgs, inferredMapArgs, latestQueryArgs, aiArguments);
+                        return shouldStartFreshMapOptions
+                            ? stripMapChoiceSelectionArgs(mergedArgs)
+                            : mergedArgs;
+                    };
+                    const buildMapOptionsToolArgs = (aiArguments: Record<string, unknown>) => {
+                        const contextualArgs = buildContextualMapToolArgs(aiArguments);
+                        return hasCurrentMapSelectionParam(mapSelectionPayload)
+                            ? contextualArgs
+                            : { ...contextualArgs, optionsOnly: true };
                     };
                     const persistMapSelectionState = async (payload: ReturnType<typeof buildMapOptionsEvent>) => {
                         const selectedValues = asRecord(payload.selectedValues);
@@ -5148,7 +5966,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                         };
 
                         if (hasMapSelection) {
-                            const contextualArguments = buildContextualMapToolArgs({});
+                            const contextualArguments = buildMapOptionsToolArgs({});
                             const optionResult = await handleMapOptionsTool(userId, contextualArguments, mapHeaderApiKey);
                             const optionPayload = buildMapOptionsEvent(optionResult);
                             await persistMapSelectionState(optionPayload);
@@ -5516,7 +6334,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                 let wroteOptionPayload = false;
                                 try {
                                     aiArguments = parseToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments);
-                                    contextualArguments = buildContextualMapToolArgs(aiArguments);
+                                    contextualArguments = buildMapOptionsToolArgs(aiArguments);
                                     const optionResult = await handleMapOptionsTool(userId, contextualArguments, mapHeaderApiKey);
                                     optionPayload = buildMapOptionsEvent(optionResult);
                                     await persistMapSelectionState(optionPayload);
@@ -5588,7 +6406,11 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             if (toolName !== 'get_map_layer') continue;
 
                             const aiArguments = parseToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments);
-                            const contextualArguments = buildContextualMapToolArgs(aiArguments);
+                            const rawContextualArguments = buildContextualMapToolArgs(aiArguments);
+                            const contextualArguments = !hasCurrentMapSelectionParam(mapSelectionPayload)
+                                && !hasMapChoiceSelectionFromMessage(rawContextualArguments, message)
+                                ? stripMapChoiceSelectionArgs(rawContextualArguments)
+                                : rawContextualArguments;
                             let mapResult: Awaited<ReturnType<typeof handleMapTool>>;
                             try {
                                 mapResult = await handleMapTool(userId, contextualArguments, mapHeaderApiKey);
@@ -5654,7 +6476,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                 let optionPayload: ReturnType<typeof buildMapOptionsEvent>;
                                 let wroteOptionPayload = false;
                                 try {
-                                    contextualArguments = buildContextualMapToolArgs({});
+                                    contextualArguments = buildMapOptionsToolArgs({});
                                     const optionResult = await handleMapOptionsTool(userId, contextualArguments, mapHeaderApiKey);
                                     optionPayload = buildMapOptionsEvent(optionResult);
                                     await persistMapSelectionState(optionPayload);
@@ -5858,6 +6680,149 @@ export const updateConversationMapLayerOrder = async (
     return {
         event: 'map_order',
         layerIds: updatedRows.map((row) => row.layerKey)
+    };
+};
+
+type MapStyleHistoryEntry = {
+    messageId: string;
+    createdAt: Date;
+    mapStyle: Record<string, unknown>;
+    signature: string;
+};
+
+const stableJsonValue = (value: unknown): unknown => {
+    if (Array.isArray(value)) return value.map(stableJsonValue);
+    if (!value || typeof value !== 'object') return value;
+
+    return Object.fromEntries(
+        Object.entries(value as Record<string, unknown>)
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([key, nestedValue]) => [key, stableJsonValue(nestedValue)])
+    );
+};
+
+const getMapStyleHistorySignature = (mapStyle: unknown): string => {
+    return JSON.stringify(stableJsonValue(mapStyle));
+};
+
+const getMapStyleHistorySelection = (selection: unknown): { layerId: string } | undefined => {
+    const record = asRecord(selection);
+    const key = typeof record.key === 'string' ? record.key.trim() : '';
+    const layerId = toSuggestionString(record.value || record.layerId);
+    if (!layerId) return undefined;
+
+    if (key === 'mapundo') return { layerId };
+    return undefined;
+};
+
+const restoreConversationMapLayerStyleFromHistory = async (
+    userId: string,
+    role: string,
+    conversationId: string,
+    layerId: string
+) => {
+    if (role === 'guest') {
+        return {
+            success: true,
+            persisted: false,
+            event: 'map_style',
+            layerId
+        };
+    }
+
+    await verifyConversationAccess(userId, conversationId);
+    await ensureConversationMapLayersTable();
+
+    const rows = await getConversationMapLayerRows(conversationId);
+    const currentLayer = rows.find((row) => row.layerKey === layerId);
+    if (!currentLayer) {
+        throw Errors.badRequest('map layer not found in conversation');
+    }
+
+    const messages = await prisma.messages.findMany({
+        where: {
+            conversation_id: conversationId,
+            deleted_at: null,
+            metadata: { not: Prisma.JsonNull }
+        },
+        orderBy: [{ created_at: 'asc' }, { id: 'asc' }],
+        select: {
+            id: true,
+            metadata: true,
+            created_at: true
+        }
+    });
+    const history: MapStyleHistoryEntry[] = messages.flatMap((message) => {
+        const mapStyle = getMapStyleFromMessageMetadata(message.metadata);
+        if (!mapStyle) return [];
+
+        const styleLayerId = getMapStyleLayerId(mapStyle);
+        if (styleLayerId && styleLayerId !== layerId) return [];
+
+        const normalizedMapStyle = styleLayerId
+            ? mapStyle
+            : { ...mapStyle, layerId };
+        return [{
+            messageId: message.id,
+            createdAt: message.created_at ?? new Date(0),
+            mapStyle: normalizedMapStyle,
+            signature: getMapStyleHistorySignature(normalizedMapStyle)
+        }];
+    });
+
+    if (history.length === 0) {
+        return {
+            success: false,
+            event: 'map_style_history',
+            layerId,
+            message: 'No map style history was found for this layer.'
+        };
+    }
+
+    const currentSignature = getMapStyleHistorySignature(currentLayer.mapStyle);
+    const matchingIndex = history.map((entry) => entry.signature).lastIndexOf(currentSignature);
+    const currentIndex = matchingIndex >= 0 ? matchingIndex : history.length;
+    const targetIndex = currentIndex - 1;
+    const targetEntry = history[targetIndex];
+    if (!targetEntry) {
+        return {
+            success: false,
+            event: 'map_style_history',
+            layerId,
+            currentIndex: matchingIndex,
+            historyCount: history.length,
+            message: 'This layer is already at the first saved map style.'
+        };
+    }
+
+    const activeStyle = getMapStyleKey(targetEntry.mapStyle);
+    const mapStyleJson = JSON.stringify(targetEntry.mapStyle);
+    await prisma.$executeRaw`
+        UPDATE "conversation_map_layers"
+        SET
+            "map_style" = CAST(${mapStyleJson} AS jsonb),
+            "active_style" = ${activeStyle ?? null},
+            "visible" = true,
+            "deleted_at" = NULL,
+            "updated_at" = CURRENT_TIMESTAMP
+        WHERE "conversation_id" = ${conversationId}
+            AND "layer_key" = ${layerId}
+    `;
+
+    const updatedRows = await getConversationMapLayerRows(conversationId, false);
+    const updatedLayer = updatedRows.find((row) => row.layerKey === layerId);
+
+    return {
+        success: true,
+        persisted: true,
+        event: 'map_style',
+        layerId,
+        messageId: targetEntry.messageId,
+        restoredFromMessageCreatedAt: targetEntry.createdAt,
+        historyIndex: targetIndex,
+        historyCount: history.length,
+        mapStyle: targetEntry.mapStyle,
+        ...(updatedLayer ? { layer: toPublicConversationMapLayer(updatedLayer) } : {})
     };
 };
 

@@ -1220,8 +1220,15 @@ const getCatalogColorValues = async (): Promise<string[]> => {
 
 const getAttributeStylePalette = async (
   existingPaint: Record<string, unknown>,
-  color?: string
+  color?: string,
+  paintKey?: string
 ): Promise<string[]> => {
+  const directColorValues = paintKey && existingPaint[paintKey] !== undefined
+    ? [existingPaint[paintKey]]
+    : Object.values(existingPaint);
+  const directColors = directColorValues
+    .map(normalizeColorHex)
+    .filter((item): item is string => Boolean(item));
   const existingColors = Object.values(existingPaint)
     .flatMap((value) => collectExpressionOutputs(value))
     .map(normalizeColorHex)
@@ -1230,6 +1237,7 @@ const getAttributeStylePalette = async (
 
   return Array.from(new Set([
     ...(color ? [color] : []),
+    ...directColors,
     ...existingColors,
     ...catalogColors
   ]));
@@ -1241,7 +1249,15 @@ const getExplicitAttributeOutputs = (value: unknown): unknown[] => {
   return value
     .map((item) => {
       const record = pickRecord(item);
-      return record.output !== undefined ? record.output : item;
+      return record.output !== undefined
+        ? record.output
+        : record.colorValue !== undefined
+          ? record.colorValue
+          : record.color !== undefined
+            ? record.color
+            : record.value !== undefined
+              ? record.value
+              : item;
     })
     .filter((item) => item !== undefined && item !== null);
 };
@@ -1278,7 +1294,7 @@ const getAttributeStyleOutputs = async (
   if (explicitOutputs.length > 0) return explicitOutputs;
 
   if (paintKey.endsWith("-color")) {
-    return getAttributeStylePalette(existingPaint, color);
+    return getAttributeStylePalette(existingPaint, color, paintKey);
   }
 
   const currentValue = existingPaint[paintKey];
@@ -1768,6 +1784,96 @@ const buildAttributePaintPatch = async (
   };
 };
 
+const combineLayerFilter = (existingFilter: unknown, nextFilter: unknown): unknown => {
+  if (existingFilter === undefined || existingFilter === null) return nextFilter;
+  return ["all", existingFilter, nextFilter];
+};
+
+const buildExcludeLayerAttributeValuesFilter = (
+  attributeKey: string,
+  values: unknown[]
+): unknown | undefined => {
+  const conditions = values.map((value) => ["!=", ["get", attributeKey], value]);
+  if (conditions.length === 0) return undefined;
+  return conditions.length === 1 ? conditions[0] : ["all", ...conditions];
+};
+
+const buildFallbackHeatmapPaint = (
+  paint: Record<string, unknown>,
+  paintKey: string,
+  color: string
+): Record<string, unknown> => {
+  return Object.fromEntries(
+    Object.entries({
+      ...paint,
+      [paintKey]: buildHeatmapColorRamp(color)
+    }).map(([key, value]) => {
+      if (!key.endsWith("-opacity") || typeof value !== "number") return [key, value];
+      return [key, Math.max(0, Math.min(1, value / 4))];
+    })
+  );
+};
+
+const buildHeatmapAttributeStyleLayers = async (
+  layer: Record<string, unknown>,
+  args: EditMapStyleArgs,
+  color: string | undefined
+): Promise<Array<Record<string, unknown>> | undefined> => {
+  if (toStringValue(layer.type) !== "heatmap") return undefined;
+  const attributeKey = toStringValue(args.attributeKey);
+  if (
+    !attributeKey
+    || args.attributeValue !== undefined
+    || (Array.isArray(args.attributePatches) && args.attributePatches.length > 0)
+  ) return undefined;
+
+  const existingPaint = pickRecord(layer.paint);
+  const paintKey = resolvePaintKeyByInstruction(existingPaint, args)
+    || toStringValue(args.paintKey)
+    || getEditablePaintColorKey(existingPaint);
+  if (paintKey !== "heatmap-color") return undefined;
+
+  const values = getAttributeValuesList(args.attributeValues).slice(0, 5);
+  if (values.length === 0) return undefined;
+
+  const palette = (await getAttributeStylePalette(existingPaint, color, paintKey))
+    .filter((item, index, items) => items.indexOf(item) === index);
+  if (palette.length === 0) return undefined;
+
+  const baseId = toStringValue(layer.id)
+    || [
+      toStringValue(args.layerId),
+      toStringValue(args.styleLayerId),
+      toStringValue(layer.type)
+    ].filter(Boolean).join("-")
+    || "map-style-layer";
+  const filteredLayers = values.map((value, index) => {
+    const valueText = toStringValue(value) || String(index);
+    const suffix = valueText.toLowerCase().replace(/[^a-z0-9]+/gi, "-").replace(/^-+|-+$/g, "") || String(index);
+    return {
+      ...layer,
+      id: `${baseId}-${attributeKey}-${suffix}`,
+      filter: combineLayerFilter(layer.filter, ["==", ["get", attributeKey], value]),
+      paint: {
+        ...existingPaint,
+        [paintKey]: buildHeatmapColorRamp(palette[index % palette.length])
+      }
+    };
+  });
+  const fallbackFilter = buildExcludeLayerAttributeValuesFilter(attributeKey, values);
+  if (!fallbackFilter) return filteredLayers;
+
+  return [
+    {
+      ...layer,
+      id: `${baseId}-${attributeKey}-fallback`,
+      filter: combineLayerFilter(layer.filter, fallbackFilter),
+      paint: buildFallbackHeatmapPaint(existingPaint, paintKey, palette[palette.length - 1])
+    },
+    ...filteredLayers
+  ];
+};
+
 const getPaintPatchForLayerType = async (
   args: EditMapStyleArgs,
   color?: string,
@@ -1883,7 +1989,7 @@ export const handleEditMapStyleTool = async (
   const officialStyleSpec = isFilterOperation ? undefined : await loadMapLibreStyleSpec();
   let matchedFilterLayer = false;
 
-  const patchLayer = async (layer: unknown) => {
+  const patchLayer = async (layer: unknown): Promise<Record<string, unknown> | Array<Record<string, unknown>>> => {
     const layerRecord = pickRecord(layer);
     const layerType = toStringValue(layerRecord.type) || "";
     const styleLayerId = toStringValue(aiArgs.styleLayerId);
@@ -1904,6 +2010,9 @@ export const handleEditMapStyleTool = async (
       return applyStylePropertyOperation(layerRecord, aiArgs, operation, resolvedColor, officialStyleSpec);
     }
 
+    const heatmapAttributeLayers = await buildHeatmapAttributeStyleLayers(layerRecord, aiArgs, resolvedColor);
+    if (heatmapAttributeLayers) return heatmapAttributeLayers;
+
     const paintPatch = await getPaintPatchForLayerType(aiArgs, resolvedColor, pickRecord(layerRecord.paint));
     const layoutPatch = pickRecord(aiArgs.layout);
 
@@ -1913,7 +2022,7 @@ export const handleEditMapStyleTool = async (
       ...(Object.keys(paintPatch).length > 0 ? { paint: { ...pickRecord(layerRecord.paint), ...paintPatch } } : {})
     };
   };
-  const layers = await Promise.all(currentLayers.map((layer) => {
+  const patchedLayers = await Promise.all(currentLayers.map((layer) => {
     const layerRecord = pickRecord(layer);
     const layerIdMatches = !requestedLayerId
       || requestedLayerId === currentMapLayerId
@@ -1921,6 +2030,7 @@ export const handleEditMapStyleTool = async (
 
     return layerIdMatches ? patchLayer(layerRecord) : layerRecord;
   }));
+  const layers = patchedLayers.flatMap((layer) => Array.isArray(layer) ? layer : [layer]);
   const styleChanged = JSON.stringify(layers) !== JSON.stringify(currentLayers);
 
   if (!styleChanged && operation === "clear_filter" && matchedFilterLayer) {
@@ -2964,7 +3074,8 @@ const getVectorTileCollectionRequestParams = (
     "offset",
     "nextOffset",
     "currentOffset",
-    "action"
+    "action",
+    "optionsOnly"
   ]);
   const params = {
     ...pickRecord(aiArgs.params),
@@ -3834,8 +3945,12 @@ const buildVectorTileOptionsPayload = async (
   const collections = extractVectorTileCollections(collectionsPayload);
   const pagination = buildMapOptionPaginationResult(collectionsPayload, paginationRequest, collections.length);
   const collectionChoices = buildVectorTileChoices(collections, layerType);
-  const explicitLayerId = getVectorTileLayerId(aiArgs, optionKey);
-  const shouldInferLayerId = !explicitLayerId && Object.keys(collectionRequestParams).length === 0;
+  const optionsOnly = aiArgs.optionsOnly === true
+    || pickRecord(aiArgs.params).optionsOnly === true
+    || pickRecord(aiArgs.options).optionsOnly === true
+    || pickRecord(aiArgs.variables).optionsOnly === true;
+  const explicitLayerId = optionsOnly ? undefined : getVectorTileLayerId(aiArgs, optionKey);
+  const shouldInferLayerId = !optionsOnly && !explicitLayerId && Object.keys(collectionRequestParams).length === 0;
   const selectedLayerId = explicitLayerId
     || (shouldInferLayerId ? inferVectorTileLayerIdFromQuery(getMapQuery(aiArgs), collectionChoices) : undefined);
   const selectedCollection = selectedLayerId
