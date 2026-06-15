@@ -80,7 +80,7 @@ type EditMapStyleArgs = MapToolArgs & {
 };
 
 type StylePropertyKind = "paint" | "layout";
-type EditMapStyleOperation = "add_property" | "remove_property" | "update_layer" | "set_filter" | "add_filter" | "remove_filter" | "clear_filter";
+type EditMapStyleOperation = "add_property" | "remove_property" | "update_layer" | "add_filter";
 
 let mapLibreStyleSpecCache: Record<string, unknown> | null | undefined;
 
@@ -1337,10 +1337,7 @@ const normalizeStylePropertyOperation = (value: unknown): EditMapStyleOperation 
     normalized === "add_property"
     || normalized === "remove_property"
     || normalized === "update_layer"
-    || normalized === "set_filter"
     || normalized === "add_filter"
-    || normalized === "remove_filter"
-    || normalized === "clear_filter"
   ) return normalized;
   return undefined;
 };
@@ -1467,7 +1464,7 @@ const resolveEditMapStyleOperation = (args: EditMapStyleArgs): EditMapStyleOpera
   const instruction = getEditInstruction(args);
   const inferred = inferStylePropertyOperationFromInstruction(instruction);
 
-  if (explicit === "set_filter" || explicit === "add_filter" || explicit === "remove_filter" || explicit === "clear_filter") {
+  if (explicit === "add_filter") {
     return explicit;
   }
   if (explicit === "remove_property" || inferred === "remove_property") {
@@ -1595,13 +1592,8 @@ const getFilterLogic = (filter: unknown, requestedLogic: unknown): "all" | "any"
 const applyFilterOperation = (
   layer: Record<string, unknown>,
   args: EditMapStyleArgs,
-  operation: Extract<EditMapStyleOperation, "set_filter" | "add_filter" | "remove_filter" | "clear_filter">
+  operation: Extract<EditMapStyleOperation, "add_filter">
 ): Record<string, unknown> => {
-  if (operation === "clear_filter") {
-    const { filter: _removedFilter, ...rest } = layer;
-    return rest;
-  }
-
   const attributeFields = getFilterAttributeFields(args);
   const directFilter = args.filter;
   const candidateFilter = isValidFilterExpression(directFilter, attributeFields)
@@ -1610,33 +1602,16 @@ const applyFilterOperation = (
   const requestedFilter = isValidFilterExpression(candidateFilter, attributeFields) ? candidateFilter : undefined;
   if (!requestedFilter) return layer;
 
-  if (operation === "set_filter") return { ...layer, filter: requestedFilter };
-
   const currentConditions = flattenFilterConditions(layer.filter);
   const requestedConditions = flattenFilterConditions(requestedFilter);
   const filterLogic = getFilterLogic(layer.filter, args.filterLogic);
-  if (operation === "add_filter") {
-    const combined = [...currentConditions];
-    for (const condition of requestedConditions) {
-      if (!combined.some((item) => JSON.stringify(item) === JSON.stringify(condition))) combined.push(condition);
-    }
-    return {
-      ...layer,
-      filter: combined.length === 1 ? combined[0] : [filterLogic, ...combined]
-    };
-  }
-
-  const remaining = currentConditions.filter((condition) => (
-    !requestedConditions.some((requested) => JSON.stringify(requested) === JSON.stringify(condition))
-  ));
-  if (remaining.length === currentConditions.length) return layer;
-  if (remaining.length === 0) {
-    const { filter: _removedFilter, ...rest } = layer;
-    return rest;
+  const combined = [...currentConditions];
+  for (const condition of requestedConditions) {
+    if (!combined.some((item) => JSON.stringify(item) === JSON.stringify(condition))) combined.push(condition);
   }
   return {
     ...layer,
-    filter: remaining.length === 1 ? remaining[0] : [filterLogic, ...remaining]
+    filter: combined.length === 1 ? combined[0] : [filterLogic, ...combined]
   };
 };
 
@@ -1939,10 +1914,7 @@ export const handleEditMapStyleTool = async (
 
   const instruction = getEditInstruction(aiArgs);
   const operation = resolveEditMapStyleOperation(aiArgs);
-  const isFilterOperation = operation === "set_filter"
-    || operation === "add_filter"
-    || operation === "remove_filter"
-    || operation === "clear_filter";
+  const isFilterOperation = operation === "add_filter";
   const requestedColorValue = normalizeColorHex(aiArgs.colorValue) || normalizeColorHex(aiArgs.value);
   const hasAttributePatches = Array.isArray(aiArgs.attributePatches) && aiArgs.attributePatches.length > 0;
   let matchedColorKeys: string[] = [];
@@ -2001,7 +1973,7 @@ export const handleEditMapStyleTool = async (
 
     if (!targetMatches) return layerRecord;
 
-    if (operation === "set_filter" || operation === "add_filter" || operation === "remove_filter" || operation === "clear_filter") {
+    if (operation === "add_filter") {
       matchedFilterLayer = true;
       return applyFilterOperation(layerRecord, aiArgs, operation);
     }
@@ -2033,20 +2005,23 @@ export const handleEditMapStyleTool = async (
   const layers = patchedLayers.flatMap((layer) => Array.isArray(layer) ? layer : [layer]);
   const styleChanged = JSON.stringify(layers) !== JSON.stringify(currentLayers);
 
-  if (!styleChanged && operation === "clear_filter" && matchedFilterLayer) {
-    return {
-      ...currentStyle,
-      success: true,
-      event: "map_style",
-      layerId: currentMapLayerId,
-      layers,
-      styleInstruction: instruction
-    };
-  }
-
   if (!styleChanged) {
     const attributeKey = toStringValue(aiArgs.attributeKey);
     const attributeValues = getAttributeValuesList(aiArgs.attributeValues);
+    if (attributeKey && aiArgs.attributeValue === undefined && attributeValues.length > 0) {
+      return {
+        ...currentStyle,
+        success: true,
+        event: "map_style",
+        layerId: currentMapLayerId,
+        layers: currentLayers,
+        styleInstruction: instruction,
+        attributeStyleKey: attributeKey,
+        ...(toStringValue(aiArgs.attributeType) ? { attributeStyleType: toStringValue(aiArgs.attributeType) } : {})
+      };
+    }
+    // Keep deterministic no-op errors separate from missing data. The chatbot
+    // layer can retry only lookup/network failures, not invalid paint requests.
     return {
       ...currentStyle,
       success: false,
@@ -3031,6 +3006,10 @@ const getVectorTileOptionKey = (layerConfigTemplate: unknown): string => {
 
 const getCollectionDetailType = (layerConfigTemplate: unknown): string => {
   return toStringValue(pickRecord(layerConfigTemplate).type) || "collection_detail";
+};
+
+const getPmtilesUrlTemplate = (layerConfigTemplate: unknown): string | undefined => {
+  return toStringValue(pickRecord(layerConfigTemplate).pmtilesUrlTemplate);
 };
 
 const getVectorTileLayerId = (aiArgs: MapToolArgs, optionKey: string): string | undefined => {
@@ -4908,6 +4887,8 @@ export const handleMapAttributeValuesTool = async (
     const valueConfig = getAttributeValuesConfig(config.layerConfigTemplate);
     const connectionUrlTemplate = toStringValue(valueConfig.connectionUrlTemplate);
     const exploreUrlTemplate = toStringValue(valueConfig.exploreUrlTemplate || valueConfig.urlTemplate);
+    // Attribute values are provider-configured because the same layer render API
+    // may use a different analytics/explore API for value lookup.
     if (!connectionUrlTemplate || !exploreUrlTemplate) {
       return {
         success: false,
@@ -5247,7 +5228,7 @@ export const editMapStyleToolSchema = {
   type: "function",
   function: {
     name: "edit_map_style",
-    description: "Edit the latest map style using the existing map_style as the base. Use this for paint/layout edits and feature filter operations without calling get_map_layer again. Attributes can drive compatible paint properties or structured filter conditions. Use paintKey/value, layoutKey/value, paint, or layout for direct property edits. Use set_filter/add_filter/remove_filter/clear_filter with filterConditions to control which features render.",
+    description: "Edit the latest map style using the existing map_style as the base. Use this for paint/layout edits and feature filter operations without calling get_map_layer again. Attributes can drive compatible paint properties or structured filter conditions. Use paintKey/value, layoutKey/value, paint, or layout for direct property edits. Use add_filter with filterConditions to add feature visibility filters.",
     parameters: {
       type: "object",
       properties: {
@@ -5261,12 +5242,12 @@ export const editMapStyleToolSchema = {
         },
         operation: {
           type: "string",
-          enum: ["update_layer", "add_property", "remove_property", "set_filter", "add_filter", "remove_filter", "clear_filter"],
-          description: "Use update_layer for normal edits, add_property/remove_property for paint/layout keys, and set_filter/add_filter/remove_filter/clear_filter for feature visibility filters."
+          enum: ["update_layer", "add_property", "remove_property", "add_filter"],
+          description: "Use update_layer for normal edits, add_property/remove_property for paint/layout keys, and add_filter for feature visibility filters."
         },
         action: {
           type: "string",
-          enum: ["update_layer", "add_property", "remove_property", "set_filter", "add_filter", "remove_filter", "clear_filter"],
+          enum: ["update_layer", "add_property", "remove_property", "add_filter"],
           description: "Alias for operation."
         },
         styleLayerId: {
@@ -5883,6 +5864,93 @@ export const handleMapTool = async (
   } catch (error) {
     console.error("Map Tool Handler Error:", error);
     return { error: "The map database is temporarily unavailable." };
+  }
+};
+
+export const handleRenderPmtilesLayerTool = async (
+  userId: string,
+  mapPayload: unknown,
+  headerApiKey?: string
+) => {
+  try {
+    const payloadRecord = pickRecord(mapPayload);
+    const layerRecord = pickRecord(payloadRecord.layer);
+    const intentName = toStringValue(payloadRecord.intentName);
+    const provider = normalizeProvider(toStringValue(payloadRecord.provider));
+    const layerId = toStringValue(layerRecord.layerId || layerRecord.id);
+
+    if (!intentName || !provider || !layerId) {
+      return {
+        success: false,
+        error: "The current map layer does not include intentName, provider, and layerId."
+      };
+    }
+
+    const configMatches = await prisma.mapconfig.findMany({
+      where: { intentName }
+    });
+    const activeConfig = findConfigByIntentProvider(
+      configMatches.filter((config) => config.isActive),
+      intentName,
+      provider
+    );
+    const config = activeConfig || findConfigByIntentProvider(configMatches, intentName, provider);
+
+    if (!config || !config.isActive) {
+      return {
+        success: false,
+        error: `No active mapconfig was found for ${provider}:${intentName}.`
+      };
+    }
+
+    const pmtilesUrlTemplate = getPmtilesUrlTemplate(config.layerConfigTemplate);
+    if (!pmtilesUrlTemplate) {
+      return {
+        success: false,
+        error: "layerConfigTemplate.pmtilesUrlTemplate is not configured for this map layer."
+      };
+    }
+
+    const userApiKey = selectApiKeyForProvider(
+      await resolveUserMapApiKeys(userId, headerApiKey),
+      config.provider
+    );
+
+    if (!userApiKey) {
+      return {
+        success: false,
+        error: headerApiKey?.trim()
+          ? `The API key sent in the header does not match provider ${config.provider}, or it is not authorized.`
+          : `The user has not linked an API key for ${config.provider}. Please configure an API key first.`
+      };
+    }
+
+    const runtimeConfig = withApiKeyHostBaseUrl(config, userApiKey);
+    const apiKey = decryptUserApiKey(userApiKey);
+    const privatePmtilesUrl = buildMapOptionUrl(runtimeConfig.baseUrl, pmtilesUrlTemplate, apiKey, { id: layerId });
+    const publicPmtilesUrl = createVectorTilePublicUrl(privatePmtilesUrl);
+    const { tiles, pmtiles, renderType, detailUrl, type, ...baseLayer } = layerRecord;
+
+    return {
+      success: true,
+      payload: {
+        ...payloadRecord,
+        event: "layer_catalog",
+        layer: {
+          ...baseLayer,
+          type: "pmtiles",
+          renderType: "pmtiles",
+          layerId,
+          url: publicPmtilesUrl
+        }
+      }
+    };
+  } catch (error) {
+    console.error("Render PMTiles Layer Tool Error:", error);
+    return {
+      success: false,
+      error: "An error occurred while building the PMTiles layer payload."
+    };
   }
 };
 

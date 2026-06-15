@@ -22,7 +22,8 @@ import {
     buildDynamicMapOptionToolSchema,
     resolveUserMapToolConfigs,
     buildMapOptionChoiceContext,
-    handleMapAttributeValuesTool
+    handleMapAttributeValuesTool,
+    handleRenderPmtilesLayerTool
 } from '../map/tools';
 import { Prisma } from '@prisma/client';
 import {
@@ -828,6 +829,8 @@ const buildConversationSummaryContext = (
 ): { role: 'system'; content: string } | undefined => {
     if (!summary || Object.keys(summary).length === 0) return undefined;
 
+    // Memory helps the model keep conversation continuity, but map tools must still
+    // trust structured DB state when they need the current layer/style payload.
     return {
         role: 'system',
         content: [
@@ -1463,7 +1466,7 @@ const verifyConversationAccess = async (
     });
 
     if (!conversation) {
-        throw Errors.badRequest('ไม่พบห้องแชท หรือคุณไม่มีสิทธิ์เข้าถึงข้อมูลนี้');
+        throw Errors.badRequest('Conversation not found or you do not have permission to access it.');
     }
 };
 
@@ -2099,6 +2102,40 @@ const getLayerMatchTerms = (
         .filter((term, index, allTerms) => term.length >= 3 && allTerms.indexOf(term) === index);
 };
 
+const scoreLayerTextMatch = (
+    terms: string[],
+    normalizedRequest: string
+): { score: number; longestMatch: number; matchCount: number } | undefined => {
+    let score = 0;
+    let longestMatch = 0;
+    let matchCount = 0;
+
+    for (const term of terms) {
+        if (!term) continue;
+        if (normalizedRequest === term) {
+            score += term.length * 20;
+            longestMatch = Math.max(longestMatch, term.length);
+            matchCount += 1;
+            continue;
+        }
+        if (normalizedRequest.includes(term)) {
+            score += term.length * (term.length >= 8 ? 4 : 1);
+            longestMatch = Math.max(longestMatch, term.length);
+            matchCount += 1;
+            continue;
+        }
+        if (term.includes(normalizedRequest)) {
+            score += normalizedRequest.length * 2;
+            longestMatch = Math.max(longestMatch, normalizedRequest.length);
+            matchCount += 1;
+        }
+    }
+
+    return score > 0
+        ? { score, longestMatch, matchCount }
+        : undefined;
+};
+
 const selectMapLayerStateByText = (
     mapState: ConversationMapState,
     requestText: string
@@ -2109,19 +2146,118 @@ const selectMapLayerStateByText = (
     const matches = Object.entries(mapState.layers)
         .map(([layerId, layerState]) => {
             const terms = getLayerMatchTerms(layerId, layerState);
-            const matchedTerm = terms
-                .filter((term) => normalizedRequest.includes(term) || term.includes(normalizedRequest))
-                .sort((left, right) => right.length - left.length)[0];
-            if (!matchedTerm) return undefined;
+            const match = scoreLayerTextMatch(terms, normalizedRequest);
+            if (!match) return undefined;
 
             return {
                 layerState,
-                score: matchedTerm.length,
+                ...match,
+                isActive: mapState.activeLayerId === layerId
+            };
+        })
+        .filter((item): item is { layerState: ConversationMapLayerState; score: number; longestMatch: number; matchCount: number; isActive: boolean } => Boolean(item))
+        .sort((left, right) => (
+            right.score - left.score
+            || right.longestMatch - left.longestMatch
+            || right.matchCount - left.matchCount
+            || Number(right.isActive) - Number(left.isActive)
+        ));
+
+    return matches[0]?.layerState;
+};
+
+const getMapLayerStateAttributeNames = (layerState: ConversationMapLayerState): string[] => {
+    const names = new Set<string>();
+    const addName = (value: unknown) => {
+        const name = toSuggestionString(value);
+        if (name) names.add(name);
+    };
+    const collectFromPayload = (payload: unknown) => {
+        const layer = getSuggestionLayerRecord(payload);
+        const fields = asRecord(asRecord(layer.attributes).fields);
+        for (const key of Object.keys(fields)) addName(key);
+    };
+    const collectFromStyle = (style: unknown) => {
+        const styleRecord = asRecord(style);
+        addName(styleRecord.attributeStyleKey || styleRecord.attributeKey);
+        for (const variant of getMapStyleAttributeVariants(style).values()) {
+            addName(variant.attributeKey || variant.name || variant.value);
+        }
+        for (const key of collectMapStyleAttributeKeys(style)) addName(key);
+    };
+
+    collectFromPayload(layerState.mapPayload || layerState.layer);
+    collectFromStyle(layerState.latestMapStyle);
+    Object.values(layerState.styles).forEach(collectFromStyle);
+
+    return Array.from(names);
+};
+
+const getRequestedAttributeNamesForLayerSelection = (
+    mapState: ConversationMapState,
+    aiArgs: Record<string, unknown>,
+    message?: string
+): string[] => {
+    const requested = new Set<string>();
+    const addRequested = (value: unknown) => {
+        const name = toSuggestionString(value);
+        if (name) requested.add(name);
+    };
+
+    addRequested(aiArgs.attributeKey);
+    addRequested(aiArgs.field);
+    addRequested(aiArgs.key);
+    addRequested(asRecord(aiArgs.params).attributeKey);
+    addRequested(asRecord(aiArgs.params).field);
+    addRequested(asRecord(aiArgs.options).attributeKey);
+    addRequested(asRecord(aiArgs.options).field);
+
+    const normalizedMessage = normalizeStyleSwitchText(message);
+    if (normalizedMessage) {
+        Object.values(mapState.layers)
+            .flatMap(getMapLayerStateAttributeNames)
+            .sort((left, right) => right.length - left.length)
+            .forEach((name) => {
+                const normalizedName = normalizeStyleSwitchText(name);
+                if (normalizedName && normalizedMessage.includes(normalizedName)) {
+                    requested.add(name);
+                }
+            });
+    }
+
+    return Array.from(requested);
+};
+
+const selectMapLayerStateByAttribute = (
+    mapState: ConversationMapState,
+    aiArgs: Record<string, unknown>,
+    message?: string
+): ConversationMapLayerState | undefined => {
+    const requestedAttributes = getRequestedAttributeNamesForLayerSelection(mapState, aiArgs, message)
+        .map((name) => normalizeStyleSwitchText(name))
+        .filter(Boolean);
+    if (requestedAttributes.length === 0) return undefined;
+
+    const matches = Object.entries(mapState.layers)
+        .map(([layerId, layerState]) => {
+            const attributeNames = getMapLayerStateAttributeNames(layerState);
+            const matchedAttribute = attributeNames
+                .map((name) => normalizeStyleSwitchText(name))
+                .filter(Boolean)
+                .find((name) => requestedAttributes.includes(name));
+            if (!matchedAttribute) return undefined;
+
+            return {
+                layerState,
+                score: matchedAttribute.length,
                 isActive: mapState.activeLayerId === layerId
             };
         })
         .filter((item): item is { layerState: ConversationMapLayerState; score: number; isActive: boolean } => Boolean(item))
-        .sort((left, right) => right.score - left.score || Number(right.isActive) - Number(left.isActive));
+        .sort((left, right) => (
+            Number(right.isActive) - Number(left.isActive)
+            || right.score - left.score
+        ));
 
     return matches[0]?.layerState;
 };
@@ -2138,19 +2274,22 @@ const selectMapLayerIdsByText = (
     return Object.entries(mapState.layers)
         .map(([layerId, layerState]) => {
             const terms = getLayerMatchTerms(layerId, layerState);
-            const matchedTerm = terms
-                .filter((term) => normalizedRequest.includes(term) || term.includes(normalizedRequest))
-                .sort((left, right) => right.length - left.length)[0];
-            if (!matchedTerm) return undefined;
+            const match = scoreLayerTextMatch(terms, normalizedRequest);
+            if (!match) return undefined;
 
             return {
                 layerId,
-                score: matchedTerm.length,
+                ...match,
                 isActive: mapState.activeLayerId === layerId
             };
         })
-        .filter((item): item is { layerId: string; score: number; isActive: boolean } => Boolean(item))
-        .sort((left, right) => right.score - left.score || Number(right.isActive) - Number(left.isActive))
+        .filter((item): item is { layerId: string; score: number; longestMatch: number; matchCount: number; isActive: boolean } => Boolean(item))
+        .sort((left, right) => (
+            right.score - left.score
+            || right.longestMatch - left.longestMatch
+            || right.matchCount - left.matchCount
+            || Number(right.isActive) - Number(left.isActive)
+        ))
         .map((item) => item.layerId);
 };
 
@@ -2161,6 +2300,8 @@ const selectMapLayerStateForEdit = (
 ): ConversationMapLayerState | undefined => {
     if (!mapState?.layers) return undefined;
 
+    // Explicit layerId wins over text matching because conversations can contain
+    // several layers with similar titles or translated labels.
     const requestedLayerId = getRequestedLayerIdFromToolArgs(aiArgs);
     if (requestedLayerId && mapState.layers[requestedLayerId]) {
         return mapState.layers[requestedLayerId];
@@ -2173,6 +2314,11 @@ const selectMapLayerStateForEdit = (
     const requestedLayerState = selectMapLayerStateByText(mapState, requestedLayerText);
     if (requestedLayerState) {
         return requestedLayerState;
+    }
+
+    const requestedAttributeLayerState = selectMapLayerStateByAttribute(mapState, aiArgs, message);
+    if (requestedAttributeLayerState) {
+        return requestedAttributeLayerState;
     }
 
     return getLatestLayerState(mapState);
@@ -2198,6 +2344,8 @@ const selectMapStyleForEdit = (
         const variant = attributeKey ? variants.get(attributeKey) : undefined;
         if (!variant || !Array.isArray(variant.layers)) return mapStyle;
 
+        // Attribute variants are stored as edit history for a style. Rehydrate the
+        // requested variant here so later patches target the user's active attribute.
         return {
             ...styleRecord,
             ...variant,
@@ -2807,6 +2955,10 @@ const buildStyleLayerIdSuffix = (value: unknown, index: number): string => {
     return text.toLowerCase().replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '') || String(index);
 };
 
+const areMapStyleValuesEqual = (left: unknown, right: unknown): boolean => {
+    return JSON.stringify(left) === JSON.stringify(right);
+};
+
 const buildFallbackLayerPaint = (
     paint: Record<string, unknown>,
     colorPaintKey: string,
@@ -2841,6 +2993,15 @@ const buildFilteredAttributeColorLayers = (
     if (!targetEntry) return undefined;
 
     const [paintKey, paintValue] = targetEntry;
+    const existingFilterMatch = getFilterEqualityAttributeValue(layer.filter);
+    const constrainedValue = existingFilterMatch?.attributeKey === attributeStops.attributeKey
+        ? existingFilterMatch.value
+        : undefined;
+    const activeStops = constrainedValue !== undefined
+        ? attributeStops.stops.filter((stop) => areMapStyleValuesEqual(stop.value, constrainedValue))
+        : attributeStops.stops;
+    if (activeStops.length === 0) return undefined;
+
     const baseId = toSuggestionString(layer.id)
         || [
             toSuggestionString(asRecord(currentStyle).layerId),
@@ -2848,15 +3009,19 @@ const buildFilteredAttributeColorLayers = (
             toSuggestionString(layer.type)
         ].filter(Boolean).join('-')
         || 'map-style-layer';
-    const filteredLayers = attributeStops.stops.map((stop, index) => ({
+    const filteredLayers = activeStops.map((stop, index) => ({
         ...layer,
         id: `${baseId}-${attributeStops.attributeKey}-${buildStyleLayerIdSuffix(stop.value, index)}`,
-        filter: combineMapStyleFilters(layer.filter, ['==', ['get', attributeStops.attributeKey], stop.value]),
+        filter: constrainedValue !== undefined
+            ? layer.filter
+            : combineMapStyleFilters(layer.filter, ['==', ['get', attributeStops.attributeKey], stop.value]),
         paint: {
             ...paint,
             [paintKey]: replacePaintColors(paintValue, stop.color)
         }
     }));
+    if (constrainedValue !== undefined) return filteredLayers;
+
     const fallbackFilter = buildExcludeAttributeValuesFilter(
         attributeStops.attributeKey,
         attributeStops.stops.map((stop) => stop.value)
@@ -3074,6 +3239,51 @@ const mergeLayerEditsIntoPresetLayer = (
     };
 };
 
+const getMapStyleLayerTypes = (style: unknown): Set<string> => {
+    const layers = asRecord(style).layers;
+    if (!Array.isArray(layers)) return new Set();
+
+    return new Set(
+        layers
+            .map((layer) => toSuggestionString(asRecord(layer).type)?.toLowerCase())
+            .filter((type): type is string => Boolean(type))
+    );
+};
+
+const isCircleHeatmapStyleSwitch = (presetStyle: unknown, currentStyle: unknown): boolean => {
+    const presetTypes = getMapStyleLayerTypes(presetStyle);
+    const currentTypes = getMapStyleLayerTypes(currentStyle);
+
+    return (
+        (currentTypes.has('circle') && presetTypes.has('heatmap'))
+        || (currentTypes.has('heatmap') && presetTypes.has('circle'))
+    );
+};
+
+const mergeCurrentFiltersIntoPresetLayers = (
+    presetLayers: Array<Record<string, unknown>>,
+    currentLayers: Array<Record<string, unknown>>,
+    mapPayload?: unknown
+): Array<Record<string, unknown>> => {
+    // Filters describe which features are visible, so they can survive a style
+    // shape change such as circle <-> heatmap even when paint expressions cannot.
+    const canMatchByIndex = currentLayers.length === 1 || currentLayers.length === presetLayers.length;
+
+    return presetLayers.map((presetLayer, index) => {
+        const presetId = toSuggestionString(presetLayer.id);
+        const currentLayer = presetId
+            ? currentLayers.find((layer) => toSuggestionString(layer.id) === presetId)
+            : canMatchByIndex
+                ? currentLayers[index] || currentLayers[0]
+                : undefined;
+        const layerWithFilter = currentLayer?.filter !== undefined
+            ? { ...presetLayer, filter: currentLayer.filter }
+            : presetLayer;
+
+        return sanitizeMapStyleLayerForPayload(layerWithFilter, mapPayload);
+    });
+};
+
 const mergeCurrentMapStyleIntoPreset = (
     presetStyle: unknown,
     currentStyle?: unknown,
@@ -3084,6 +3294,14 @@ const mergeCurrentMapStyleIntoPreset = (
     const presetLayers = Array.isArray(presetRecord.layers) ? presetRecord.layers.map(asRecord) : [];
     const currentLayers = Array.isArray(currentRecord.layers) ? currentRecord.layers.map(asRecord) : [];
     if (presetLayers.length === 0 || currentLayers.length === 0) return presetRecord;
+    if (isCircleHeatmapStyleSwitch(presetRecord, currentRecord)) {
+        // Circle and heatmap paints have different MapLibre semantics. Keep the
+        // new preset paint and only carry filters forward.
+        return {
+            ...presetRecord,
+            layers: mergeCurrentFiltersIntoPresetLayers(presetLayers, currentLayers, mapPayload)
+        };
+    }
     const currentColor = getCurrentMapStyleColor(currentStyle);
     const activeAttribute = toSuggestionString(currentRecord.attributeStyleKey || currentRecord.attributeKey);
 
@@ -3383,6 +3601,34 @@ const buildAttributeValueSuggestionItems = (
     }];
 };
 
+const buildAttributeFilterSuggestionItems = (
+    mapPayload: unknown,
+    mapStyle: unknown,
+    instruction?: string
+) => {
+    const fields = getSuggestionAttributeFields(mapPayload, mapStyle, instruction);
+    if (fields.length === 0) return [];
+
+    const styleRecord = asRecord(mapStyle);
+    const activeAttributeKey = toSuggestionString(styleRecord.attributeStyleKey || styleRecord.attributeKey);
+    const selectedField = activeAttributeKey
+        ? fields.find((field) => normalizeStyleSwitchText(field.name) === normalizeStyleSwitchText(activeAttributeKey))
+        : resolveRequestedSuggestionAttribute(fields, instruction);
+    if (!selectedField) return [];
+
+    const isNumberAttribute = selectedField.type?.trim().toLowerCase() === 'number';
+
+    return [{
+        key: 'filter_by_attribute',
+        label: 'Filter by attribute ',
+        attributeKey: selectedField.name,
+        ...(selectedField.type ? { attributeType: selectedField.type } : {}),
+        promptTemplate: isNumberAttribute
+            ? `Filter the map ${selectedField.name} greater than `
+            : `Filter  the map ${selectedField.name} is `
+    }];
+};
+
 const isAttributeValueStyleEditInstruction = (instruction?: string): boolean => {
     if (typeof instruction !== 'string') return false;
     return /\bvalue\s+\S+/i.test(instruction);
@@ -3409,6 +3655,11 @@ const buildMapSuggestionsPayload = (
     const styles = Array.isArray(catalogRecord.styles) ? catalogRecord.styles : [];
     const colors = Array.isArray(catalogRecord.colors) ? catalogRecord.colors : [];
     const attributeValueItems = buildAttributeValueSuggestionItems(
+        mapPayload,
+        mapStyle,
+        instruction || toSuggestionString(styleRecord.styleInstruction)
+    );
+    const attributeFilterItems = buildAttributeFilterSuggestionItems(
         mapPayload,
         mapStyle,
         instruction || toSuggestionString(styleRecord.styleInstruction)
@@ -3487,6 +3738,7 @@ const buildMapSuggestionsPayload = (
             : []),
         ...(hideAttributeStyleSuggestion ? [] : buildAttributeStyleSuggestionItems(mapPayload, mapStyle)),
         ...attributeValueItems,
+        ...attributeFilterItems,
         ...buildClearMapSuggestionItems()
     ];
 
@@ -3703,7 +3955,7 @@ const buildMapFilterPatch = (
     mapStyle: unknown
 ): Record<string, unknown> | undefined => {
     const operation = normalizeMapEditOperationName(args.operation || args.action);
-    if (!operation || !['set_filter', 'add_filter', 'remove_filter', 'clear_filter'].includes(operation)) {
+    if (operation !== 'add_filter') {
         return undefined;
     }
 
@@ -3719,7 +3971,7 @@ const buildMapFilterPatch = (
     const patches = selectedLayers.map((layer) => ({
         ...(toSuggestionString(layer.id) ? { styleLayerId: toSuggestionString(layer.id) } : {}),
         ...(toSuggestionString(layer.type) ? { layerType: toSuggestionString(layer.type) } : {}),
-        filter: operation === 'clear_filter' ? null : layer.filter ?? null
+        filter: layer.filter ?? null
     }));
 
     return {
@@ -3728,6 +3980,22 @@ const buildMapFilterPatch = (
         operation,
         patches
     };
+};
+
+const extractMapAttributeNameFromInstruction = (instruction?: string): string | undefined => {
+    if (!instruction) return undefined;
+
+    const patterns = [
+        /\battribute\s+([A-Za-z_][A-Za-z0-9_-]*)/i,
+        /\bfield\s+([A-Za-z_][A-Za-z0-9_-]*)/i,
+        /\bproperty\s+([A-Za-z_][A-Za-z0-9_-]*)/i
+    ];
+    for (const pattern of patterns) {
+        const match = instruction.match(pattern);
+        if (match?.[1]) return match[1];
+    }
+
+    return undefined;
 };
 
 const resolveRequestedMapAttribute = (
@@ -3751,16 +4019,21 @@ const resolveRequestedMapAttribute = (
         const normalizedExplicitKey = normalizeStyleSwitchText(explicitKey);
         const explicitMatch = entries.find((field) => normalizeStyleSwitchText(field.name) === normalizedExplicitKey);
         if (explicitMatch) return explicitMatch;
+        return { name: explicitKey };
     }
 
     if (!normalizedInstruction) return undefined;
 
-    return entries
+    const fieldMatch = entries
         .filter((field) => {
             const normalizedName = normalizeStyleSwitchText(field.name);
             return normalizedName && normalizedInstruction.includes(normalizedName);
         })
         .sort((left, right) => right.name.length - left.name.length)[0];
+    if (fieldMatch) return fieldMatch;
+
+    const inferredAttribute = extractMapAttributeNameFromInstruction(instruction);
+    return inferredAttribute ? { name: inferredAttribute } : undefined;
 };
 
 const getMapPayloadAttributeFieldByName = (
@@ -3976,18 +4249,44 @@ const buildAttributeEditArgs = async (
 
 const buildFilterEditArgs = (
     baseArgs: Record<string, unknown>,
-    mapPayload: unknown
+    mapPayload: unknown,
+    mapStyle?: unknown
 ): Record<string, unknown> => {
     const operation = normalizeMapEditOperationName(baseArgs.operation || baseArgs.action);
     if (!operation?.endsWith('_filter')) return baseArgs;
 
     const layer = getSuggestionLayerRecord(mapPayload);
     const fields = asRecord(asRecord(layer.attributes).fields);
-    if (Object.keys(fields).length === 0) return baseArgs;
+    const attributeFields: Record<string, unknown> = { ...fields };
+    const styleRecord = asRecord(mapStyle);
+    const styleAttributeKey = toSuggestionString(styleRecord.attributeStyleKey || styleRecord.attributeKey);
+    const styleAttributeType = toSuggestionString(styleRecord.attributeStyleType || styleRecord.attributeType);
+    // Some edited attributes exist only in the current map_style metadata. Merge
+    // them into fields so filter prompts still work after several style edits.
+    if (styleAttributeKey && styleAttributeType && attributeFields[styleAttributeKey] === undefined) {
+        attributeFields[styleAttributeKey] = { type: styleAttributeType };
+    }
+    for (const variant of getMapStyleAttributeVariants(mapStyle).values()) {
+        const name = toSuggestionString(variant.attributeKey || variant.name || variant.value);
+        const type = toSuggestionString(variant.attributeType || variant.type);
+        if (name && type && attributeFields[name] === undefined) {
+            attributeFields[name] = { type };
+        }
+    }
+    for (const condition of Array.isArray(baseArgs.filterConditions) ? baseArgs.filterConditions : []) {
+        const record = asRecord(condition);
+        const attributeKey = toSuggestionString(record.attributeKey || record.field || record.key);
+        if (!attributeKey || attributeFields[attributeKey] !== undefined) continue;
+        const fallbackType = attributeKey === styleAttributeKey
+            ? styleAttributeType
+            : toSuggestionString(asRecord(getMapStyleAttributeVariants(mapStyle).get(attributeKey)).attributeType);
+        if (fallbackType) attributeFields[attributeKey] = { type: fallbackType };
+    }
+    if (Object.keys(attributeFields).length === 0) return baseArgs;
 
     return {
         ...baseArgs,
-        attributeFields: fields
+        attributeFields
     };
 };
 
@@ -4020,21 +4319,77 @@ const getFilterLogicForInferredCondition = (
         : 'all';
 };
 
+const escapeFilterValuePattern = (value: string): string => {
+    return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+};
+
+const getFilterValueText = (value: unknown): string | undefined => {
+    const rawValue = asRecord(value).value ?? value;
+    if (rawValue === undefined || rawValue === null || rawValue === '') return undefined;
+    return String(rawValue);
+};
+
+const matchesFilterValueText = (instruction: string, valueText: string): boolean => {
+    const trimmedValue = valueText.trim();
+    if (!trimmedValue) return false;
+
+    if (/^[A-Za-z0-9_ -]+$/.test(trimmedValue)) {
+        const pattern = new RegExp(`(^|[^A-Za-z0-9_])${escapeFilterValuePattern(trimmedValue)}([^A-Za-z0-9_]|$)`, 'i');
+        return pattern.test(instruction);
+    }
+
+    return instruction.toLowerCase().includes(trimmedValue.toLowerCase());
+};
+
 const resolveFilterValueFromInstruction = (
     instruction: string | undefined,
     values: unknown[]
 ): unknown | undefined => {
-    const normalizedInstruction = normalizeStyleSwitchText(instruction);
-    if (!normalizedInstruction) return undefined;
+    return resolveFilterValuesFromInstruction(instruction, values)[0];
+};
 
-    return values
+const resolveFilterValuesFromInstruction = (
+    instruction: string | undefined,
+    values: unknown[]
+): unknown[] => {
+    if (!instruction?.trim()) return [];
+
+    const rawMatches = values
         .map((item) => asRecord(item).value ?? item)
         .filter((value) => value !== undefined && value !== null && value !== '')
         .sort((left, right) => String(right).length - String(left).length)
-        .find((value) => {
-            const normalizedValue = normalizeStyleSwitchText(value);
-            return normalizedValue && normalizedInstruction.includes(normalizedValue);
+        .filter((value, index, matchedValues) => {
+            const valueText = getFilterValueText(value);
+            if (!valueText || !matchesFilterValueText(instruction, valueText)) return false;
+            const serialized = JSON.stringify(value);
+            return matchedValues.findIndex((item) => JSON.stringify(item) === serialized) === index;
         });
+    if (rawMatches.length > 0) return rawMatches;
+
+    const normalizedInstruction = normalizeStyleSwitchText(instruction);
+    if (!normalizedInstruction) return [];
+
+    const normalizedMatches = values
+        .map((item) => asRecord(item).value ?? item)
+        .filter((value) => value !== undefined && value !== null && value !== '')
+        .sort((left, right) => String(right).length - String(left).length)
+        .filter((value, index, matchedValues) => {
+            const normalizedValue = normalizeStyleSwitchText(value);
+            if (!normalizedValue || !normalizedInstruction.includes(normalizedValue)) return false;
+            const serialized = JSON.stringify(value);
+            return matchedValues.findIndex((item) => JSON.stringify(item) === serialized) === index;
+        });
+
+    const keptNormalizedValues: string[] = [];
+    return normalizedMatches.filter((value) => {
+        const normalizedValue = normalizeStyleSwitchText(value);
+        if (!normalizedValue) return false;
+        if (keptNormalizedValues.some((kept) => kept !== normalizedValue && kept.includes(normalizedValue))) {
+            return false;
+        }
+        keptNormalizedValues.push(normalizedValue);
+        return true;
+    });
 };
 
 const normalizeMapEditOperationName = (value: unknown): string | undefined => {
@@ -4072,6 +4427,70 @@ const hasExplicitStyleEditArgs = (args: Record<string, unknown>): boolean => {
     });
 };
 
+const resolveActiveMapStyleAttribute = (
+    mapPayload: unknown,
+    mapStyle?: unknown
+): { name: string; type?: string } | undefined => {
+    const styleRecord = asRecord(mapStyle);
+    const attributeKey = toSuggestionString(styleRecord.attributeStyleKey || styleRecord.attributeKey);
+    if (!attributeKey) return undefined;
+
+    const payloadField = getMapPayloadAttributeFieldByName(mapPayload, attributeKey);
+    const attributeType = toSuggestionString(styleRecord.attributeStyleType || styleRecord.attributeType)
+        || payloadField.type
+        || toSuggestionString(asRecord(getMapStyleAttributeVariants(mapStyle).get(attributeKey)).attributeType);
+
+    return {
+        name: attributeKey,
+        ...(attributeType ? { type: attributeType } : {})
+    };
+};
+
+const resolveRequestedFilterAttribute = (
+    mapPayload: unknown,
+    instruction: string | undefined,
+    explicitAttributeKey: unknown,
+    mapStyle?: unknown
+): { name: string; type?: string } | undefined => {
+    return resolveRequestedMapAttribute(mapPayload, instruction, explicitAttributeKey)
+        || resolveActiveMapStyleAttribute(mapPayload, mapStyle);
+};
+
+const resolveNumericFilterOperatorFromInstruction = (instruction: string | undefined): string | undefined => {
+    const normalized = (instruction || '').toLowerCase();
+    if (!normalized.trim()) return undefined;
+    if (/(>=|greater\s+than\s+or\s+equal|at\s+least|not\s+less\s+than|มากกว่า\s*หรือ\s*เท่ากับ|ตั้งแต่)/i.test(normalized)) return '>=';
+    if (/(<=|less\s+than\s+or\s+equal|at\s+most|not\s+more\s+than|น้อยกว่า\s*หรือ\s*เท่ากับ)/i.test(normalized)) return '<=';
+    if (/(!=|not\s+equal|ไม่เท่ากับ)/i.test(normalized)) return '!=';
+    if (/(>|more\s+than|greater\s+than|above|over|มากกว่า)/i.test(normalized)) return '>';
+    if (/(<|less\s+than|below|under|น้อยกว่า)/i.test(normalized)) return '<';
+    if (/(==|=|\bis\b|\bequal\b|เท่ากับ)/i.test(normalized)) return '==';
+    return undefined;
+};
+
+const resolveNumericFilterValueFromInstruction = (instruction: string | undefined): number | undefined => {
+    const matches = Array.from((instruction || '').matchAll(/(?:^|[^\w.])([-+]?\d+(?:\.\d+)?)/g))
+        .map((match) => Number(match[1]))
+        .filter(Number.isFinite);
+    return matches.length > 0 ? matches[matches.length - 1] : undefined;
+};
+
+const buildNumericFilterConditionFromInstruction = (
+    instruction: string | undefined,
+    attribute: { name: string; type?: string }
+): Record<string, unknown> | undefined => {
+    if (attribute.type?.trim().toLowerCase() !== 'number') return undefined;
+    const operator = resolveNumericFilterOperatorFromInstruction(instruction);
+    const value = resolveNumericFilterValueFromInstruction(instruction);
+    if (!operator || value === undefined) return undefined;
+
+    return {
+        attributeKey: attribute.name,
+        operator,
+        value
+    };
+};
+
 const buildFilterEditArgsFromInstruction = async (
     baseArgs: Record<string, unknown>,
     mapPayload: unknown,
@@ -4081,22 +4500,15 @@ const buildFilterEditArgsFromInstruction = async (
     mapStyle?: unknown
 ): Promise<Record<string, unknown> | undefined> => {
     const requestedOperation = normalizeMapEditOperationName(baseArgs.operation || baseArgs.action);
-    const isExplicitFilterOperation = requestedOperation?.endsWith('_filter') === true;
-    if (requestedOperation === 'clear_filter'
-        || (requestedOperation === 'remove_filter' && !hasFilterPayloadArgs(baseArgs))
-    ) {
-        return buildFilterEditArgs({
-            ...baseArgs,
-            operation: 'clear_filter'
-        }, mapPayload);
-    }
+    const isExplicitFilterOperation = requestedOperation === 'add_filter';
 
     if (!isExplicitFilterOperation && hasExplicitStyleEditArgs(baseArgs)) return undefined;
 
-    const requestedAttribute = resolveRequestedMapAttribute(
+    const requestedAttribute = resolveRequestedFilterAttribute(
         mapPayload,
         instruction,
-        baseArgs.attributeKey
+        baseArgs.attributeKey,
+        mapStyle
     );
     if (!requestedAttribute) return undefined;
 
@@ -4110,6 +4522,18 @@ const buildFilterEditArgsFromInstruction = async (
     const styleAttributeValues = (collectMapStyleAttributeValues(mapStyle).get(requestedAttribute.name) || [])
         .map((item) => item.value)
         .filter((value) => value !== undefined && value !== null && value !== '');
+    const filterOperation = 'add_filter';
+    const numericCondition = buildNumericFilterConditionFromInstruction(instruction, requestedAttribute);
+    if (numericCondition) {
+        // Numeric filters do not need an attribute value lookup; the prompt already
+        // contains the operator and threshold.
+        return buildFilterEditArgs({
+            ...baseArgs,
+            operation: filterOperation,
+            filterConditions: [numericCondition],
+            filterLogic: getFilterLogicForInferredCondition(filterOperation, requestedAttribute.name, mapStyle)
+        }, mapPayload, mapStyle);
+    }
 
     let apiAttributeValues: unknown[] = [];
     if (intentName && provider && datasetId) {
@@ -4135,22 +4559,22 @@ const buildFilterEditArgsFromInstruction = async (
             const current = JSON.stringify(asRecord(value).value ?? value);
             return values.findIndex((item) => JSON.stringify(asRecord(item).value ?? item) === current) === index;
         });
-    const filterValue = resolveFilterValueFromInstruction(instruction, attributeValues);
+    const filterValues = resolveFilterValuesFromInstruction(instruction, attributeValues);
+    const filterValue = filterValues[0] ?? resolveFilterValueFromInstruction(instruction, attributeValues);
     if (filterValue === undefined) return undefined;
-    const filterOperation = isExplicitFilterOperation && requestedOperation
-        ? requestedOperation
-        : 'set_filter';
 
     return buildFilterEditArgs({
         ...baseArgs,
         operation: filterOperation,
         filterConditions: [{
             attributeKey: requestedAttribute.name,
-            operator: '==',
-            value: filterValue
+            operator: filterValues.length > 1 ? 'in' : '==',
+            ...(filterValues.length > 1 ? { values: filterValues } : { value: filterValue })
         }],
-        filterLogic: getFilterLogicForInferredCondition(filterOperation, requestedAttribute.name, mapStyle)
-    }, mapPayload);
+        filterLogic: filterValues.length > 1
+            ? 'any'
+            : getFilterLogicForInferredCondition(filterOperation, requestedAttribute.name, mapStyle)
+    }, mapPayload, mapStyle);
 };
 
 const buildFallbackAttributeStyleArgs = (
@@ -4561,6 +4985,10 @@ const hasMapChoiceSelectionFromMessage = (
         const normalizedValue = normalizeMapSearchText(value);
         return normalizedValue.length > 0 && normalizedMessage.includes(normalizedValue);
     });
+};
+
+const isPmtilesRenderRequest = (message: string): boolean => {
+    return /\bpm\s*tiles?\b/i.test(message);
 };
 
 const normalizeMapSearchText = (value: unknown): string => {
@@ -5173,9 +5601,9 @@ export const processChatMessageStream = (
                             }
                         }
                     }
-                    const sanitizedMessagesForLLM = messagesForLLM
-                        .filter((msg) => msg.role !== 'system')
-                        .map((msg) => ({ role: msg.role, content: msg.content }));
+    const sanitizedMessagesForLLM = messagesForLLM
+        .filter((msg) => msg.role !== 'system')
+        .map((msg) => ({ role: msg.role, content: msg.content }));
                     const lastMessageForLLM = sanitizedMessagesForLLM.pop();
                     const memoryPayload = isGuest
                         ? {}
@@ -5187,6 +5615,8 @@ export const processChatMessageStream = (
                     const conversationMapState = mapFeaturesEnabled
                         ? (memoryPayload.conversationMapState || buildConversationMapStateFromMessages(messagesForLLM)) as ConversationMapState | undefined
                         : undefined;
+                    // Current DB state is preferred over message-derived history so
+                    // edits continue from the layer/style actually rendered now.
                     const latestMapStyle = mapFeaturesEnabled
                         ? getLatestMapStyleFromState(conversationMapState)
                             || getLatestMapStyleFromMessages(messagesForLLM)
@@ -5339,6 +5769,33 @@ export const processChatMessageStream = (
                         if (mapStylePayload) {
                             writeSse(controller, 'map_style', toPublicMapStyleStreamPayload(mapStylePayload));
                         }
+                        await safeSyncConversationMapLayerCatalog(convId, payload, mapStylePayload);
+
+                        const styleCatalog = mapStylePayload ? await handleStyleCatalogTool() : undefined;
+                        let suggestionsPayload = mapStylePayload && styleCatalog
+                            ? buildMapSuggestionsPayload(payload, mapStylePayload, styleCatalog, conversationMapState, hasUserMessage ? message : undefined)
+                            : buildMapControlSuggestionsPayload();
+                        suggestionsPayload = await enrichMapSuggestionsWithAttributeValues(
+                            suggestionsPayload,
+                            payload,
+                            userId,
+                            mapHeaderApiKey,
+                            false
+                        );
+                        const splitSuggestions = splitMapSuggestionsPayload(suggestionsPayload);
+                        if (splitSuggestions.attributeValues) {
+                            writeSse(controller, 'attribute_values', splitSuggestions.attributeValues);
+                        }
+                        if (splitSuggestions.suggestions) {
+                            writeSse(controller, 'suggestions', splitSuggestions.suggestions);
+                        }
+                        return mapStylePayload;
+                    };
+                    const writeMapSourceSwitchEvents = async (payload: unknown, currentStyle: unknown) => {
+                        writeSse(controller, 'map', toPublicMapStreamPayload(payload));
+                        const mapStylePayload = currentStyle
+                            ? mergeMapStyleAttributeVariants(currentStyle, undefined, payload)
+                            : undefined;
                         await safeSyncConversationMapLayerCatalog(convId, payload, mapStylePayload);
 
                         const styleCatalog = mapStylePayload ? await handleStyleCatalogTool() : undefined;
@@ -5652,6 +6109,57 @@ export const processChatMessageStream = (
                     };
 
                     if (
+                        mapFeaturesEnabled
+                        && latestMapPayload
+                        && latestMapStyle
+                        && hasUserMessage
+                        && !hasMapSelection
+                        && isPmtilesRenderRequest(message)
+                    ) {
+                        const pmtilesResult = await handleRenderPmtilesLayerTool(
+                            userId,
+                            latestMapPayload,
+                            mapHeaderApiKey
+                        );
+
+                        if (pmtilesResult.success && pmtilesResult.payload) {
+                            const mapStylePayload = await writeMapSourceSwitchEvents(pmtilesResult.payload, latestMapStyle);
+                            const mapMetadata = createMapMetadata(pmtilesResult.payload, mapStylePayload);
+                            const postReply = await streamPostMapEventReply('map', pmtilesResult.payload);
+                            const assistantMessageId = await saveAssistantMessage(
+                                postReply.reply,
+                                mapMetadata,
+                                0,
+                                postReply.tokenUsage
+                            );
+                            writeSse(controller, 'done', {
+                                done: true,
+                                tokenUsage: postReply.tokenUsage,
+                                assistantmessage_Id: assistantMessageId,
+                                skippedAssistantReply: true,
+                                reason: 'pmtiles_layer_ready'
+                            });
+                            closeSafely();
+                            return;
+                        }
+
+                        const mapErrorMessage = getToolErrorMessage(pmtilesResult, 'Unable to build the PMTiles URL for the current layer.');
+                        writeSse(controller, 'map_error', { message: mapErrorMessage });
+                        const assistantMessageId = await saveAssistantMessage(
+                            mapErrorMessage,
+                            toPrismaJsonObject({ event: 'map_error', message: mapErrorMessage })
+                        );
+                        writeSse(controller, 'token', { text: mapErrorMessage });
+                        writeSse(controller, 'done', {
+                            done: true,
+                            tokenUsage: 0,
+                            assistantmessage_Id: assistantMessageId
+                        });
+                        closeSafely();
+                        return;
+                    }
+
+                    if (
                         mapRequestIntent === 'map_control'
                         && latestMapPayload
                         && latestMapStyle
@@ -5741,9 +6249,6 @@ export const processChatMessageStream = (
                                 ...(shouldOfferMapStyleEdit
                                     ? ['Latest active map_style is available. If the user asks to change a map paint/layout property, call edit_map_style.']
                                     : []),
-                                ...(shouldOfferMapStyleEdit
-                                    ? ['If the user asks to remove or clear a feature filter from a displayed layer, call edit_map_style with operation "clear_filter". Do not call clear_map_layers unless the user wants to remove/hide the layer itself.']
-                                    : []),
                                 'If the user asks to clear displayed map layers or styles, call clear_map_layers. Use mode "selected" for one or more named entries, or mode "all" for every displayed entry. You may pass layerId, styleId, layerTitle, or layerIds; the backend resolves them against conversation map state.',
                                 'Do not call get_map_layer for style-only edits.',
                                 'Do not call get_map_layer for map layer clear commands.',
@@ -5761,7 +6266,7 @@ export const processChatMessageStream = (
                                         'If the user asks to add any style property to the current layer, call edit_map_style with operation "add_property" and use the exact paintKey or layoutKey named in the prompt plus value/colorKey/colorValue.',
                                         'If the user asks to remove/delete a style property, call edit_map_style with operation "remove_property". Semantically map the user wording to the closest exact paintKey/layoutKey that already exists in Current map_style; do not invent a new property key.',
                                         'For remove_property, ignore any trailing property value in the user wording because removing a property does not set a value.',
-                                        'If the user intent is to limit feature visibility by attribute/value conditions, call edit_map_style with a filter operation instead of changing paint. Use set_filter to replace the current filter, add_filter to add conditions, remove_filter to remove matching conditions, and clear_filter to remove all filter conditions.',
+                                        'If the user intent is to limit feature visibility by attribute/value conditions, call edit_map_style with operation "add_filter" instead of changing paint. Filters only add conditions to the current map style.',
                                         'For filter operations, send filterConditions with attributeKey, operator, and value or values. Use filterLogic "all" when every condition must match and "any" when at least one condition may match. Attribute names and types are validated against the selected layer catalog.',
                                         'Normalize a single requested color into colorKey from the style color catalog or a valid colorValue hex. Never combine multiple requested colors into one color; assign them to their requested attribute values or properties.',
                                         'If the user asks to use/add/apply/change colors from the current or previous image/photo, including wording like "like image", read Latest vision memory dominantColors and call edit_map_style with colorValue from the best matching dominant color hex. Do not answer text-only for this request.',
@@ -6128,7 +6633,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                         return;
                     }
 
-                    // อ่าน stream จาก Ollama แล้วแปลงเป็น SSE token ส่งต่อให้ frontend
+                    // Convert Ollama chunks into SSE tokens while intercepting tool calls.
                     let assistantReply = '';
                     let tokenUsage = 0;
                     const decoder = new TextDecoder();
@@ -6140,13 +6645,21 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                     const executeEditMapStyle = async (aiArguments: Record<string, unknown>) => {
                         const selectedMapPayload = selectMapPayloadForEdit(conversationMapState, aiArguments, latestMapPayload, message);
+                        // Infer filter/style intent against the selected layer first;
+                        // using only the latest global style breaks multi-layer chats.
+                        const inferredMapStyle = selectMapStyleForEdit(
+                            conversationMapState,
+                            aiArguments,
+                            message,
+                            latestMapStyle
+                        );
                         const filterArguments = await buildFilterEditArgsFromInstruction(
                             aiArguments,
                             selectedMapPayload,
                             userId,
                             typeof aiArguments.instruction === 'string' ? aiArguments.instruction : message,
                             mapHeaderApiKey,
-                            latestMapStyle
+                            inferredMapStyle
                         );
                         const normalizedAiArguments = filterArguments || aiArguments;
                         const requestedEditOperation = normalizeMapEditOperationName(normalizedAiArguments.operation || normalizedAiArguments.action);
@@ -6158,7 +6671,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             latestMapStyle
                         );
                         const enrichedEditArguments = isFilterEdit
-                            ? buildFilterEditArgs(normalizedAiArguments, selectedMapPayload)
+                            ? buildFilterEditArgs(normalizedAiArguments, selectedMapPayload, initialMapStyle)
                             : await buildAttributeEditArgs(
                                 normalizedAiArguments,
                                 selectedMapPayload,
@@ -6238,7 +6751,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             return true;
                         }
 
-                        const styleErrorMessage = getToolErrorMessage(editResult, 'ไม่สามารถแก้ style แผนที่ได้ครับ');
+                        const styleErrorMessage = getToolErrorMessage(editResult, 'Unable to edit the map style.');
                         writeSse(controller, 'map_error', { message: styleErrorMessage });
                         assistantReply += styleErrorMessage;
                         writeSse(controller, 'token', { text: styleErrorMessage });
@@ -6256,7 +6769,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                         }
 
                         if (toolCalls.length > 0) {
-                            console.log("=== สิ่งที่ AI คิดและตอบกลับมา ===");
+                            console.log("=== AI tool-call decision ===");
                             console.log(JSON.stringify(toolCalls, null, 2));
                         }
 
@@ -6266,24 +6779,11 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             if (handledToolCalls.has(toolCallKey)) continue;
                             handledToolCalls.add(toolCallKey);
 
-                            console.log(`AI ตัดสินใจเรียก Tool ชื่อ: ${toolName}`);
-                            console.log('พร้อมกับแนบข้อมูลมาให้คือ:', toolCall?.function?.arguments ?? toolCall?.arguments);
+                            console.log(`AI decided to call tool: ${toolName}`);
+                            console.log('Tool arguments:', toolCall?.function?.arguments ?? toolCall?.arguments);
 
                             if (toolName === 'clear_map_layers') {
                                 const aiArguments = parseToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments);
-                                const clearFilterArguments = await buildFilterEditArgsFromInstruction(
-                                    aiArguments,
-                                    selectMapPayloadForEdit(conversationMapState, aiArguments, latestMapPayload, message),
-                                    userId,
-                                    message,
-                                    mapHeaderApiKey,
-                                    latestMapStyle
-                                );
-                                if (clearFilterArguments) {
-                                    const handledClearFilter = await executeEditMapStyle(clearFilterArguments);
-                                    if (handledClearFilter) continue;
-                                }
-
                                 const controlResult = await handleClearMapLayersTool(
                                     userId,
                                     convId,
@@ -6299,7 +6799,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                     assistantReply += postReply.reply;
                                     tokenUsage += postReply.tokenUsage;
                                 } else {
-                                    const controlErrorMessage = getToolErrorMessage(controlResult, 'ไม่สามารถจัดการ layer แผนที่ได้ครับ');
+                                    const controlErrorMessage = getToolErrorMessage(controlResult, 'Unable to manage map layers.');
                                     writeSse(controller, 'map_error', { message: controlErrorMessage });
                                     assistantReply += controlErrorMessage;
                                 }
@@ -6320,7 +6820,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                 }
 
                                 if (!accessResult.success) {
-                                    const accessErrorMessage = accessResult.message || 'ไม่พบสิทธิ์การใช้งานแผนที่ครับ';
+                                    const accessErrorMessage = accessResult.message || 'No map access permission was found.';
                                     assistantReply += accessErrorMessage;
                                     writeSse(controller, 'token', { text: accessErrorMessage });
                                 }
@@ -6390,7 +6890,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                             assistantEventMetadata = createMapOptionsMetadata(nextOptionPayload);
                                         }
                                     } else {
-                                        const mapErrorMessage = getToolErrorMessage(mapResult, 'ไม่สามารถดึงข้อมูลแผนที่ได้ครับ');
+                                        const mapErrorMessage = getToolErrorMessage(mapResult, 'Unable to fetch map data.');
                                         writeSse(controller, 'map_error', { message: mapErrorMessage });
                                         assistantReply += mapErrorMessage;
                                     }
@@ -6436,7 +6936,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                     assistantEventMetadata = createMapOptionsMetadata(optionPayload);
                                 }
                             } else {
-                                const mapErrorMessage = getToolErrorMessage(mapResult, 'ไม่สามารถดึงข้อมูลแผนที่ได้ครับ');
+                                const mapErrorMessage = getToolErrorMessage(mapResult, 'Unable to fetch map data.');
                                 writeSse(controller, 'map_error', { message: mapErrorMessage });
                                 assistantReply += mapErrorMessage;
                             }
@@ -6444,7 +6944,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                         if (chunk?.done && handledToolCalls.size === 0 && !loggedNoToolDecision) {
                             loggedNoToolDecision = true;
-                            console.log("AI เลือกที่จะตอบเป็นข้อความธรรมดา (ไม่ได้เรียก Tool)");
+                            console.log("AI chose a plain text response without calling a tool.");
 
                             if (shouldOfferMapStyleEdit) {
                                 const fallbackFilterArgs = await buildFilterEditArgsFromInstruction(
@@ -6532,7 +7032,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                             assistantEventMetadata = createMapOptionsMetadata(nextOptionPayload);
                                         }
                                     } else {
-                                        const mapErrorMessage = getToolErrorMessage(mapResult, 'ไม่สามารถดึงข้อมูลแผนที่ได้ครับ');
+                                        const mapErrorMessage = getToolErrorMessage(mapResult, 'Unable to fetch map data.');
                                         writeSse(controller, 'map_error', { message: mapErrorMessage });
                                         assistantReply += mapErrorMessage;
                                     }
@@ -6892,7 +7392,7 @@ export const getChatHistory = async (userId: string, role: string, conversationI
     });
 
     if (!conversation) {
-        throw Errors.badRequest('ไม่พบห้องแชท หรือคุณไม่มีสิทธิ์เข้าถึงข้อมูลนี้');
+        throw Errors.badRequest('Conversation not found or you do not have permission to access it.');
     }
 
     const [dbMessages, totalCount, conversationModelMessage] = await Promise.all([
