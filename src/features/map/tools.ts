@@ -6,7 +6,9 @@ import type {
   MapToolArgs,
   MapOptionInfo,
   MapOptionChoice,
-  MapConfigForTools
+  MapConfigForTools,
+  EditMapStyleArgs, 
+  EditMapStyleOperation
 } from "./type";
 
 
@@ -47,40 +49,7 @@ type StyleColorEntry = {
   description?: string;
 };
 
-type EditMapStyleArgs = MapToolArgs & {
-  layerId?: string;
-  instruction?: string;
-  operation?: string;
-  action?: string;
-  target?: string;
-  layer?: unknown;
-  layerType?: string;
-  styleLayerId?: string;
-  colorKey?: string;
-  colorValue?: string;
-  attributeKey?: string;
-  attributeType?: string;
-  attributeValue?: string | number;
-  attributePatches?: unknown;
-  attributeValues?: unknown;
-  attributeStats?: unknown;
-  outputs?: unknown;
-  fallbackOutput?: unknown;
-  paintKey?: string;
-  layoutKey?: string;
-  removePaintKeys?: unknown;
-  removeLayoutKeys?: unknown;
-  value?: unknown;
-  paint?: unknown;
-  layout?: unknown;
-  filter?: unknown;
-  filterLogic?: string;
-  filterConditions?: unknown;
-  attributeFields?: unknown;
-};
-
 type StylePropertyKind = "paint" | "layout";
-type EditMapStyleOperation = "add_property" | "remove_property" | "update_layer" | "add_filter";
 
 let mapLibreStyleSpecCache: Record<string, unknown> | null | undefined;
 
@@ -1957,14 +1926,36 @@ export const handleEditMapStyleTool = async (
 
   const requestedLayerId = toStringValue(aiArgs.layerId) || toStringValue(pickRecord(aiArgs.params).layerId);
   const currentMapLayerId = toStringValue(currentStyle.layerId) || requestedLayerId;
-  const target = toStringValue(aiArgs.target)?.toLowerCase();
+  const requestedTarget = toStringValue(aiArgs.target)?.toLowerCase();
+  const availableStyleLayerIds = new Set(
+    currentLayers
+      .map((layer) => toStringValue(pickRecord(layer).id))
+      .filter((value): value is string => Boolean(value))
+  );
+  const availableLayerTargets = new Set(
+    currentLayers
+      .flatMap((layer) => {
+        const layerRecord = pickRecord(layer);
+        return [
+          toStringValue(layerRecord.id)?.toLowerCase(),
+          toStringValue(layerRecord.type)?.toLowerCase()
+        ];
+      })
+      .filter((value): value is string => Boolean(value))
+  );
+  const target = requestedTarget && availableLayerTargets.has(requestedTarget)
+    ? requestedTarget
+    : undefined;
   const officialStyleSpec = isFilterOperation ? undefined : await loadMapLibreStyleSpec();
   let matchedFilterLayer = false;
 
   const patchLayer = async (layer: unknown): Promise<Record<string, unknown> | Array<Record<string, unknown>>> => {
     const layerRecord = pickRecord(layer);
     const layerType = toStringValue(layerRecord.type) || "";
-    const styleLayerId = toStringValue(aiArgs.styleLayerId);
+    const requestedStyleLayerId = toStringValue(aiArgs.styleLayerId);
+    const styleLayerId = requestedStyleLayerId && availableStyleLayerIds.has(requestedStyleLayerId)
+      ? requestedStyleLayerId
+      : undefined;
     const targetMatches = styleLayerId
       ? styleLayerId === toStringValue(layerRecord.id)
       : !target
@@ -2006,6 +1997,16 @@ export const handleEditMapStyleTool = async (
   const styleChanged = JSON.stringify(layers) !== JSON.stringify(currentLayers);
 
   if (!styleChanged) {
+    if (isFilterOperation && matchedFilterLayer && (aiArgs.filter !== undefined || Array.isArray(aiArgs.filterConditions))) {
+      return {
+        ...currentStyle,
+        success: true,
+        event: "map_style",
+        layerId: currentMapLayerId,
+        layers: currentLayers,
+        styleInstruction: instruction
+      };
+    }
     const attributeKey = toStringValue(aiArgs.attributeKey);
     const attributeValues = getAttributeValuesList(aiArgs.attributeValues);
     if (attributeKey && aiArgs.attributeValue === undefined && attributeValues.length > 0) {
@@ -5238,7 +5239,7 @@ export const editMapStyleToolSchema = {
         },
         layerTitle: {
           type: "string",
-          description: "The title/name of the displayed map layer to edit when the user names a layer but does not provide layerId."
+          description: "The exact title/name of a displayed map layer to edit when the user names a layer but does not provide layerId. Leave this empty for generic map/style wording."
         },
         operation: {
           type: "string",

@@ -2307,18 +2307,20 @@ const selectMapLayerStateForEdit = (
         return mapState.layers[requestedLayerId];
     }
 
-    const requestedLayerText = [
-        message,
-        getRequestedLayerTextFromToolArgs(aiArgs)
-    ].filter(Boolean).join(' ');
-    const requestedLayerState = selectMapLayerStateByText(mapState, requestedLayerText);
-    if (requestedLayerState) {
-        return requestedLayerState;
+    const explicitLayerText = getRequestedLayerTextFromToolArgs(aiArgs);
+    const explicitLayerState = selectMapLayerStateByText(mapState, explicitLayerText);
+    if (explicitLayerState) {
+        return explicitLayerState;
     }
 
     const requestedAttributeLayerState = selectMapLayerStateByAttribute(mapState, aiArgs, message);
     if (requestedAttributeLayerState) {
         return requestedAttributeLayerState;
+    }
+
+    const requestedLayerState = selectMapLayerStateByText(mapState, message || '');
+    if (requestedLayerState) {
+        return requestedLayerState;
     }
 
     return getLatestLayerState(mapState);
@@ -3375,6 +3377,39 @@ const collectMapStyleAttributeValues = (
             }
         }
 
+        if (['==', '!='].includes(String(operator))) {
+            const attributeKey = getMapStyleAttributeKey(value[1]);
+            const attributeValue = value[2];
+            if (attributeKey && attributeValue !== undefined && attributeValue !== null && attributeValue !== '') {
+                const values = valuesByAttribute.get(attributeKey) || [];
+                values.push({
+                    value: attributeValue,
+                    ...(paintKey ? { paintKey } : {})
+                });
+                valuesByAttribute.set(attributeKey, values);
+            }
+        }
+
+        if (['in', '!in'].includes(String(operator))) {
+            const attributeKey = getMapStyleAttributeKey(value[1]);
+            const literalValues = Array.isArray(value[2]) && value[2][0] === 'literal' && Array.isArray(value[2][1])
+                ? value[2][1]
+                : Array.isArray(value[2])
+                    ? value[2]
+                    : [];
+            if (attributeKey && literalValues.length > 0) {
+                const values = valuesByAttribute.get(attributeKey) || [];
+                for (const attributeValue of literalValues) {
+                    if (attributeValue === undefined || attributeValue === null || attributeValue === '') continue;
+                    values.push({
+                        value: attributeValue,
+                        ...(paintKey ? { paintKey } : {})
+                    });
+                }
+                valuesByAttribute.set(attributeKey, values);
+            }
+        }
+
         for (const item of value) {
             collectMapStyleAttributeValues(item, valuesByAttribute, paintKey);
         }
@@ -3961,7 +3996,26 @@ const buildMapFilterPatch = (
 
     const styleRecord = asRecord(mapStyle);
     const layers = Array.isArray(styleRecord.layers) ? styleRecord.layers.map(asRecord) : [];
-    const target = toSuggestionString(args.styleLayerId || args.target);
+    const requestedStyleLayerId = toSuggestionString(args.styleLayerId);
+    const requestedTarget = toSuggestionString(args.target)?.toLowerCase();
+    const availableStyleLayerIds = new Set(
+        layers
+            .map((layer) => toSuggestionString(layer.id))
+            .filter((value): value is string => Boolean(value))
+    );
+    const availableLayerTargets = new Set(
+        layers
+            .flatMap((layer) => [
+                toSuggestionString(layer.id)?.toLowerCase(),
+                toSuggestionString(layer.type)?.toLowerCase()
+            ])
+            .filter((value): value is string => Boolean(value))
+    );
+    const target = requestedStyleLayerId && availableStyleLayerIds.has(requestedStyleLayerId)
+        ? requestedStyleLayerId
+        : requestedTarget && availableLayerTargets.has(requestedTarget)
+            ? requestedTarget
+            : undefined;
     const selectedLayers = layers.filter((layer) => (
         !target
         || toSuggestionString(layer.id) === target
@@ -4280,7 +4334,16 @@ const buildFilterEditArgs = (
         const fallbackType = attributeKey === styleAttributeKey
             ? styleAttributeType
             : toSuggestionString(asRecord(getMapStyleAttributeVariants(mapStyle).get(attributeKey)).attributeType);
-        if (fallbackType) attributeFields[attributeKey] = { type: fallbackType };
+        const conditionValue = record.value ?? (Array.isArray(record.values) ? record.values.find((value) => value !== undefined && value !== null) : undefined);
+        const inferredType = fallbackType
+            || (typeof conditionValue === 'number'
+                ? 'Number'
+                : typeof conditionValue === 'boolean'
+                    ? 'Boolean'
+                    : conditionValue !== undefined && conditionValue !== null
+                        ? 'String'
+                        : undefined);
+        if (inferredType) attributeFields[attributeKey] = { type: inferredType };
     }
     if (Object.keys(attributeFields).length === 0) return baseArgs;
 
@@ -4329,16 +4392,30 @@ const getFilterValueText = (value: unknown): string | undefined => {
     return String(rawValue);
 };
 
-const matchesFilterValueText = (instruction: string, valueText: string): boolean => {
+const findFilterValueTextMatch = (
+    instruction: string,
+    valueText: string
+): { start: number; end: number } | undefined => {
     const trimmedValue = valueText.trim();
-    if (!trimmedValue) return false;
+    if (!trimmedValue) return undefined;
 
     if (/^[A-Za-z0-9_ -]+$/.test(trimmedValue)) {
         const pattern = new RegExp(`(^|[^A-Za-z0-9_])${escapeFilterValuePattern(trimmedValue)}([^A-Za-z0-9_]|$)`, 'i');
-        return pattern.test(instruction);
+        const match = pattern.exec(instruction);
+        if (!match) return undefined;
+
+        const prefixLength = match[1]?.length || 0;
+        const start = match.index + prefixLength;
+        return {
+            start,
+            end: start + trimmedValue.length
+        };
     }
 
-    return instruction.toLowerCase().includes(trimmedValue.toLowerCase());
+    const start = instruction.toLowerCase().indexOf(trimmedValue.toLowerCase());
+    return start >= 0
+        ? { start, end: start + trimmedValue.length }
+        : undefined;
 };
 
 const resolveFilterValueFromInstruction = (
@@ -4358,13 +4435,29 @@ const resolveFilterValuesFromInstruction = (
         .map((item) => asRecord(item).value ?? item)
         .filter((value) => value !== undefined && value !== null && value !== '')
         .sort((left, right) => String(right).length - String(left).length)
-        .filter((value, index, matchedValues) => {
+        .map((value) => {
             const valueText = getFilterValueText(value);
-            if (!valueText || !matchesFilterValueText(instruction, valueText)) return false;
+            const match = valueText ? findFilterValueTextMatch(instruction, valueText) : undefined;
+            return match ? { value, ...match } : undefined;
+        })
+        .filter((item): item is { value: unknown; start: number; end: number } => Boolean(item))
+        .filter((match, index, matchedValues) => {
+            const { value } = match;
             const serialized = JSON.stringify(value);
-            return matchedValues.findIndex((item) => JSON.stringify(item) === serialized) === index;
+            return matchedValues.findIndex((item) => JSON.stringify(item.value) === serialized) === index;
         });
-    if (rawMatches.length > 0) return rawMatches;
+    if (rawMatches.length > 0) {
+        const orderedMatches = [...rawMatches].sort((left, right) => left.start - right.start);
+        const hasOnlyWhitespaceBetweenMatches = orderedMatches.length > 1 && orderedMatches
+            .slice(1)
+            .every((match, index) => {
+                const previous = orderedMatches[index];
+                return instruction.slice(previous.end, match.start).trim().length === 0;
+            });
+        if (!hasOnlyWhitespaceBetweenMatches) {
+            return rawMatches.map((match) => match.value);
+        }
+    }
 
     const normalizedInstruction = normalizeStyleSwitchText(instruction);
     if (!normalizedInstruction) return [];
@@ -4500,7 +4593,7 @@ const buildFilterEditArgsFromInstruction = async (
     mapStyle?: unknown
 ): Promise<Record<string, unknown> | undefined> => {
     const requestedOperation = normalizeMapEditOperationName(baseArgs.operation || baseArgs.action);
-    const isExplicitFilterOperation = requestedOperation === 'add_filter';
+    const isExplicitFilterOperation = requestedOperation === 'add_filter' || hasFilterPayloadArgs(baseArgs);
 
     if (!isExplicitFilterOperation && hasExplicitStyleEditArgs(baseArgs)) return undefined;
 
@@ -4530,6 +4623,7 @@ const buildFilterEditArgsFromInstruction = async (
         return buildFilterEditArgs({
             ...baseArgs,
             operation: filterOperation,
+            action: filterOperation,
             filterConditions: [numericCondition],
             filterLogic: getFilterLogicForInferredCondition(filterOperation, requestedAttribute.name, mapStyle)
         }, mapPayload, mapStyle);
@@ -4566,6 +4660,7 @@ const buildFilterEditArgsFromInstruction = async (
     return buildFilterEditArgs({
         ...baseArgs,
         operation: filterOperation,
+        action: filterOperation,
         filterConditions: [{
             attributeKey: requestedAttribute.name,
             operator: filterValues.length > 1 ? 'in' : '==',
@@ -5617,12 +5712,12 @@ export const processChatMessageStream = (
                         : undefined;
                     // Current DB state is preferred over message-derived history so
                     // edits continue from the layer/style actually rendered now.
-                    const latestMapStyle = mapFeaturesEnabled
+                    let latestMapStyle = mapFeaturesEnabled
                         ? getLatestMapStyleFromState(conversationMapState)
                             || getLatestMapStyleFromMessages(messagesForLLM)
                             || memoryPayload.latestMapStyle
                         : undefined;
-                    const latestMapPayload = mapFeaturesEnabled
+                    let latestMapPayload = mapFeaturesEnabled
                         ? getLatestMapPayloadFromState(conversationMapState)
                             || getLatestMapPayloadFromMessages(messagesForLLM)
                             || memoryPayload.latestMap
@@ -5770,6 +5865,16 @@ export const processChatMessageStream = (
                             writeSse(controller, 'map_style', toPublicMapStyleStreamPayload(mapStylePayload));
                         }
                         await safeSyncConversationMapLayerCatalog(convId, payload, mapStylePayload);
+                        if (conversationMapState) {
+                            applyMapPayloadToState(conversationMapState, payload);
+                            if (mapStylePayload) {
+                                applyMapStyleToState(conversationMapState, mapStylePayload, getLayerIdFromMapPayload(payload));
+                            }
+                        }
+                        latestMapPayload = payload;
+                        if (mapStylePayload) {
+                            latestMapStyle = mapStylePayload;
+                        }
 
                         const styleCatalog = mapStylePayload ? await handleStyleCatalogTool() : undefined;
                         let suggestionsPayload = mapStylePayload && styleCatalog
@@ -5797,6 +5902,16 @@ export const processChatMessageStream = (
                             ? mergeMapStyleAttributeVariants(currentStyle, undefined, payload)
                             : undefined;
                         await safeSyncConversationMapLayerCatalog(convId, payload, mapStylePayload);
+                        if (conversationMapState) {
+                            applyMapPayloadToState(conversationMapState, payload);
+                            if (mapStylePayload) {
+                                applyMapStyleToState(conversationMapState, mapStylePayload, getLayerIdFromMapPayload(payload));
+                            }
+                        }
+                        latestMapPayload = payload;
+                        if (mapStylePayload) {
+                            latestMapStyle = mapStylePayload;
+                        }
 
                         const styleCatalog = mapStylePayload ? await handleStyleCatalogTool() : undefined;
                         let suggestionsPayload = mapStylePayload && styleCatalog
@@ -5883,101 +5998,85 @@ export const processChatMessageStream = (
                     };
 
                     const streamPostMapEventReply = async (
-                        eventName: 'map' | 'map_style' | 'map_clear',
+                        eventName: 'map' | 'map_style' | 'map_filter' | 'map_clear',
                         eventPayload: unknown
                     ) => {
-                        const replyMessages = [
-                            systemMessage,
-                            styleReminder,
+                        const latestUserText = message || toSuggestionString(lastMessageForLLM?.content) || '';
+                        const targetLanguage = /[\u0E00-\u0E7F]/.test(latestUserText) ? 'Thai' : 'English';
+                        const containsChineseText = (value: string) => /[\u3400-\u9FFF]/.test(value);
+                        const containsInternalGroundingText = (value: string) => {
+                            const normalized = value.trim().toLowerCase();
+                            return normalized.includes('grounding only')
+                                || normalized.includes('"event"')
+                                || normalized.includes('map_style_filter')
+                                || normalized.startsWith('{')
+                                || normalized.startsWith('[');
+                        };
+                        const groundingPayload = eventName === 'map_filter'
+                            ? { action: 'map_filter_applied' }
+                            : eventPayload;
+                        const buildReplyMessages = (retry = false) => [
                             {
                                 role: 'system',
                                 content: [
-                                    `A "${eventName}" result is already ready and visible in the map UI.`,
-                                    'Reply briefly and naturally to the user in the same language as the user.',
-                                    'If the user language is unclear, reply in English.',
-                                    'Never reply in Chinese unless the latest user message is written in Chinese.',
+                                    'You are a chatbot responding after a map UI action has already completed.',
+                                    `Reply only in ${targetLanguage}.`,
+                                    'Never use Chinese characters unless the latest user message itself is Chinese.',
+                                    'Use one short natural sentence.',
                                     'Do not call tools.',
-                                    'Do not repeat raw JSON.',
-                                    'Do not mention backend events, emitted events, payloads, APIs, coordinates, bounds, or zoom levels unless the user explicitly asks.',
-                                    'Do not claim that you still need to fetch or prepare the map.',
+                                    'Do not output JSON.',
+                                    'Do not mention backend events, APIs, coordinates, bounds, or zoom levels.',
                                     eventName === 'map'
-                                        ? 'Say that the requested map layer is ready/displayed. Keep it to one short sentence.'
+                                        ? 'Tell the user that the requested map layer is ready/displayed.'
                                         : eventName === 'map_style'
-                                            ? 'Say that the requested map style has been applied. Keep it to one short sentence.'
-                                            : 'Say that the requested map layer clear action has been applied. Keep it to one short sentence.',
-                                    `Internal context for grounding only, not for direct quotation: ${JSON.stringify(eventPayload).slice(0, 600)}`
-                                ].join('\n')
+                                            ? 'Tell the user that the requested map style has been applied.'
+                                            : eventName === 'map_filter'
+                                                ? 'Tell the user only that the requested map filter has been applied. Do not describe colors, legends, categories, or style details.'
+                                                : 'Tell the user that the requested map layer clear action has been applied.',
+                                    retry ? `The previous draft exposed internal grounding or used the wrong language. Rewrite it in ${targetLanguage} only as a user-facing confirmation sentence.` : '',
+                                    `Grounding only: ${JSON.stringify(groundingPayload).slice(0, 400)}`
+                                ].filter(Boolean).join('\n')
                             },
-                            ...(lastMessageForLLM ? [lastMessageForLLM] : [])
+                            {
+                                role: 'user',
+                                content: eventName === 'map_filter'
+                                    ? 'Confirm the completed map filter action.'
+                                    : latestUserText || 'Confirm the completed map action.'
+                            }
                         ];
 
-                        const response = await fetch(`${OLLAMA_URL}/api/chat`, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({
-                                model: selectedModel,
-                                messages: replyMessages,
-                                stream: true,
-                                options: {
-                                    temperature: selectedFeelingKey === 'aggressive' ? 0.7 : selectedFeelingKey === 'polite' ? 0.45 : 0.5,
-                                    top_p: selectedFeelingKey === 'aggressive' ? 0.9 : 0.85,
-                                    num_predict: 96
-                                }
-                            })
-                        });
-
-                        if (!response.ok || !response.body) {
-                            return { reply: '', tokenUsage: 0 };
-                        }
-
-                        const reader = response.body.getReader();
-                        const decoder = new TextDecoder();
-                        let buffer = '';
-                        let reply = '';
-                        let tokenUsage = 0;
-
-                        while (true) {
-                            const { done, value } = await reader.read();
-
-                            if (done) {
-                                const lastLine = buffer.trim();
-                                if (lastLine) {
-                                    const chunk = JSON.parse(lastLine);
-                                    const textPart = chunk?.message?.content || '';
-                                    if (textPart) {
-                                        reply += textPart;
-                                        writeSse(controller, 'token', { text: textPart });
+                        const generateReply = async (retry = false) => {
+                            const response = await fetch(`${OLLAMA_URL}/api/chat`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                    model: selectedModel,
+                                    messages: buildReplyMessages(retry),
+                                    stream: false,
+                                    options: {
+                                        temperature: retry ? 0.1 : 0.25,
+                                        top_p: 0.8,
+                                        num_predict: 64
                                     }
-                                    if (typeof chunk?.eval_count === 'number') tokenUsage = chunk.eval_count;
-                                }
-                                break;
-                            }
+                                })
+                            });
 
-                            buffer += decoder.decode(value, { stream: true });
-                            const lines = buffer.split('\n');
-                            buffer = lines.pop() || '';
+                            if (!response.ok) return { reply: '', tokenUsage: 0 };
+                            const chunk = await response.json();
+                            return {
+                                reply: toSuggestionString(asRecord(chunk.message).content) || '',
+                                tokenUsage: typeof chunk?.eval_count === 'number' ? chunk.eval_count : 0
+                            };
+                        };
 
-                            for (const line of lines) {
-                                const trimmed = line.trim();
-                                if (!trimmed) continue;
-
-                                const chunk = JSON.parse(trimmed);
-                                const textPart = chunk?.message?.content || '';
-                                if (textPart) {
-                                    reply += textPart;
-                                    writeSse(controller, 'token', { text: textPart });
-                                }
-                                if (typeof chunk?.eval_count === 'number') tokenUsage = chunk.eval_count;
-                            }
+                        let result = await generateReply(false);
+                        if (containsChineseText(result.reply) || containsInternalGroundingText(result.reply)) {
+                            result = await generateReply(true);
                         }
+                        if (!result.reply) return result;
 
-                        try {
-                            reader.releaseLock();
-                        } catch {
-                            // Reader may already be released after the stream ends.
-                        }
-
-                        return { reply, tokenUsage };
+                        writeSse(controller, 'token', { text: result.reply });
+                        return result;
                     };
 
                     const isMapOptionsMetadata = (metadata: unknown) => {
@@ -6718,6 +6817,8 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             if (conversationMapState) {
                                 applyMapStyleToState(conversationMapState, editResult, selectedLayerId);
                             }
+                            latestMapStyle = editResult;
+                            latestMapPayload = selectedMapPayload || latestMapPayload;
                             await safeSyncConversationMapStyle(convId, editResult);
                             const editedLayerId = getMapStyleLayerId(editResult);
                             if (selectedLayerId && (!editedLayerId || selectedLayerId === editedLayerId)) {
@@ -6745,7 +6846,10 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             }
                             mapMetadata = createMapStyleMetadata(editResult);
 
-                            const postReply = await streamPostMapEventReply('map_style', editResult);
+                            const postReply = await streamPostMapEventReply(
+                                mapFilterPatch ? 'map_filter' : 'map_style',
+                                mapFilterPatch || editResult
+                            );
                             assistantReply += postReply.reply;
                             tokenUsage += postReply.tokenUsage;
                             return true;
