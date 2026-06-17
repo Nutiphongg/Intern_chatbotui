@@ -815,6 +815,52 @@ const replaceAttributeExpressionStopOutput = (
   return { value: changed ? next : value, changed };
 };
 
+const replaceAttributeExpressionOutputs = (
+  value: unknown,
+  attributeKey: string,
+  outputs: unknown[]
+): { value: unknown; changed: boolean } => {
+  if (!Array.isArray(value) || outputs.length === 0) return { value, changed: false };
+
+  const next = [...value];
+  let changed = false;
+  const operator = next[0];
+
+  if (operator === "interpolate" && getExpressionAttributeKey(next[2]) === attributeKey) {
+    let outputIndex = 0;
+    for (let index = 4; index < next.length; index += 2) {
+      const output = outputs[outputIndex % outputs.length];
+      if (JSON.stringify(next[index]) !== JSON.stringify(output)) {
+        next[index] = output;
+        changed = true;
+      }
+      outputIndex += 1;
+    }
+  }
+
+  if (operator === "match" && getExpressionAttributeKey(next[1]) === attributeKey) {
+    let outputIndex = 0;
+    for (let index = 3; index < next.length - 1; index += 2) {
+      const output = outputs[outputIndex % outputs.length];
+      if (JSON.stringify(next[index]) !== JSON.stringify(output)) {
+        next[index] = output;
+        changed = true;
+      }
+      outputIndex += 1;
+    }
+  }
+
+  for (let index = 0; index < next.length; index += 1) {
+    const nested = replaceAttributeExpressionOutputs(next[index], attributeKey, outputs);
+    if (nested.changed) {
+      next[index] = nested.value;
+      changed = true;
+    }
+  }
+
+  return { value: changed ? next : value, changed };
+};
+
 const collectPaintAttributeStops = (
   value: unknown,
   stops: Array<{ attributeKey: string; value: unknown }> = []
@@ -953,6 +999,32 @@ const buildAttributeStopPaintPatch = (
           changed = changed || patched.changed;
         }
         return changed ? [paintKey, nextValue] : undefined;
+      })
+      .filter((entry): entry is [string, unknown] => Boolean(entry))
+  );
+};
+
+const buildAttributeRampOutputPatch = (
+  paint: Record<string, unknown>,
+  args: EditMapStyleArgs,
+  outputs: unknown[]
+): Record<string, unknown> => {
+  const attributeKey = toStringValue(args.attributeKey);
+  if (!attributeKey || outputs.length === 0) return {};
+  if (args.attributeValue !== undefined || (Array.isArray(args.attributePatches) && args.attributePatches.length > 0)) return {};
+
+  const requestedPaintKey = toStringValue(args.paintKey);
+  return Object.fromEntries(
+    Object.entries(paint)
+      .map(([paintKey, paintValue]) => {
+        if (requestedPaintKey && requestedPaintKey !== paintKey) return undefined;
+        const patchOutputs = paintKey.endsWith("-color")
+          ? outputs.filter((item) => typeof item !== "string" || Boolean(normalizeColorHex(item)))
+          : outputs;
+        if (patchOutputs.length === 0) return undefined;
+
+        const patched = replaceAttributeExpressionOutputs(paintValue, attributeKey, patchOutputs);
+        return patched.changed ? [paintKey, patched.value] : undefined;
       })
       .filter((entry): entry is [string, unknown] => Boolean(entry))
   );
@@ -1300,6 +1372,60 @@ const getRequestedStylePropertyKeys = (...values: unknown[]): string[] => {
   ));
 };
 
+const getExistingStylePropertyKeysByText = (
+  layer: Record<string, unknown>,
+  args: EditMapStyleArgs,
+  kind: StylePropertyKind
+): string[] => {
+  const existingKeys = Object.keys(pickRecord(layer[kind]));
+  if (existingKeys.length === 0) return [];
+
+  const normalizedTarget = normalizeStyleMatchText(args.target);
+  const normalizedInstruction = normalizeStyleMatchText(getEditInstruction(args));
+  return existingKeys.filter((key) => {
+    const normalizedKey = normalizeStyleMatchText(key);
+    return Boolean(normalizedKey && (
+      normalizedKey === normalizedTarget
+      || normalizedInstruction.includes(normalizedKey)
+    ));
+  });
+};
+
+const getExistingStylePropertyTarget = (
+  layers: unknown[],
+  target: unknown
+): { kind: StylePropertyKind; key: string } | undefined => {
+  const key = toStringValue(target)?.trim();
+  if (!key) return undefined;
+
+  for (const layer of layers) {
+    const layerRecord = pickRecord(layer);
+    if (pickRecord(layerRecord.paint)[key] !== undefined) return { kind: "paint", key };
+    if (pickRecord(layerRecord.layout)[key] !== undefined) return { kind: "layout", key };
+  }
+
+  return undefined;
+};
+
+const normalizeStylePropertyTargetArgs = (
+  args: EditMapStyleArgs,
+  layers: unknown[]
+): EditMapStyleArgs => {
+  const propertyTarget = getExistingStylePropertyTarget(layers, args.target);
+  if (!propertyTarget) return args;
+
+  return {
+    ...args,
+    target: undefined,
+    ...(propertyTarget.kind === "paint" && !toStringValue(args.paintKey)
+      ? { paintKey: propertyTarget.key }
+      : {}),
+    ...(propertyTarget.kind === "layout" && !toStringValue(args.layoutKey)
+      ? { layoutKey: propertyTarget.key }
+      : {})
+  };
+};
+
 const normalizeStylePropertyOperation = (value: unknown): EditMapStyleOperation | undefined => {
   const normalized = toStringValue(value)?.trim().toLowerCase().replace(/[\s-]+/g, "_");
   if (
@@ -1625,9 +1751,21 @@ const applyStylePropertyOperation = (
     const parsedProperty = parseStylePropertyInstruction(args);
     const parsedPaintKey = parsedProperty?.kind === "paint" ? parsedProperty.key : undefined;
     const parsedLayoutKey = parsedProperty?.kind === "layout" ? parsedProperty.key : undefined;
-    const paintKeys = getRequestedStylePropertyKeys(args.paintKey, parsedPaintKey, args.removePaintKeys, Object.keys(pickRecord(args.paint)))
+    const paintKeys = getRequestedStylePropertyKeys(
+      args.paintKey,
+      parsedPaintKey,
+      args.removePaintKeys,
+      Object.keys(pickRecord(args.paint)),
+      getExistingStylePropertyKeysByText(layer, args, "paint")
+    )
       .filter((key) => canPatchStyleProperty(key, layer, "paint", officialSpec));
-    const layoutKeys = getRequestedStylePropertyKeys(args.layoutKey, parsedLayoutKey, args.removeLayoutKeys, Object.keys(pickRecord(args.layout)))
+    const layoutKeys = getRequestedStylePropertyKeys(
+      args.layoutKey,
+      parsedLayoutKey,
+      args.removeLayoutKeys,
+      Object.keys(pickRecord(args.layout)),
+      getExistingStylePropertyKeysByText(layer, args, "layout")
+    )
       .filter((key) => canPatchStyleProperty(key, layer, "layout", officialSpec));
     if (paintKeys.length === 0 && layoutKeys.length === 0) return layer;
 
@@ -1829,7 +1967,14 @@ const getPaintPatchForLayerType = async (
   );
   const attributeStopOutput = color ?? normalizeStylePropertyValue(args.value);
   const attributeStopPatch = buildAttributeStopPaintPatch(existingPaint, args, attributeStopOutput);
-  const attributePaintPatch = await buildAttributePaintPatch(args, color, existingPaint);
+  const attributeRampOutputs = [
+    ...getExplicitAttributeOutputs(args.outputs),
+    ...(color ? [color] : [])
+  ];
+  const attributeRampPatch = buildAttributeRampOutputPatch(existingPaint, args, attributeRampOutputs);
+  const attributePaintPatch = Object.keys(attributeRampPatch).length > 0
+    ? {}
+    : await buildAttributePaintPatch(args, color, existingPaint);
   const isAttributeValueEdit = Boolean(
     toStringValue(args.attributeKey)
     && (
@@ -1845,12 +1990,17 @@ const getPaintPatchForLayerType = async (
     && args.attributeValue === undefined
     && (!Array.isArray(args.attributePatches) || args.attributePatches.length === 0)
   );
-  if (isAttributeStyleRequest && Object.keys(attributePaintPatch).length === 0) {
+  if (
+    isAttributeStyleRequest
+    && Object.keys(attributeRampPatch).length === 0
+    && Object.keys(attributePaintPatch).length === 0
+  ) {
     return {};
   }
   const explicitPaintColorPatch = buildExplicitPaintColorPatch(existingPaint, args, color);
   const explicitGenericPaintPatch = buildExplicitGenericPaintPatch(existingPaint, args, color);
   const colorPatch = Object.keys(attributeStopPatch).length > 0
+    || Object.keys(attributeRampPatch).length > 0
     || Object.keys(attributePaintPatch).length > 0
     || Object.keys(explicitPaintColorPatch).length > 0
     || Object.keys(explicitGenericPaintPatch).length > 0
@@ -1860,6 +2010,7 @@ const getPaintPatchForLayerType = async (
   return {
     ...explicitPaint,
     ...attributeStopPatch,
+    ...attributeRampPatch,
       ...attributePaintPatch,
       ...explicitPaintColorPatch,
       ...explicitGenericPaintPatch,
@@ -1880,6 +2031,8 @@ export const handleEditMapStyleTool = async (
       message: "No recent map_style is available to edit. Please select or display a layer first."
     };
   }
+
+  aiArgs = normalizeStylePropertyTargetArgs(aiArgs, currentLayers);
 
   const instruction = getEditInstruction(aiArgs);
   const operation = resolveEditMapStyleOperation(aiArgs);

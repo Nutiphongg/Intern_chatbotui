@@ -1691,6 +1691,30 @@ const getLatestLayerState = (state?: unknown): ConversationMapLayerState | undef
     return layerIds.length > 0 ? mapState.layers[layerIds[layerIds.length - 1]] : undefined;
 };
 
+const layerStateHasStyle = (layerState?: ConversationMapLayerState): boolean => {
+    if (!layerState) return false;
+    if (layerState.latestMapStyle) return true;
+    return Boolean(layerState.activeStyle && layerState.styles[layerState.activeStyle]);
+};
+
+const getLatestStyledLayerState = (state?: unknown): ConversationMapLayerState | undefined => {
+    const mapState = state as ConversationMapState | undefined;
+    if (!mapState?.layers) return undefined;
+
+    if (mapState.activeLayerId) {
+        const activeLayerState = mapState.layers[mapState.activeLayerId];
+        if (layerStateHasStyle(activeLayerState)) return activeLayerState;
+    }
+
+    const layerIds = Object.keys(mapState.layers);
+    for (let index = layerIds.length - 1; index >= 0; index -= 1) {
+        const layerState = mapState.layers[layerIds[index]];
+        if (layerStateHasStyle(layerState)) return layerState;
+    }
+
+    return getLatestLayerState(mapState);
+};
+
 const getLatestMapPayloadFromState = (state?: unknown): unknown | undefined => {
     return getLatestLayerState(state)?.mapPayload;
 };
@@ -2313,17 +2337,22 @@ const selectMapLayerStateForEdit = (
         return explicitLayerState;
     }
 
-    const requestedAttributeLayerState = selectMapLayerStateByAttribute(mapState, aiArgs, message);
-    if (requestedAttributeLayerState) {
-        return requestedAttributeLayerState;
-    }
-
     const requestedLayerState = selectMapLayerStateByText(mapState, message || '');
     if (requestedLayerState) {
         return requestedLayerState;
     }
 
-    return getLatestLayerState(mapState);
+    const latestLayerState = getLatestLayerState(mapState);
+    if (latestLayerState) {
+        return latestLayerState;
+    }
+
+    const requestedAttributeLayerState = selectMapLayerStateByAttribute(mapState, aiArgs, message);
+    if (requestedAttributeLayerState) {
+        return requestedAttributeLayerState;
+    }
+
+    return getLatestStyledLayerState(mapState);
 };
 
 const selectMapStyleForEdit = (
@@ -2368,7 +2397,17 @@ const selectMapStyleForEdit = (
         return selectAttributeVariant(layerState.styles[layerState.activeStyle]);
     }
 
-    return selectAttributeVariant(layerState.latestMapStyle || fallbackMapStyle);
+    if (layerState.latestMapStyle) {
+        return selectAttributeVariant(layerState.latestMapStyle);
+    }
+
+    const fallbackStyleLayerId = getMapStyleLayerId(fallbackMapStyle);
+    const selectedLayerId = getLayerIdFromMapPayload(layerState.mapPayload);
+    if (fallbackMapStyle && fallbackStyleLayerId && selectedLayerId && fallbackStyleLayerId === selectedLayerId) {
+        return selectAttributeVariant(fallbackMapStyle);
+    }
+
+    return undefined;
 };
 
 const selectMapPayloadForEdit = (
@@ -3451,6 +3490,32 @@ const collectMapStylePaintKeys = (
     return keys;
 };
 
+const buildCurrentMapEditContext = (
+    mapPayload: unknown,
+    mapStyle: unknown
+) => {
+    const layerId = getLayerIdFromMapPayload(mapPayload) || getMapStyleLayerId(mapStyle);
+    const title = getMapLayerTitle(mapPayload);
+    const type = getMapLayerType(mapPayload);
+    const styleKey = getMapStyleKey(mapStyle);
+    const styleRecord = asRecord(mapStyle);
+    const layerTypes = Array.from(getMapStyleLayerTypes(mapStyle));
+    const paintKeys = Array.from(collectMapStylePaintKeys(mapStyle));
+    const attributeKeys = Array.from(collectMapStyleAttributeKeys(mapStyle));
+    const attributeStyleKey = toSuggestionString(styleRecord.attributeStyleKey || styleRecord.attributeKey);
+
+    return {
+        ...(layerId ? { layerId } : {}),
+        ...(title ? { title } : {}),
+        ...(type ? { type } : {}),
+        ...(styleKey ? { styleKey } : {}),
+        ...(layerTypes.length > 0 ? { layerTypes } : {}),
+        ...(paintKeys.length > 0 ? { paintKeys } : {}),
+        ...(attributeStyleKey ? { attributeStyleKey } : {}),
+        ...(attributeKeys.length > 0 ? { attributeKeys } : {})
+    };
+};
+
 const collectMapStylePropertyKeys = (
     value: unknown,
     keys = new Set<string>()
@@ -3585,12 +3650,23 @@ const getSuggestionAttributeFields = (
     return [...fieldEntries, ...variantEntries].slice(0, 8);
 };
 
+const hasSuggestionAttributeFields = (
+    mapPayload: unknown,
+    mapStyle: unknown
+): boolean => {
+    const layer = getSuggestionLayerRecord(mapPayload);
+    const fields = asRecord(asRecord(layer.attributes).fields);
+    if (Object.keys(fields).some((name) => Boolean(name.trim()))) return true;
+
+    if (getMapStyleAttributeVariantFields(mapStyle).length > 0) return true;
+    return collectMapStyleAttributeKeys(mapStyle).size > 0;
+};
+
 const buildAttributeStyleSuggestionItems = (
     mapPayload: unknown,
     mapStyle: unknown
 ) => {
-    const fields = getSuggestionAttributeFields(mapPayload, mapStyle);
-    if (fields.length === 0) return [];
+    if (!hasSuggestionAttributeFields(mapPayload, mapStyle)) return [];
 
     return [{
         key: 'style_by_attribute',
@@ -3939,6 +4015,43 @@ const getRequestedAttributePatchValues = (args: Record<string, unknown>): unknow
     });
 };
 
+const hasAttributeRampOutputRequest = (args: Record<string, unknown>): boolean => {
+    if (Array.isArray(args.outputs) && args.outputs.length > 0) return true;
+    return Boolean(
+        normalizeSuggestionColorValue(args.colorValue)
+        || normalizeSuggestionColorValue(args.value)
+    );
+};
+
+const getVisionDominantColorPalette = (vision?: VisionAnalysis | null): string[] => {
+    return (Array.isArray(vision?.dominantColors) ? vision.dominantColors : [])
+        .map((color) => normalizeSuggestionColorValue(color.hex))
+        .filter((color): color is string => Boolean(color));
+};
+
+const instructionReferencesImageColors = (instruction: unknown): boolean => {
+    const normalized = normalizeStyleSwitchText(toSuggestionString(instruction));
+    if (!normalized) return false;
+    return /\b(image|photo|picture)\b/.test(normalized);
+};
+
+const enrichStyleArgsWithVisionPalette = (
+    args: Record<string, unknown>,
+    instruction: unknown,
+    vision?: VisionAnalysis | null
+): Record<string, unknown> => {
+    if (Array.isArray(args.outputs) && args.outputs.length > 0) return args;
+    if (!instructionReferencesImageColors(instruction)) return args;
+
+    const palette = getVisionDominantColorPalette(vision);
+    if (palette.length === 0) return args;
+
+    return {
+        ...args,
+        outputs: palette
+    };
+};
+
 const buildAttributeMapStylePatch = (
     args: Record<string, unknown>,
     mapStyle: unknown
@@ -4119,6 +4232,57 @@ const getStyleAttributeValueItems = (
     });
 };
 
+const styleAttributeHasValue = (
+    mapStyle: unknown,
+    attributeKey: string | undefined,
+    value: unknown
+): boolean => {
+    if (!attributeKey || value === undefined || value === null || value === '') return false;
+    return getStyleAttributeValueItems(mapStyle, attributeKey).some((item) => {
+        const itemValue = asRecord(item).value ?? item;
+        return normalizeStyleSwitchText(itemValue) === normalizeStyleSwitchText(value);
+    });
+};
+
+const resolveFilterConditionAttributeFromStyleValues = (
+    mapPayload: unknown,
+    mapStyle: unknown,
+    condition: Record<string, unknown>
+): { name: string; type?: string } | undefined => {
+    const conditionValue = condition.value
+        ?? (Array.isArray(condition.values) ? condition.values.find((value) => value !== undefined && value !== null && value !== '') : undefined);
+    if (conditionValue === undefined || conditionValue === null || conditionValue === '') return undefined;
+
+    const currentAttributeKey = toSuggestionString(condition.attributeKey || condition.field || condition.key);
+    if (styleAttributeHasValue(mapStyle, currentAttributeKey, conditionValue)) {
+        return undefined;
+    }
+
+    const styleRecord = asRecord(mapStyle);
+    const activeAttribute = toSuggestionString(styleRecord.attributeStyleKey || styleRecord.attributeKey);
+    const variants = getMapStyleAttributeVariants(mapStyle);
+    const candidateNames = [
+        ...(activeAttribute ? [activeAttribute] : []),
+        ...Array.from(variants.keys()),
+        ...Array.from(collectMapStyleAttributeValues(mapStyle).keys())
+    ].filter((name, index, names) => names.indexOf(name) === index);
+
+    for (const name of candidateNames) {
+        if (name === currentAttributeKey) continue;
+        if (!styleAttributeHasValue(mapStyle, name, conditionValue)) continue;
+
+        const variant = asRecord(variants.get(name));
+        const variantType = toSuggestionString(variant.attributeType || variant.type);
+        const field = getMapPayloadAttributeFieldByName(mapPayload, name);
+        return {
+            ...field,
+            ...(field.type ? {} : variantType ? { type: variantType } : {})
+        };
+    }
+
+    return undefined;
+};
+
 const instructionMentionsStyleAttributeValue = (
     instruction: string | undefined,
     values: Array<Record<string, unknown>>
@@ -4233,6 +4397,20 @@ const buildAttributeEditArgs = async (
     ) || resolveRequestedMapAttributeFromStyleValues(mapPayload, mapStyle, instruction);
     if (!requestedAttribute) return baseArgs;
     const { attributeValues: _ignoredAttributeValues, attributeStats: _ignoredAttributeStats, ...trustedBaseArgs } = baseArgs;
+    const suppliedAttributeKey = toSuggestionString(trustedBaseArgs.attributeKey);
+    const suppliedAttributeKeyIsStyleValue = Boolean(
+        suppliedAttributeKey
+        && suppliedAttributeKey !== requestedAttribute.name
+        && styleAttributeHasValue(mapStyle, requestedAttribute.name, suppliedAttributeKey)
+    );
+    const normalizedTrustedArgs = suppliedAttributeKeyIsStyleValue
+        ? {
+            ...trustedBaseArgs,
+            attributeValue: trustedBaseArgs.attributeValue ?? suppliedAttributeKey,
+            operation: 'update_layer',
+            action: 'update_layer'
+        }
+        : trustedBaseArgs;
 
     const payloadRecord = asRecord(mapPayload);
     const layerRecord = asRecord(payloadRecord.layer);
@@ -4252,7 +4430,7 @@ const buildAttributeEditArgs = async (
             styleAttributeValues
         );
         return {
-            ...trustedBaseArgs,
+            ...normalizedTrustedArgs,
             attributeKey: requestedAttribute.name,
             ...(requestedAttribute.type ? { attributeType: requestedAttribute.type } : {}),
             ...(styleAttributeValues.length > 0 ? { attributeValues: styleAttributeValues } : {}),
@@ -4280,8 +4458,8 @@ const buildAttributeEditArgs = async (
             const current = JSON.stringify(asRecord(value).value ?? value);
             return values.findIndex((item) => JSON.stringify(asRecord(item).value ?? item) === current) === index;
         });
-    const explicitAttributePatches = Array.isArray(trustedBaseArgs.attributePatches)
-        ? trustedBaseArgs.attributePatches
+    const explicitAttributePatches = Array.isArray(normalizedTrustedArgs.attributePatches)
+        ? normalizedTrustedArgs.attributePatches
         : [];
     const inferredAttributePatches = explicitAttributePatches.length === 0
         ? await buildAttributePatchesFromInstruction(
@@ -4292,7 +4470,7 @@ const buildAttributeEditArgs = async (
         : [];
 
     return {
-        ...trustedBaseArgs,
+        ...normalizedTrustedArgs,
         attributeKey: requestedAttribute.name,
         ...(requestedAttribute.type ? { attributeType: requestedAttribute.type } : {}),
         ...(attributeValues.length > 0 ? { attributeValues } : {}),
@@ -4327,7 +4505,19 @@ const buildFilterEditArgs = (
             attributeFields[name] = { type };
         }
     }
-    for (const condition of Array.isArray(baseArgs.filterConditions) ? baseArgs.filterConditions : []) {
+    const normalizedFilterConditions = Array.isArray(baseArgs.filterConditions)
+        ? baseArgs.filterConditions.map((condition) => {
+            const record = asRecord(condition);
+            const resolvedAttribute = resolveFilterConditionAttributeFromStyleValues(mapPayload, mapStyle, record);
+            if (!resolvedAttribute) return condition;
+            return {
+                ...record,
+                attributeKey: resolvedAttribute.name,
+                ...(resolvedAttribute.type ? { attributeType: resolvedAttribute.type } : {})
+            };
+        })
+        : undefined;
+    for (const condition of normalizedFilterConditions || []) {
         const record = asRecord(condition);
         const attributeKey = toSuggestionString(record.attributeKey || record.field || record.key);
         if (!attributeKey || attributeFields[attributeKey] !== undefined) continue;
@@ -4349,6 +4539,7 @@ const buildFilterEditArgs = (
 
     return {
         ...baseArgs,
+        ...(normalizedFilterConditions ? { filterConditions: normalizedFilterConditions } : {}),
         attributeFields
     };
 };
@@ -4485,6 +4676,16 @@ const resolveFilterValuesFromInstruction = (
     });
 };
 
+const getUniqueAttributeFilterValues = (values: unknown[]): unknown[] => {
+    return values
+        .map((item) => asRecord(item).value ?? item)
+        .filter((value) => value !== undefined && value !== null && value !== '')
+        .filter((value, index, items) => {
+            const serialized = JSON.stringify(value);
+            return items.findIndex((item) => JSON.stringify(item) === serialized) === index;
+        });
+};
+
 const normalizeMapEditOperationName = (value: unknown): string | undefined => {
     return toSuggestionString(value)
         ?.trim()
@@ -4498,6 +4699,19 @@ const hasFilterPayloadArgs = (args: Record<string, unknown>): boolean => {
         if (value && typeof value === 'object') return Object.keys(asRecord(value)).length > 0;
         return value !== undefined && value !== null && value !== '';
     });
+};
+
+const isFilterIntentInstruction = (instruction: string | undefined): boolean => {
+    const text = toSuggestionString(instruction)?.toLowerCase();
+    if (!text?.trim()) return false;
+    return /\b(filter|where|only|limit|include|exclude)\b/i.test(text)
+        || /\b(show|display)\s+only\b/i.test(text);
+};
+
+const isStyleIntentInstruction = (instruction: string | undefined): boolean => {
+    const text = toSuggestionString(instruction)?.toLowerCase();
+    if (!text?.trim()) return false;
+    return /\b(style|paint|color|colour|edit|change|update|apply)\b/i.test(text);
 };
 
 const hasExplicitStyleEditArgs = (args: Record<string, unknown>): boolean => {
@@ -4594,7 +4808,11 @@ const buildFilterEditArgsFromInstruction = async (
 ): Promise<Record<string, unknown> | undefined> => {
     const requestedOperation = normalizeMapEditOperationName(baseArgs.operation || baseArgs.action);
     const isExplicitFilterOperation = requestedOperation === 'add_filter' || hasFilterPayloadArgs(baseArgs);
+    const hasFilterIntent = isFilterIntentInstruction(instruction);
+    const hasStyleIntent = isStyleIntentInstruction(instruction);
 
+    if (!isExplicitFilterOperation && !hasFilterIntent) return undefined;
+    if (isExplicitFilterOperation && hasStyleIntent && !hasFilterIntent) return undefined;
     if (!isExplicitFilterOperation && hasExplicitStyleEditArgs(baseArgs)) return undefined;
 
     const requestedAttribute = resolveRequestedFilterAttribute(
@@ -4655,6 +4873,25 @@ const buildFilterEditArgsFromInstruction = async (
         });
     const filterValues = resolveFilterValuesFromInstruction(instruction, attributeValues);
     const filterValue = filterValues[0] ?? resolveFilterValueFromInstruction(instruction, attributeValues);
+    const attributeType = requestedAttribute.type?.trim().toLowerCase();
+    if (filterValue === undefined && attributeType !== 'number') {
+        const knownValues = getUniqueAttributeFilterValues(
+            styleAttributeValues.length > 0 ? styleAttributeValues : attributeValues
+        );
+        if (knownValues.length > 0) {
+            return buildFilterEditArgs({
+                ...baseArgs,
+                operation: filterOperation,
+                action: filterOperation,
+                filterConditions: [{
+                    attributeKey: requestedAttribute.name,
+                    operator: 'in',
+                    values: knownValues
+                }],
+                filterLogic: getFilterLogicForInferredCondition(filterOperation, requestedAttribute.name, mapStyle)
+            }, mapPayload, mapStyle);
+        }
+    }
     if (filterValue === undefined) return undefined;
 
     return buildFilterEditArgs({
@@ -4680,15 +4917,64 @@ const buildFallbackAttributeStyleArgs = (
     const requestedAttribute = resolveRequestedMapAttribute(mapPayload, message);
     if (!requestedAttribute) return undefined;
 
-    const imagePalette = (Array.isArray(vision?.dominantColors) ? vision.dominantColors : [])
-        .map((color) => normalizeSuggestionColorValue(color.hex))
-        .filter((color): color is string => Boolean(color));
+    const imagePalette = getVisionDominantColorPalette(vision);
 
     return {
         operation: 'update_layer',
         attributeKey: requestedAttribute.name,
         ...(requestedAttribute.type ? { attributeType: requestedAttribute.type } : {}),
         ...(imagePalette.length > 0 ? { outputs: imagePalette } : {}),
+        instruction: message
+    };
+};
+
+const getMapStylePropertyKeys = (
+    mapStyle: unknown,
+    kind: 'paint' | 'layout'
+): string[] => {
+    const layers = Array.isArray(asRecord(mapStyle).layers)
+        ? asRecord(mapStyle).layers as unknown[]
+        : [];
+
+    return layers
+        .flatMap((layer) => Object.keys(asRecord(asRecord(layer)[kind])))
+        .filter((key, index, keys) => keys.indexOf(key) === index);
+};
+
+const getMentionedMapStylePropertyKeys = (
+    message: string,
+    keys: string[]
+): string[] => {
+    const normalizedMessage = normalizeStyleSwitchText(message);
+    if (!normalizedMessage) return [];
+
+    return keys.filter((key) => {
+        const normalizedKey = normalizeStyleSwitchText(key);
+        return normalizedKey && normalizedMessage.includes(normalizedKey);
+    });
+};
+
+const buildFallbackStylePropertyEditArgs = (
+    message: string,
+    mapStyle: unknown
+): Record<string, unknown> | undefined => {
+    if (!/\b(remove|delete|drop|clear)\b/i.test(message)) return undefined;
+
+    const removePaintKeys = getMentionedMapStylePropertyKeys(
+        message,
+        getMapStylePropertyKeys(mapStyle, 'paint')
+    );
+    const removeLayoutKeys = getMentionedMapStylePropertyKeys(
+        message,
+        getMapStylePropertyKeys(mapStyle, 'layout')
+    );
+    if (removePaintKeys.length === 0 && removeLayoutKeys.length === 0) return undefined;
+
+    return {
+        operation: 'remove_property',
+        action: 'remove_property',
+        ...(removePaintKeys.length > 0 ? { removePaintKeys } : {}),
+        ...(removeLayoutKeys.length > 0 ? { removeLayoutKeys } : {}),
         instruction: message
     };
 };
@@ -5712,16 +5998,31 @@ export const processChatMessageStream = (
                         : undefined;
                     // Current DB state is preferred over message-derived history so
                     // edits continue from the layer/style actually rendered now.
-                    let latestMapStyle = mapFeaturesEnabled
-                        ? getLatestMapStyleFromState(conversationMapState)
-                            || getLatestMapStyleFromMessages(messagesForLLM)
-                            || memoryPayload.latestMapStyle
-                        : undefined;
                     let latestMapPayload = mapFeaturesEnabled
                         ? getLatestMapPayloadFromState(conversationMapState)
                             || getLatestMapPayloadFromMessages(messagesForLLM)
                             || memoryPayload.latestMap
                         : undefined;
+                    const hasConversationMapLayerState = Boolean(
+                        conversationMapState
+                        && Object.keys(conversationMapState.layers || {}).length > 0
+                    );
+                    let latestMapStyle = mapFeaturesEnabled
+                        ? getLatestMapStyleFromState(conversationMapState)
+                        : undefined;
+                    if (
+                        mapFeaturesEnabled
+                        && !latestMapStyle
+                        && hasConversationMapLayerState
+                        && latestMapPayload
+                    ) {
+                        const defaultStyle = await buildMapStylePayload(latestMapPayload);
+                        latestMapStyle = defaultStyle.success ? defaultStyle : undefined;
+                    }
+                    if (mapFeaturesEnabled && !latestMapStyle && !hasConversationMapLayerState) {
+                        latestMapStyle = getLatestMapStyleFromMessages(messagesForLLM)
+                            || memoryPayload.latestMapStyle;
+                    }
                     const classifiedMapRequestIntent: MapRequestIntent = hasMapSelection
                         ? 'map_access'
                         : mapFeaturesEnabled && hasUserMessage
@@ -6342,6 +6643,9 @@ export const processChatMessageStream = (
                             ? styleCatalog.colors.map((color) => color.key)
                             : [];
                         const latestVisionForStyle = visionAnalysis || memoryPayload.latestVision || null;
+                        const currentMapEditContext = latestMapStyle
+                            ? buildCurrentMapEditContext(latestMapPayload, latestMapStyle)
+                            : {};
                         mapStyleContext = {
                             role: 'system',
                             content: [
@@ -6360,6 +6664,7 @@ export const processChatMessageStream = (
                                         'If the user names an attribute value/category and a color, call edit_map_style with attributeKey, attributeValue, and colorKey/colorValue when possible.',
                                         'If the user changes one attribute value for a non-color paint property, call edit_map_style with attributeKey, attributeValue, the exact paintKey, and the requested numeric/string value.',
                                         'If the user changes multiple values of one attribute at once, call edit_map_style once with attributeKey, paintKey, and attributePatches containing each attributeValue and requested output/value/colorValue.',
+                                        'If the user asks to change the base/ramp/min/max colors of an existing numeric attribute style, call edit_map_style with attributeKey, paintKey, and outputs or colorValue, but omit attributeValue so the backend recolors the existing stops instead of adding a new stop.',
                                         'If the user asks to change an attribute or map style color like/from/same as/based on the current image, call edit_map_style with colorValue from Latest vision memory dominantColors. Include attributeKey when the user names one.',
                                         'For direct paint/layout edits, call edit_map_style with paintKey or layoutKey plus value when possible.',
                                         'If the user asks to add any style property to the current layer, call edit_map_style with operation "add_property" and use the exact paintKey or layoutKey named in the prompt plus value/colorKey/colorValue.',
@@ -6372,6 +6677,7 @@ export const processChatMessageStream = (
                                         'If the user names a non-active style such as circle, heatmap, fill, line, or 3d_extrusion, call edit_map_style with target/style wording so the backend can edit that saved style instead of only the latest active style.',
                                         `Available colorKeys: ${JSON.stringify(colorKeys)}`,
                                         `Latest vision memory: ${JSON.stringify(latestVisionForStyle)}`,
+                                        `Current map edit context from conversation_map_layers: ${JSON.stringify(currentMapEditContext)}`,
                                         `Current map_style: ${JSON.stringify(latestMapStyle)}`
                                     ]
                                     : []),
@@ -6744,13 +7050,22 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                     const executeEditMapStyle = async (aiArguments: Record<string, unknown>) => {
                         const selectedMapPayload = selectMapPayloadForEdit(conversationMapState, aiArguments, latestMapPayload, message);
+                        const ensureSelectedMapStyle = async (mapStyle: unknown | undefined): Promise<unknown | undefined> => {
+                            if (mapStyle) return mapStyle;
+                            if (!selectedMapPayload) return undefined;
+
+                            const defaultStyle = await buildMapStylePayload(selectedMapPayload);
+                            return defaultStyle.success ? defaultStyle : undefined;
+                        };
                         // Infer filter/style intent against the selected layer first;
                         // using only the latest global style breaks multi-layer chats.
-                        const inferredMapStyle = selectMapStyleForEdit(
-                            conversationMapState,
-                            aiArguments,
-                            message,
-                            latestMapStyle
+                        const inferredMapStyle = await ensureSelectedMapStyle(
+                            selectMapStyleForEdit(
+                                conversationMapState,
+                                aiArguments,
+                                message,
+                                latestMapStyle
+                            )
                         );
                         const filterArguments = await buildFilterEditArgsFromInstruction(
                             aiArguments,
@@ -6763,13 +7078,15 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                         const normalizedAiArguments = filterArguments || aiArguments;
                         const requestedEditOperation = normalizeMapEditOperationName(normalizedAiArguments.operation || normalizedAiArguments.action);
                         const isFilterEdit = requestedEditOperation?.endsWith('_filter') === true;
-                        const initialMapStyle = selectMapStyleForEdit(
-                            conversationMapState,
-                            normalizedAiArguments,
-                            isFilterEdit ? '' : message,
-                            latestMapStyle
+                        const initialMapStyle = await ensureSelectedMapStyle(
+                            selectMapStyleForEdit(
+                                conversationMapState,
+                                normalizedAiArguments,
+                                isFilterEdit ? '' : message,
+                                latestMapStyle
+                            )
                         );
-                        const enrichedEditArguments = isFilterEdit
+                        let enrichedEditArguments = isFilterEdit
                             ? buildFilterEditArgs(normalizedAiArguments, selectedMapPayload, initialMapStyle)
                             : await buildAttributeEditArgs(
                                 normalizedAiArguments,
@@ -6779,11 +7096,20 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                 mapHeaderApiKey,
                                 initialMapStyle
                             );
-                        const selectedMapStyle = selectMapStyleForEdit(
-                            conversationMapState,
-                            enrichedEditArguments,
-                            isFilterEdit ? '' : message,
-                            initialMapStyle
+                        if (!isFilterEdit) {
+                            enrichedEditArguments = enrichStyleArgsWithVisionPalette(
+                                enrichedEditArguments,
+                                enrichedEditArguments.instruction || normalizedAiArguments.instruction || message,
+                                visionAnalysis || memoryPayload.latestVision || null
+                            );
+                        }
+                        const selectedMapStyle = await ensureSelectedMapStyle(
+                            selectMapStyleForEdit(
+                                conversationMapState,
+                                enrichedEditArguments,
+                                isFilterEdit ? '' : message,
+                                initialMapStyle
+                            )
                         );
                         const rawEditResult = await handleEditMapStyleTool(
                             {
@@ -6829,6 +7155,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                 toSuggestionString(enrichedEditArguments.attributeKey)
                                 && enrichedEditArguments.attributeValue === undefined
                                 && (!Array.isArray(enrichedEditArguments.attributePatches) || enrichedEditArguments.attributePatches.length === 0)
+                                && !hasAttributeRampOutputRequest(enrichedEditArguments)
                             );
                             const suggestionsPayload = await enrichMapSuggestionsWithAttributeValues(
                                 buildMapSuggestionsPayload(selectedMapPayload, editResult, styleCatalog, conversationMapState, hasUserMessage ? message : undefined),
@@ -7062,6 +7389,15 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                 if (fallbackFilterArgs) {
                                     const handledFallbackFilter = await executeEditMapStyle(fallbackFilterArgs);
                                     if (handledFallbackFilter) return;
+                                }
+
+                                const fallbackStylePropertyArgs = buildFallbackStylePropertyEditArgs(
+                                    message,
+                                    latestMapStyle
+                                );
+                                if (fallbackStylePropertyArgs) {
+                                    const handledFallbackStyleProperty = await executeEditMapStyle(fallbackStylePropertyArgs);
+                                    if (handledFallbackStyleProperty) return;
                                 }
 
                                 const fallbackEditArgs = buildFallbackAttributeStyleArgs(
