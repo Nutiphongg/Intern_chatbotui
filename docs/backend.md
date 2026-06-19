@@ -505,6 +505,212 @@ LLM เรียก edit_map_style
 ]
 ```
 
+### 6.5 Image Palette Style Flow
+
+Flow นี้ใช้เมื่อผู้ใช้แนบรูปภาพและขอให้แต่งสีแผนที่จากรูป เช่น "ใช้สีจากรูปนี้แต่ง map" หรือ "style map เหมือน image"
+
+**ฟังก์ชันหลักใน Chatbot:** `extractImagePaletteWithSharp()`, `isImageMapColorStyleRequest()`, `getVisionDominantColorPalette()`, `enrichStyleArgsWithVisionPalette()`
+
+```
+User ส่ง message พร้อม imageAttachments
+  → parseChatImage() ตรวจ mime type และขนาดไฟล์
+  → ถ้าเป็นคำขอแต่ง map จากรูป:
+       imageAttachments.length > 0 && isBackendPaletteMapStyleRequest
+  → extractImagePaletteWithSharp() อ่าน pixel ด้วย sharp
+       - rotate() เพื่อ normalize orientation
+       - resize() ลดขนาด sample เพื่อประหยัดเวลา
+       - ensureAlpha().raw().toBuffer() เพื่ออ่าน RGBA pixel
+       - ข้าม pixel โปร่งใส alpha < 128
+       - quantize RGB เป็น step ละ 16 เพื่อลดสีซ้ำ
+  → เลือก dominant color จากจำนวน pixel ที่พบมากที่สุด
+  → เติมสีอื่นจากภาพแบบ deterministic random rank
+       โดยคุมระยะห่างสีด้วย colorDistance()
+  → Stream event: image_palette
+  → เก็บ palette ใน visionAnalysis.dominantColors
+  → ก่อนเรียก edit_map_style:
+       enrichStyleArgsWithVisionPalette() ใส่ outputs = palette
+  → getVisionDominantColorPalette() normalize/dedupe/sort สีสำหรับ numeric ramp
+  → handleEditMapStyleTool() ใช้ outputs กับ paint expression
+  → Stream map_style หรือ map_style_patch
+```
+
+**กฎสำคัญของ Palette**
+
+| ขั้นตอน | รายละเอียด |
+|---|---|
+| อ่านสี | ใช้ `sharp` อ่าน pixel จริงจากรูป ไม่ต้องรอ Vision Model ในเคสแต่ง style จากรูป |
+| สีเด่น | เลือกจาก pixel count สูงสุด |
+| สีที่เหลือ | เติมจากสีอื่นในรูปด้วย deterministic rank และเว้นระยะสี |
+| การเรียงเฉด | ก่อนส่งเข้า `edit_map_style` จะเรียงด้วย ramp score ที่เน้นความเข้มของสี และใช้ hue/warmth เฉพาะสีที่มี saturation ชัดเจน |
+| Numeric Attribute | ค่า min ใช้สีที่อ่านเป็นค่าต่ำกว่า และค่า max ใช้สีที่อ่านเป็นค่าสูงกว่า/หนักกว่าใน `interpolate` |
+| String Attribute | ค่าแต่ละ category วนใช้ `outputs` ตามลำดับสีที่เรียงแล้ว |
+
+**ตัวอย่าง outputs หลังจัดเรียงเฉด**
+
+```json
+{
+  "operation": "update_layer",
+  "attributeKey": "dri_mean",
+  "paintKey": "circle-color",
+  "outputs": ["#F9E7A1", "#E59A33", "#88491F"]
+}
+```
+
+สำหรับ Numeric Attribute จะได้ expression ประมาณนี้:
+
+```json
+["interpolate", ["linear"], ["get", "dri_mean"],
+  0,   "#F9E7A1",
+  50,  "#E59A33",
+  100, "#88491F"
+]
+```
+
+### 6.6 Style Property Selection Flow
+
+Flow นี้ใช้เมื่อผู้ใช้สั่งแต่ง style แต่ backend ยังไม่รู้ว่าจะใช้ `paintKey` หรือ `layoutKey` ตัวไหน เช่น:
+
+- "ลบเส้นรอบวงกลม"
+- "ปรับเป็น 10"
+- "เพิ่มขนาดให้ใหญ่ขึ้น"
+- "เปลี่ยน stroke width เป็น 2"
+
+**ฟังก์ชันหลัก:** `buildStylePropertyChoiceOptionsIfNeeded()`, `buildStylePropertyChoiceOptionsPayload()`, `normalizeMapSelectionArgs()`, `handleEditMapStyleTool()`
+
+```
+User ขอแก้ style
+  → LLM เรียก edit_map_style
+  → Chatbot merge args กับ current map_style
+  → handleEditMapStyleTool() ตรวจว่า property ชัดเจนหรือยัง
+  → ถ้ายังไม่ชัด:
+       buildStylePropertyChoiceOptionsIfNeeded()
+       สร้าง event map_options พร้อม choices ของ paint/layout property
+       selectedValues เก็บ pending args เช่น:
+         styleAction, operation, value, colorKey, colorValue, layerId, target, instruction
+  → Chatbot persist pending selection ลง Redis
+  → Frontend แสดงตัวเลือก property
+  → Frontend ส่ง mapselection กลับมา เช่น:
+       { "key": "paintKey", "value": "circle-radius" }
+  → normalizeMapSelectionArgs() แปลง selection เป็น params.paintKey
+  → Chatbot merge savedMapSelectionArgs + mapSelectionArgs
+  → ถ้า pending styleAction === "edit_map_style":
+       route เป็น map_control
+       ไม่เข้า map_access/map_options อีก
+  → executeEditMapStyle() เรียก handleEditMapStyleTool() อีกครั้ง
+  → ใช้ value/pending args เดิมกับ property ที่เลือก
+  → Stream map_style ใหม่
+  → Sync conversation_map_layers.map_style
+  → clear Redis map selection state
+```
+
+**เหตุผลที่ต้องใช้ pending styleAction**
+
+`mapselection` เดิมใช้กับ flow เลือก layer/map options ด้วย ถ้าไม่แยก `styleAction: "edit_map_style"` backend จะเข้าใจว่า selection นี้เป็นข้อมูลสำหรับ `get_map_layer` และอาจเรียก `map_options` ซ้ำ แทนที่จะเอา property ไปแก้ style
+
+### 6.7 ตัวอย่าง Style Property Payload
+
+**กรณีลบ property**
+
+ผู้ใช้:
+
+```text
+remove line around circle the map
+```
+
+Backend ส่ง `map_options`:
+
+```json
+{
+  "needInfo": true,
+  "key": "paintKey",
+  "choices": [
+    { "label": "circle-stroke-width", "value": "circle-stroke-width" },
+    { "label": "circle-stroke-color", "value": "circle-stroke-color" }
+  ],
+  "selectedValues": {
+    "styleAction": "edit_map_style",
+    "operation": "remove_property",
+    "action": "remove_property",
+    "instruction": "remove line around circle the map"
+  }
+}
+```
+
+Frontend ส่งกลับ:
+
+```json
+{
+  "mapselection": {
+    "key": "paintKey",
+    "value": "circle-stroke-width"
+  }
+}
+```
+
+Backend รวม args แล้วลบ `circle-stroke-width` จาก `map_style.layers[].paint` และ stream `map_style` ใหม่
+
+**กรณีบอก value ก่อน แล้วค่อยเลือก property**
+
+ผู้ใช้:
+
+```text
+ปรับเป็น 10
+```
+
+Backend ยังไม่รู้ว่าจะปรับ property ไหน จึงส่ง `map_options` พร้อม pending value:
+
+```json
+{
+  "needInfo": true,
+  "key": "paintKey",
+  "choices": [
+    { "label": "circle-radius", "value": "circle-radius" },
+    { "label": "circle-stroke-width", "value": "circle-stroke-width" }
+  ],
+  "selectedValues": {
+    "styleAction": "edit_map_style",
+    "operation": "update_layer",
+    "action": "update_layer",
+    "value": 10,
+    "instruction": "ปรับเป็น 10"
+  }
+}
+```
+
+Frontend เลือก property:
+
+```json
+{
+  "mapselection": {
+    "key": "paintKey",
+    "value": "circle-radius"
+  }
+}
+```
+
+Backend merge pending state เป็น:
+
+```json
+{
+  "styleAction": "edit_map_style",
+  "operation": "update_layer",
+  "value": 10,
+  "paintKey": "circle-radius"
+}
+```
+
+แล้ว patch paint:
+
+```json
+{
+  "circle-radius": 10
+}
+```
+
+**กรณีเลือก layout property**
+
+ถ้า `map_options` ส่ง `key: "layoutKey"` หรือ `stylePropertyKey: "layout:<key>"` เมื่อ frontend เลือกกลับมา backend จะใช้ `value` เดิม patch เข้า `layout` แทน `paint`
+
 ---
 
 ## 7. Filter Flow
@@ -608,4 +814,3 @@ Frontend ส่ง mapselection พร้อม Undo Key/LayerId
   → อัปเดต conversation_map_layers.map_style
   → Stream map_style ที่ Restore แล้ว
 ```
-

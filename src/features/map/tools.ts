@@ -72,6 +72,8 @@ let styleCatalogCache: {
   colors: StyleColorEntry[];
 } | undefined;
 
+const ATTRIBUTE_STYLE_VALUE_LIMIT = 10;
+
 const isRecord = (value: unknown): value is Record<string, unknown> => {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 };
@@ -1152,15 +1154,44 @@ const buildExplicitPaintColorPatch = (
   };
 };
 
+const getPaintKeyFromStylePropertyKey = (value: unknown): string | undefined => {
+  const stylePropertyKey = toStringValue(value)?.trim();
+  if (!stylePropertyKey) return undefined;
+
+  const separatorIndex = stylePropertyKey.indexOf(":");
+  if (separatorIndex > 0) {
+    const kind = stylePropertyKey.slice(0, separatorIndex);
+    const key = stylePropertyKey.slice(separatorIndex + 1).trim();
+    return kind === "paint" && key ? key : undefined;
+  }
+
+  return stylePropertyKey.includes("-") ? stylePropertyKey : undefined;
+};
+
+const parseGenericInstructionValue = (instruction: string): unknown => {
+  const numberMatch = instruction.match(/(?:\bvalue\b|\bto\b|=|:|เป็น|ค่า)\s*(-?\d+(?:\.\d+)?)/i);
+  if (numberMatch?.[1]) return numberMatch[1];
+
+  const trailingNumberMatch = instruction.match(/(-?\d+(?:\.\d+)?)\s*$/);
+  if (trailingNumberMatch?.[1]) return trailingNumberMatch[1];
+
+  return undefined;
+};
+
 const parseGenericPaintValue = (args: EditMapStyleArgs): unknown => {
-  if (args.value !== undefined) return args.value;
+  const explicitValue = getEditMapStyleArgValue(args, "value");
+  if (explicitValue !== undefined) return explicitValue;
 
   const instruction = getEditInstruction(args);
-  const explicitPaintKey = toStringValue(args.paintKey);
+  const explicitPaintKey = toStringValue(getEditMapStyleArgValue(args, "paintKey"))
+    || getPaintKeyFromStylePropertyKey(getEditMapStyleArgValue(args, "stylePropertyKey"));
   if (explicitPaintKey) {
     const escapedKey = explicitPaintKey.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     const match = instruction.match(new RegExp(`${escapedKey}\\s*(?:is|to|=|:|เป็น)?\\s*([^\\s,]+)`, "i"));
     if (match?.[1]) return match[1];
+
+    const genericValue = parseGenericInstructionValue(instruction);
+    if (genericValue !== undefined) return genericValue;
   }
 
   return undefined;
@@ -1203,7 +1234,8 @@ const resolvePaintKeyByInstruction = (
   args: EditMapStyleArgs,
   suffix?: string
 ): string | undefined => {
-  const explicitPaintKey = toStringValue(args.paintKey);
+  const explicitPaintKey = toStringValue(getEditMapStyleArgValue(args, "paintKey"))
+    || getPaintKeyFromStylePropertyKey(getEditMapStyleArgValue(args, "stylePropertyKey"));
   if (explicitPaintKey && (!suffix || explicitPaintKey.endsWith(suffix))) return explicitPaintKey;
 
   const instruction = normalizeEditText(getEditInstruction(args));
@@ -1372,6 +1404,77 @@ const getRequestedStylePropertyKeys = (...values: unknown[]): string[] => {
   ));
 };
 
+const getStylePropertySpecRecord = (
+  key: string,
+  layer: Record<string, unknown>,
+  kind: StylePropertyKind,
+  officialSpec?: Record<string, unknown>
+): Record<string, unknown> => {
+  const bucket = getOfficialStyleSpecBucket(officialSpec, toStringValue(layer.type), kind);
+  return pickRecord(bucket?.[key]);
+};
+
+const getStylePropertySearchTokens = (
+  key: string,
+  layer: Record<string, unknown>,
+  kind: StylePropertyKind,
+  officialSpec?: Record<string, unknown>
+): Set<string> => {
+  const specRecord = getStylePropertySpecRecord(key, layer, kind, officialSpec);
+  return new Set([
+    ...tokenizeStyleMatchText(key),
+    ...tokenizeStyleMatchText(specRecord.doc),
+    ...tokenizeStyleMatchText(specRecord.description),
+    ...tokenizeStyleMatchText(specRecord.type),
+    ...tokenizeStyleMatchText(specRecord["property-type"])
+  ]);
+};
+
+const getRequestedStyleIntentTokens = (args: EditMapStyleArgs): string[] => {
+  const tokens = [
+    ...tokenizeStyleMatchText(args.styleIntent),
+    ...tokenizeStyleMatchText(args.target),
+    ...tokenizeStyleMatchText(getEditInstruction(args))
+  ];
+  return Array.from(new Set(tokens));
+};
+
+const getExistingStylePropertyKeysByIntent = (
+  layer: Record<string, unknown>,
+  args: EditMapStyleArgs,
+  kind: StylePropertyKind,
+  officialSpec?: Record<string, unknown>
+): string[] => {
+  const requestedTokens = getRequestedStyleIntentTokens(args);
+  if (requestedTokens.length === 0) return [];
+
+  const layerTypeToken = normalizeStyleMatchText(layer.type);
+  const candidates = Object.keys(pickRecord(layer[kind]))
+    .filter((key) => canPatchStyleProperty(key, layer, kind, officialSpec))
+    .map((key) => ({
+      key,
+      tokens: getStylePropertySearchTokens(key, layer, kind, officialSpec)
+    }));
+  const propertyMatchedTokens = requestedTokens.filter((token) => {
+    const normalizedToken = normalizeStyleMatchText(token);
+    if (!normalizedToken || normalizedToken === layerTypeToken) return false;
+    return candidates.some((candidate) => candidate.tokens.has(token));
+  });
+  const requiredTokens = propertyMatchedTokens.length > 0 ? propertyMatchedTokens : requestedTokens;
+
+  return candidates
+    .filter((candidate) => {
+      const keyPrefixToken = normalizeStyleMatchText(getStylePropertyPrefix(candidate.key));
+      const meaningfulTokens = requiredTokens.filter((token) => {
+        const normalizedToken = normalizeStyleMatchText(token);
+        return normalizedToken && normalizedToken !== layerTypeToken && normalizedToken !== keyPrefixToken;
+      });
+      return meaningfulTokens.length > 0
+        && meaningfulTokens.every((token) => candidate.tokens.has(token));
+    })
+    .map((candidate) => candidate.key);
+};
+
 const getExistingStylePropertyKeysByText = (
   layer: Record<string, unknown>,
   args: EditMapStyleArgs,
@@ -1389,6 +1492,34 @@ const getExistingStylePropertyKeysByText = (
       || normalizedInstruction.includes(normalizedKey)
     ));
   });
+};
+
+const getExistingStylePropertyKeysByCurrentValue = (
+  layer: Record<string, unknown>,
+  args: EditMapStyleArgs,
+  kind: StylePropertyKind,
+  color?: string,
+  officialSpec?: Record<string, unknown>
+): string[] => {
+  const existing = pickRecord(layer[kind]);
+  const requestedColor = normalizeColorHex(color);
+  const requestedValue = normalizeStylePropertyValue(getEditMapStyleArgValue(args, "value"));
+  if (!requestedColor && requestedValue === undefined) return [];
+
+  return Object.entries(existing)
+    .filter(([key, value]) => {
+      if (!canPatchStyleProperty(key, layer, kind, officialSpec)) return false;
+
+      const currentColor = normalizeColorHex(value);
+      if (requestedColor && currentColor === requestedColor) return true;
+
+      if (requestedValue === undefined) return false;
+      if (typeof value === "number" || typeof value === "string" || typeof value === "boolean") {
+        return String(value).toLowerCase() === String(requestedValue).toLowerCase();
+      }
+      return false;
+    })
+    .map(([key]) => key);
 };
 
 const getExistingStylePropertyTarget = (
@@ -1450,20 +1581,69 @@ const getInstructionStylePropertyKey = (instruction: string): string | undefined
   return match?.[1];
 };
 
+const getEditMapStyleArgValue = (
+  args: EditMapStyleArgs,
+  key: string
+): unknown => {
+  if (args[key] !== undefined) return args[key];
+
+  const params = pickRecord(args.params);
+  if (params[key] !== undefined) return params[key];
+
+  const options = pickRecord(args.options);
+  if (options[key] !== undefined) return options[key];
+
+  const selectedOptions = pickRecord(args.selectedOptions);
+  if (selectedOptions[key] !== undefined) return selectedOptions[key];
+
+  return undefined;
+};
+
+const getSelectedStylePropertyFromArgs = (
+  args: EditMapStyleArgs
+): { kind: StylePropertyKind; key: string } | undefined => {
+  const selectedPropertyKey = toStringValue(getEditMapStyleArgValue(args, "stylePropertyKey"))?.trim();
+  if (selectedPropertyKey) {
+    const separatorIndex = selectedPropertyKey.indexOf(":");
+    if (separatorIndex > 0) {
+      const kind = selectedPropertyKey.slice(0, separatorIndex);
+      const key = selectedPropertyKey.slice(separatorIndex + 1).trim();
+      if ((kind === "paint" || kind === "layout") && key) return { kind, key };
+    }
+    if (selectedPropertyKey.includes("-")) return { kind: "paint", key: selectedPropertyKey };
+  }
+
+  const paintKey = toStringValue(getEditMapStyleArgValue(args, "paintKey"))?.trim();
+  if (paintKey) return { kind: "paint", key: paintKey };
+
+  const layoutKey = toStringValue(getEditMapStyleArgValue(args, "layoutKey"))?.trim();
+  if (layoutKey) return { kind: "layout", key: layoutKey };
+
+  return undefined;
+};
+
 const parseStylePropertyInstruction = (
   args: EditMapStyleArgs
 ): { kind: StylePropertyKind; key: string; value?: unknown } | undefined => {
   const instruction = getEditInstruction(args);
-  const explicitLayoutKey = toStringValue(args.layoutKey);
+  const selectedProperty = getSelectedStylePropertyFromArgs(args);
+  if (selectedProperty) {
+    return {
+      ...selectedProperty,
+      ...(getEditMapStyleArgValue(args, "value") !== undefined ? { value: getEditMapStyleArgValue(args, "value") } : {})
+    };
+  }
+
+  const explicitLayoutKey = toStringValue(getEditMapStyleArgValue(args, "layoutKey"));
   if (explicitLayoutKey) {
     return {
       kind: "layout",
       key: explicitLayoutKey,
-      ...(args.value !== undefined ? { value: args.value } : {})
+      ...(getEditMapStyleArgValue(args, "value") !== undefined ? { value: getEditMapStyleArgValue(args, "value") } : {})
     };
   }
 
-  const explicitPaintKey = toStringValue(args.paintKey);
+  const explicitPaintKey = toStringValue(getEditMapStyleArgValue(args, "paintKey"));
   const key = explicitPaintKey || getInstructionStylePropertyKey(instruction);
   if (!key) return undefined;
 
@@ -1478,6 +1658,21 @@ const parseStylePropertyInstruction = (
 const getStylePropertyPrefix = (key: string): string | undefined => {
   const index = key.indexOf("-");
   return index > 0 ? key.slice(0, index) : undefined;
+};
+
+const areStylePropertyKeysStructurallySimilar = (
+  candidateKey: string,
+  requestedKey: string
+): boolean => {
+  const candidateTokens = tokenizeStyleMatchText(candidateKey);
+  const requestedTokens = tokenizeStyleMatchText(requestedKey);
+  if (candidateTokens.length < 2 || requestedTokens.length < 2) return false;
+
+  const sameLayerPrefix = candidateTokens[0] === requestedTokens[0];
+  const sameOutputSuffix = candidateTokens[candidateTokens.length - 1] === requestedTokens[requestedTokens.length - 1];
+  if (!sameLayerPrefix || !sameOutputSuffix) return false;
+
+  return candidateTokens.some((token) => requestedTokens.includes(token));
 };
 
 const loadMapLibreStyleSpec = async (): Promise<Record<string, unknown> | undefined> => {
@@ -1538,7 +1733,443 @@ const canPatchStyleProperty = (
   officialSpec?: Record<string, unknown>
 ): boolean => {
   const officialResult = isStylePropertyAllowedByOfficialSpec(key, layer, kind, officialSpec);
+  const existing = pickRecord(layer[kind]);
+  if (existing[key] !== undefined) return officialResult !== false;
   return officialResult === true;
+};
+
+type StylePropertyOptionCandidate = {
+  kind: StylePropertyKind;
+  key: string;
+  layerType?: string;
+  value: unknown;
+};
+
+type StylePropertyChoiceOperation = Extract<EditMapStyleOperation, "update_layer" | "add_property" | "remove_property">;
+
+const getPatchableStylePropertyOptionCandidates = (
+  layer: Record<string, unknown>,
+  kind: StylePropertyKind,
+  officialSpec?: Record<string, unknown>
+): StylePropertyOptionCandidate[] => {
+  return Object.entries(pickRecord(layer[kind]))
+    .filter(([key]) => canPatchStyleProperty(key, layer, kind, officialSpec))
+    .map(([key, value]) => ({
+      kind,
+      key,
+      layerType: toStringValue(layer.type),
+      value
+    }));
+};
+
+const getMatchedStylePropertyOptionCandidates = (
+  layer: Record<string, unknown>,
+  args: EditMapStyleArgs,
+  kind: StylePropertyKind,
+  officialSpec?: Record<string, unknown>
+): StylePropertyOptionCandidate[] => {
+  const matchedKeys = getRequestedStylePropertyKeys(
+    getExistingStylePropertyKeysByText(layer, args, kind),
+    getExistingStylePropertyKeysByIntent(layer, args, kind, officialSpec)
+  );
+  const existing = pickRecord(layer[kind]);
+  return matchedKeys
+    .filter((key) => existing[key] !== undefined && canPatchStyleProperty(key, layer, kind, officialSpec))
+    .map((key) => ({
+      kind,
+      key,
+      layerType: toStringValue(layer.type),
+      value: existing[key]
+    }));
+};
+
+const uniqueStylePropertyOptionCandidates = (
+  candidates: StylePropertyOptionCandidate[]
+): StylePropertyOptionCandidate[] => {
+  const seen = new Set<string>();
+  return candidates.filter((candidate) => {
+    const id = `${candidate.kind}:${candidate.key}`;
+    if (seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
+};
+
+const isStylePropertyPatchableInLayers = (
+  layers: Record<string, unknown>[],
+  property: { kind: StylePropertyKind; key: string },
+  officialSpec?: Record<string, unknown>
+): boolean => {
+  return layers.some((layer) => {
+    const existing = pickRecord(layer[property.kind]);
+    return existing[property.key] !== undefined
+      && canPatchStyleProperty(property.key, layer, property.kind, officialSpec);
+  });
+};
+
+const getStylePropertyOptionCandidatesByRequestedKey = (
+  layers: Record<string, unknown>[],
+  property: { kind: StylePropertyKind; key: string },
+  officialSpec?: Record<string, unknown>
+): StylePropertyOptionCandidate[] => {
+  const requestedKey = normalizeStyleMatchText(property.key);
+  if (!requestedKey) return [];
+
+  return uniqueStylePropertyOptionCandidates(
+    layers.flatMap((layer) => {
+      const existing = pickRecord(layer[property.kind]);
+      return Object.entries(existing)
+        .filter(([key]) => {
+          const normalizedKey = normalizeStyleMatchText(key);
+          return Boolean(normalizedKey && (
+            normalizedKey === requestedKey
+            || normalizedKey.startsWith(requestedKey)
+            || normalizedKey.includes(requestedKey)
+            || areStylePropertyKeysStructurallySimilar(key, property.key)
+          ));
+        })
+        .filter(([key]) => canPatchStyleProperty(key, layer, property.kind, officialSpec))
+        .map(([key, value]) => ({
+          kind: property.kind,
+          key,
+          layerType: toStringValue(layer.type),
+          value
+        }));
+    })
+  );
+};
+
+const getStylePropertyFamilyOptionCandidates = (
+  layers: Record<string, unknown>[],
+  property: { kind: StylePropertyKind; key: string },
+  officialSpec?: Record<string, unknown>
+): StylePropertyOptionCandidate[] => {
+  const requestedTokens = tokenizeStyleMatchText(property.key);
+  const requestedPrefix = requestedTokens[0];
+  const requestedDescriptors = requestedTokens.slice(1, -1);
+  if (!requestedPrefix || requestedDescriptors.length === 0) return [];
+
+  return uniqueStylePropertyOptionCandidates(
+    layers.flatMap((layer) => {
+      const existing = pickRecord(layer[property.kind]);
+      return Object.entries(existing)
+        .filter(([key]) => {
+          const candidateTokens = tokenizeStyleMatchText(key);
+          if (candidateTokens[0] !== requestedPrefix) return false;
+          const candidateDescriptors = candidateTokens.slice(1, -1);
+          return requestedDescriptors.some((token) => candidateDescriptors.includes(token));
+        })
+        .filter(([key]) => canPatchStyleProperty(key, layer, property.kind, officialSpec))
+        .map(([key, value]) => ({
+          kind: property.kind,
+          key,
+          layerType: toStringValue(layer.type),
+          value
+        }));
+    })
+  );
+};
+
+const getStylePropertyPrefixOptionCandidates = (
+  layers: Record<string, unknown>[],
+  property: { kind: StylePropertyKind; key: string },
+  officialSpec?: Record<string, unknown>
+): StylePropertyOptionCandidate[] => {
+  const requestedTokens = tokenizeStyleMatchText(property.key);
+  const requestedPrefix = requestedTokens[0];
+  if (!requestedPrefix) return [];
+
+  return uniqueStylePropertyOptionCandidates(
+    layers.flatMap((layer) => {
+      const existing = pickRecord(layer[property.kind]);
+      return Object.entries(existing)
+        .filter(([key]) => tokenizeStyleMatchText(key)[0] === requestedPrefix)
+        .filter(([key]) => canPatchStyleProperty(key, layer, property.kind, officialSpec))
+        .map(([key, value]) => ({
+          kind: property.kind,
+          key,
+          layerType: toStringValue(layer.type),
+          value
+        }));
+    })
+  );
+};
+
+const instructionMentionsStylePropertyDescriptor = (
+  instruction: string,
+  property: { key: string }
+): boolean => {
+  const instructionTokens = new Set(tokenizeStyleMatchText(instruction));
+  const descriptorTokens = tokenizeStyleMatchText(property.key).slice(1, -1);
+  if (descriptorTokens.length === 0) return false;
+
+  return descriptorTokens.some((token) => {
+    if (instructionTokens.has(token)) return true;
+    if (token !== "stroke") return false;
+    return ["line", "border", "outline", "around"].some((synonym) => instructionTokens.has(synonym));
+  });
+};
+
+const getStylePropertyRemoveOptionCandidates = (
+  layers: Record<string, unknown>[],
+  property: { kind: StylePropertyKind; key: string },
+  officialSpec?: Record<string, unknown>,
+  instruction = ""
+): StylePropertyOptionCandidate[] => {
+  const prefixCandidates = getStylePropertyPrefixOptionCandidates(layers, property, officialSpec);
+  if (!instructionMentionsStylePropertyDescriptor(instruction, property)) {
+    return prefixCandidates;
+  }
+
+  const familyCandidates = getStylePropertyFamilyOptionCandidates(layers, property, officialSpec);
+  return familyCandidates.length > 1
+    ? familyCandidates
+    : prefixCandidates;
+};
+
+const getExplicitRemoveStyleProperties = (
+  args: EditMapStyleArgs
+): Array<{ kind: StylePropertyKind; key: string }> => {
+  return [
+    ...toStringList(args.removePaintKeys).map((key) => ({ kind: "paint" as const, key })),
+    ...toStringList(args.removeLayoutKeys).map((key) => ({ kind: "layout" as const, key }))
+  ];
+};
+
+const getExactStylePropertyOptionCandidates = (
+  layers: Record<string, unknown>[],
+  properties: Array<{ kind: StylePropertyKind; key: string }>,
+  officialSpec?: Record<string, unknown>
+): StylePropertyOptionCandidate[] => {
+  return uniqueStylePropertyOptionCandidates(
+    properties.flatMap((property) => {
+      return layers.flatMap((layer) => {
+        const existing = pickRecord(layer[property.kind]);
+        return existing[property.key] !== undefined
+          && canPatchStyleProperty(property.key, layer, property.kind, officialSpec)
+          ? [{
+              kind: property.kind,
+              key: property.key,
+              layerType: toStringValue(layer.type),
+              value: existing[property.key]
+            }]
+          : [];
+      });
+    })
+  );
+};
+
+const stylePropertyOptionDescription = (
+  candidate: StylePropertyOptionCandidate
+): string => {
+  const preview = typeof candidate.value === "string" || typeof candidate.value === "number" || typeof candidate.value === "boolean"
+    ? String(candidate.value)
+    : Array.isArray(candidate.value)
+      ? "expression"
+      : "object";
+  return [
+    candidate.kind,
+    candidate.layerType,
+    preview
+  ].filter(Boolean).join(" | ");
+};
+
+const buildStylePropertyChoiceOptionsPayload = (
+  candidates: StylePropertyOptionCandidate[],
+  args: EditMapStyleArgs,
+  operation: StylePropertyChoiceOperation,
+  layerId: string | undefined,
+  question: string
+) => {
+  const uniqueCandidates = uniqueStylePropertyOptionCandidates(candidates);
+  const hasPaint = uniqueCandidates.some((candidate) => candidate.kind === "paint");
+  const hasLayout = uniqueCandidates.some((candidate) => candidate.kind === "layout");
+  const key = hasPaint && hasLayout
+    ? "stylePropertyKey"
+    : hasLayout
+      ? "layoutKey"
+      : "paintKey";
+  const pendingValue = getEditMapStyleArgValue(args, "value") ?? parseGenericInstructionValue(getEditInstruction(args));
+
+  return {
+    success: false,
+    needsOptions: true,
+    payload: {
+      needInfo: true,
+      complete: false,
+      missingKeys: [key],
+      options: [{
+        key,
+        required: true,
+        source: "map_access",
+        choices: uniqueCandidates.map((candidate) => ({
+          label: candidate.key,
+          value: key === "stylePropertyKey" ? `${candidate.kind}:${candidate.key}` : candidate.key,
+          type: candidate.kind,
+          description: stylePropertyOptionDescription(candidate)
+        }))
+      }],
+      selectedValues: {
+        styleAction: "edit_map_style",
+        operation,
+        action: operation,
+        ...(pendingValue !== undefined ? { value: pendingValue } : {}),
+        ...(toStringValue(getEditMapStyleArgValue(args, "colorKey")) ? { colorKey: toStringValue(getEditMapStyleArgValue(args, "colorKey")) } : {}),
+        ...(toStringValue(getEditMapStyleArgValue(args, "colorValue")) ? { colorValue: toStringValue(getEditMapStyleArgValue(args, "colorValue")) } : {}),
+        ...(layerId ? { layerId } : {}),
+        ...(toStringValue(getEditMapStyleArgValue(args, "target")) ? { target: toStringValue(getEditMapStyleArgValue(args, "target")) } : {}),
+        ...(toStringValue(getEditMapStyleArgValue(args, "styleLayerId")) ? { styleLayerId: toStringValue(getEditMapStyleArgValue(args, "styleLayerId")) } : {}),
+        instruction: getEditInstruction(args)
+      },
+      question
+    }
+  };
+};
+
+const buildStylePropertyChoiceOptionsIfNeeded = (
+  layers: Record<string, unknown>[],
+  args: EditMapStyleArgs,
+  operation: StylePropertyChoiceOperation,
+  layerId: string | undefined,
+  officialSpec?: Record<string, unknown>
+) => {
+  const selectedProperty = getSelectedStylePropertyFromArgs(args);
+  const parsedProperty = parseStylePropertyInstruction(args);
+  const requestedProperty = selectedProperty || parsedProperty;
+  const explicitRemoveProperties = getExplicitRemoveStyleProperties(args);
+  const hasExplicitRemoveKeys = explicitRemoveProperties.length > 0;
+  const hasExplicitPatchObject = Object.keys(pickRecord(args.paint)).length > 0
+    || Object.keys(pickRecord(args.layout)).length > 0;
+  const propertySelectionConfirmed = getEditMapStyleArgValue(args, "propertySelectionConfirmed") === true;
+  const instructionNamesExactStyleKey = (key: string) => {
+    const normalizedInstruction = normalizeStyleMatchText(getEditInstruction(args));
+    const normalizedKey = normalizeStyleMatchText(key);
+    return Boolean(normalizedInstruction && normalizedKey && normalizedInstruction.includes(normalizedKey));
+  };
+
+  if (requestedProperty && isStylePropertyPatchableInLayers(layers, requestedProperty, officialSpec)) {
+    const instructionNamesExactKey = instructionNamesExactStyleKey(requestedProperty.key);
+    if (operation === "remove_property" && !instructionNamesExactKey && !propertySelectionConfirmed) {
+      const removeCandidates = getStylePropertyRemoveOptionCandidates(layers, requestedProperty, officialSpec, getEditInstruction(args));
+      if (removeCandidates.length > 1) {
+        return buildStylePropertyChoiceOptionsPayload(
+          removeCandidates,
+          args,
+          operation,
+          layerId,
+          "Please choose which style property to remove."
+        );
+      }
+    }
+    return undefined;
+  }
+  if (hasExplicitRemoveKeys) {
+    const exactRemoveCandidates = getExactStylePropertyOptionCandidates(layers, explicitRemoveProperties, officialSpec);
+    if (exactRemoveCandidates.length > 1) {
+      return buildStylePropertyChoiceOptionsPayload(
+        exactRemoveCandidates,
+        args,
+        operation,
+        layerId,
+        "Please choose which style property to remove."
+      );
+    }
+    if (exactRemoveCandidates.length === 1 && !propertySelectionConfirmed) {
+      const exactCandidate = exactRemoveCandidates[0];
+      const guessedProperty = explicitRemoveProperties.find((property) => (
+        property.kind === exactCandidate.kind && property.key === exactCandidate.key
+      ));
+      if (guessedProperty && !instructionNamesExactStyleKey(guessedProperty.key)) {
+        const removeCandidates = getStylePropertyRemoveOptionCandidates(layers, guessedProperty, officialSpec, getEditInstruction(args));
+        if (removeCandidates.length > 1) {
+          return buildStylePropertyChoiceOptionsPayload(
+            removeCandidates,
+            args,
+            operation,
+            layerId,
+            "Please choose which style property to remove."
+          );
+        }
+      }
+    }
+
+    const allExplicitKeysPatchable = explicitRemoveProperties.every((property) => {
+      return isStylePropertyPatchableInLayers(layers, property, officialSpec);
+    });
+    if (allExplicitKeysPatchable) return undefined;
+
+    const explicitRemoveCandidates = uniqueStylePropertyOptionCandidates(
+      explicitRemoveProperties.flatMap((property) => {
+        return getStylePropertyOptionCandidatesByRequestedKey(layers, property, officialSpec);
+      })
+    );
+    if (explicitRemoveCandidates.length > 0) {
+      return buildStylePropertyChoiceOptionsPayload(
+        explicitRemoveCandidates,
+        args,
+        operation,
+        layerId,
+        "Please choose which style property to remove."
+      );
+    }
+  }
+  if (hasExplicitPatchObject) return undefined;
+
+  const requestedCandidates = requestedProperty
+    ? getStylePropertyOptionCandidatesByRequestedKey(layers, requestedProperty, officialSpec)
+    : [];
+  if (requestedCandidates.length > 0) {
+    return buildStylePropertyChoiceOptionsPayload(
+      requestedCandidates,
+      args,
+      operation,
+      layerId,
+      operation === "remove_property"
+        ? "Please choose which style property to remove."
+      : "Please choose which style property to edit."
+    );
+  }
+
+  const matchedCandidates = uniqueStylePropertyOptionCandidates(
+    layers.flatMap((layer) => [
+      ...getMatchedStylePropertyOptionCandidates(layer, args, "paint", officialSpec),
+      ...getMatchedStylePropertyOptionCandidates(layer, args, "layout", officialSpec)
+    ])
+  );
+  if (matchedCandidates.length === 1) {
+    if (operation !== "remove_property" && operation !== "update_layer") return undefined;
+
+    return buildStylePropertyChoiceOptionsPayload(
+      matchedCandidates,
+      args,
+      operation,
+      layerId,
+      operation === "remove_property"
+        ? "Please choose which style property to remove."
+        : "Please choose which style property to edit."
+    );
+  }
+
+  const optionCandidates = matchedCandidates.length > 1
+    ? matchedCandidates
+    : uniqueStylePropertyOptionCandidates(
+      layers.flatMap((layer) => [
+        ...getPatchableStylePropertyOptionCandidates(layer, "paint", officialSpec),
+        ...getPatchableStylePropertyOptionCandidates(layer, "layout", officialSpec)
+      ])
+    );
+
+  if (optionCandidates.length === 0) return undefined;
+
+  return buildStylePropertyChoiceOptionsPayload(
+    optionCandidates,
+    args,
+    operation,
+    layerId,
+    operation === "remove_property"
+      ? "Please choose which style property to remove."
+      : "Please choose which style property to edit."
+  );
 };
 
 const normalizeStylePropertyValue = (value: unknown): unknown => {
@@ -1555,7 +2186,9 @@ const normalizeStylePropertyValue = (value: unknown): unknown => {
 };
 
 const resolveEditMapStyleOperation = (args: EditMapStyleArgs): EditMapStyleOperation => {
-  const explicit = normalizeStylePropertyOperation(args.operation || args.action);
+  const explicit = normalizeStylePropertyOperation(
+    getEditMapStyleArgValue(args, "operation") || getEditMapStyleArgValue(args, "action")
+  );
   const instruction = getEditInstruction(args);
   const inferred = inferStylePropertyOperationFromInstruction(instruction);
 
@@ -1565,7 +2198,7 @@ const resolveEditMapStyleOperation = (args: EditMapStyleArgs): EditMapStyleOpera
   if (explicit === "remove_property" || inferred === "remove_property") {
     return "remove_property";
   }
-  if (toStringValue(args.attributeKey)) {
+  if (toStringValue(getEditMapStyleArgValue(args, "attributeKey"))) {
     return "update_layer";
   }
   if (explicit) return explicit;
@@ -1719,9 +2352,13 @@ const buildPropertyAddPatch = (
   const paint = { ...pickRecord(args.paint) };
   const layout = { ...pickRecord(args.layout) };
   const parsedProperty = parseStylePropertyInstruction(args);
-  const paintKey = parsedProperty?.kind === "paint" ? parsedProperty.key : toStringValue(args.paintKey);
-  const layoutKey = parsedProperty?.kind === "layout" ? parsedProperty.key : toStringValue(args.layoutKey);
-  const propertyValue = normalizeStylePropertyValue(parsedProperty?.value ?? args.value);
+  const paintKey = parsedProperty?.kind === "paint"
+    ? parsedProperty.key
+    : toStringValue(getEditMapStyleArgValue(args, "paintKey")) || getExistingStylePropertyKeysByIntent(layer, args, "paint", officialSpec)[0];
+  const layoutKey = parsedProperty?.kind === "layout"
+    ? parsedProperty.key
+    : toStringValue(getEditMapStyleArgValue(args, "layoutKey")) || getExistingStylePropertyKeysByIntent(layer, args, "layout", officialSpec)[0];
+  const propertyValue = normalizeStylePropertyValue(parsedProperty?.value ?? getEditMapStyleArgValue(args, "value"));
 
   if (paintKey && paint[paintKey] === undefined && canPatchStyleProperty(paintKey, layer, "paint", officialSpec)) {
     if (paintKey.endsWith("-color") && color) {
@@ -1735,6 +2372,21 @@ const buildPropertyAddPatch = (
   }
 
   return { paint, layout };
+};
+
+const buildExplicitGenericLayoutPatch = (
+  layout: Record<string, unknown>,
+  args: EditMapStyleArgs
+): Record<string, unknown> => {
+  const layoutKey = toStringValue(getEditMapStyleArgValue(args, "layoutKey"));
+  if (!layoutKey) return {};
+
+  const value = getEditMapStyleArgValue(args, "value");
+  if (value === undefined) return {};
+
+  return {
+    [layoutKey]: normalizeStylePropertyValue(value)
+  };
 };
 
 const applyStylePropertyOperation = (
@@ -1751,21 +2403,29 @@ const applyStylePropertyOperation = (
     const parsedProperty = parseStylePropertyInstruction(args);
     const parsedPaintKey = parsedProperty?.kind === "paint" ? parsedProperty.key : undefined;
     const parsedLayoutKey = parsedProperty?.kind === "layout" ? parsedProperty.key : undefined;
-    const paintKeys = getRequestedStylePropertyKeys(
-      args.paintKey,
-      parsedPaintKey,
-      args.removePaintKeys,
-      Object.keys(pickRecord(args.paint)),
-      getExistingStylePropertyKeysByText(layer, args, "paint")
-    )
+    const valueMatchedPaintKeys = getExistingStylePropertyKeysByCurrentValue(layer, args, "paint", color, officialSpec);
+    const valueMatchedLayoutKeys = getExistingStylePropertyKeysByCurrentValue(layer, args, "layout", color, officialSpec);
+    const paintKeys = (valueMatchedPaintKeys.length > 0
+      ? valueMatchedPaintKeys
+      : getRequestedStylePropertyKeys(
+        getEditMapStyleArgValue(args, "paintKey"),
+        parsedPaintKey,
+        args.removePaintKeys,
+        Object.keys(pickRecord(args.paint)),
+        getExistingStylePropertyKeysByText(layer, args, "paint"),
+        getExistingStylePropertyKeysByIntent(layer, args, "paint", officialSpec)
+      ))
       .filter((key) => canPatchStyleProperty(key, layer, "paint", officialSpec));
-    const layoutKeys = getRequestedStylePropertyKeys(
-      args.layoutKey,
-      parsedLayoutKey,
-      args.removeLayoutKeys,
-      Object.keys(pickRecord(args.layout)),
-      getExistingStylePropertyKeysByText(layer, args, "layout")
-    )
+    const layoutKeys = (valueMatchedLayoutKeys.length > 0
+      ? valueMatchedLayoutKeys
+      : getRequestedStylePropertyKeys(
+        getEditMapStyleArgValue(args, "layoutKey"),
+        parsedLayoutKey,
+        args.removeLayoutKeys,
+        Object.keys(pickRecord(args.layout)),
+        getExistingStylePropertyKeysByText(layer, args, "layout"),
+        getExistingStylePropertyKeysByIntent(layer, args, "layout", officialSpec)
+      ))
       .filter((key) => canPatchStyleProperty(key, layer, "layout", officialSpec));
     if (paintKeys.length === 0 && layoutKeys.length === 0) return layer;
 
@@ -1825,7 +2485,7 @@ const buildAttributePaintPatch = async (
     || getEditablePaintColorKey(existingPaint);
   if (!paintKey || (typeof color === "string" && normalizeColorHex(color) && !paintKey.endsWith("-color"))) return {};
 
-  const values = getAttributeValuesList(args.attributeValues).slice(0, 5);
+  const values = getAttributeValuesList(args.attributeValues).slice(0, ATTRIBUTE_STYLE_VALUE_LIMIT);
   const outputs = await getAttributeStyleOutputs(args, paintKey, existingPaint, color, Math.max(values.length, 3));
   if (outputs.length === 0) return {};
   const fallbackOutput = args.fallbackOutput !== undefined
@@ -1915,7 +2575,7 @@ const buildHeatmapAttributeStyleLayers = async (
     || getEditablePaintColorKey(existingPaint);
   if (paintKey !== "heatmap-color") return undefined;
 
-  const values = getAttributeValuesList(args.attributeValues).slice(0, 5);
+  const values = getAttributeValuesList(args.attributeValues).slice(0, ATTRIBUTE_STYLE_VALUE_LIMIT);
   if (values.length === 0) return undefined;
 
   const palette = (await getAttributeStylePalette(existingPaint, color, paintKey))
@@ -2077,9 +2737,9 @@ export const handleEditMapStyleTool = async (
     }
   }
 
-  const requestedLayerId = toStringValue(aiArgs.layerId) || toStringValue(pickRecord(aiArgs.params).layerId);
+  const requestedLayerId = toStringValue(getEditMapStyleArgValue(aiArgs, "layerId"));
   const currentMapLayerId = toStringValue(currentStyle.layerId) || requestedLayerId;
-  const requestedTarget = toStringValue(aiArgs.target)?.toLowerCase();
+  const requestedTarget = toStringValue(getEditMapStyleArgValue(aiArgs, "target"))?.toLowerCase();
   const availableStyleLayerIds = new Set(
     currentLayers
       .map((layer) => toStringValue(pickRecord(layer).id))
@@ -2101,14 +2761,54 @@ export const handleEditMapStyleTool = async (
     : undefined;
   const officialStyleSpec = isFilterOperation ? undefined : await loadMapLibreStyleSpec();
   let matchedFilterLayer = false;
+  const requestedStyleLayerId = toStringValue(getEditMapStyleArgValue(aiArgs, "styleLayerId"));
+  const styleLayerId = requestedStyleLayerId && availableStyleLayerIds.has(requestedStyleLayerId)
+    ? requestedStyleLayerId
+    : undefined;
+  const targetStyleLayers = currentLayers
+    .map(pickRecord)
+    .filter((layerRecord) => {
+      const layerIdMatches = !requestedLayerId
+        || requestedLayerId === currentMapLayerId
+        || requestedLayerId === toStringValue(layerRecord.id);
+      const layerType = toStringValue(layerRecord.type) || "";
+      const targetMatches = styleLayerId
+        ? styleLayerId === toStringValue(layerRecord.id)
+        : !target
+          || target === layerType.toLowerCase()
+          || target === toStringValue(layerRecord.id)?.toLowerCase();
+      return layerIdMatches && targetMatches;
+    });
+
+  const shouldAskForUpdateProperty = operation === "update_layer"
+    && (
+      getEditMapStyleArgValue(aiArgs, "value") !== undefined
+      || parseGenericInstructionValue(getEditInstruction(aiArgs)) !== undefined
+    )
+    && !getSelectedStylePropertyFromArgs(aiArgs)
+    && Object.keys(pickRecord(aiArgs.paint)).length === 0
+    && Object.keys(pickRecord(aiArgs.layout)).length === 0;
+  if (
+    (
+      operation === "add_property"
+      || operation === "remove_property"
+      || shouldAskForUpdateProperty
+    )
+    && targetStyleLayers.length > 0
+  ) {
+    const propertyOptions = buildStylePropertyChoiceOptionsIfNeeded(
+      targetStyleLayers,
+      aiArgs,
+      shouldAskForUpdateProperty ? "update_layer" : operation,
+      requestedLayerId || currentMapLayerId,
+      officialStyleSpec
+    );
+    if (propertyOptions) return propertyOptions;
+  }
 
   const patchLayer = async (layer: unknown): Promise<Record<string, unknown> | Array<Record<string, unknown>>> => {
     const layerRecord = pickRecord(layer);
     const layerType = toStringValue(layerRecord.type) || "";
-    const requestedStyleLayerId = toStringValue(aiArgs.styleLayerId);
-    const styleLayerId = requestedStyleLayerId && availableStyleLayerIds.has(requestedStyleLayerId)
-      ? requestedStyleLayerId
-      : undefined;
     const targetMatches = styleLayerId
       ? styleLayerId === toStringValue(layerRecord.id)
       : !target
@@ -2130,7 +2830,10 @@ export const handleEditMapStyleTool = async (
     if (heatmapAttributeLayers) return heatmapAttributeLayers;
 
     const paintPatch = await getPaintPatchForLayerType(aiArgs, resolvedColor, pickRecord(layerRecord.paint));
-    const layoutPatch = pickRecord(aiArgs.layout);
+    const layoutPatch = {
+      ...pickRecord(aiArgs.layout),
+      ...buildExplicitGenericLayoutPatch(pickRecord(layerRecord.layout), aiArgs)
+    };
 
     return {
       ...layerRecord,
@@ -2162,7 +2865,7 @@ export const handleEditMapStyleTool = async (
     }
     const attributeKey = toStringValue(aiArgs.attributeKey);
     const attributeValues = getAttributeValuesList(aiArgs.attributeValues);
-    if (attributeKey && aiArgs.attributeValue === undefined && attributeValues.length > 0) {
+    if (operation !== "remove_property" && attributeKey && aiArgs.attributeValue === undefined && attributeValues.length > 0) {
       return {
         ...currentStyle,
         success: true,
@@ -5416,6 +6119,10 @@ export const editMapStyleToolSchema = {
           type: "string",
           description: "The current style layer type or style layer id to edit. If omitted, layers from the latest map_style are used."
         },
+        styleIntent: {
+          type: "string",
+          description: "Natural-language visual concept for a style property. The backend token-matches it only against paint/layout keys already present in the current map_style plus MapLibre spec metadata, then validates with the MapLibre style spec."
+        },
         layerType: {
           type: "string",
           description: "Optional current MapLibre layer type hint."
@@ -5488,6 +6195,10 @@ export const editMapStyleToolSchema = {
         layoutKey: {
           type: "string",
           description: "MapLibre layout key to edit, add, or remove."
+        },
+        stylePropertyKey: {
+          type: "string",
+          description: "Selected ambiguous style property from map_options. Use paint:<key> or layout:<key> when both groups are offered."
         },
         removePaintKeys: {
           type: "array",

@@ -129,6 +129,7 @@ export type EditMapStyleArgs = MapToolArgs & {
   layerType?: string;
   layer?: unknown;
   target?: string;
+  styleIntent?: string;
   operation?: string;
   action?: string;
   colorKey?: string;

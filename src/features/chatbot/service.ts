@@ -48,8 +48,10 @@ const MAP_INTENT_ROUTER_TIMEOUT_MS = 12000;
 const VISION_OUTPUT_TOKENS = 3072;
 const VISION_REQUEST_TIMEOUT_MS = 180000;
 const CHAT_ATTACHMENT_SIGNED_URL_TTL_SECONDS = 60 * 60 * 24;
-const MAX_CHAT_IMAGES = 3;
+const MAX_CHAT_IMAGES = 1;
 const MAX_CHAT_IMAGE_BYTES = 5 * 1024 * 1024;
+const IMAGE_PALETTE_COLOR_LIMIT = 8;
+const IMAGE_PALETTE_SAMPLE_SIZE = 96;
 const ALLOWED_CHAT_IMAGE_MIME_TYPES = new Set(['image/jpeg', 'image/png', 'image/webp']);
 
 type ChatImageAttachment = {
@@ -311,6 +313,144 @@ const getImageExtension = (mimeType: string): string => {
     if (mimeType === 'image/jpeg') return 'jpg';
     if (mimeType === 'image/webp') return 'webp';
     return 'png';
+};
+
+type SharpFactory = (input: Buffer, options?: Record<string, unknown>) => {
+    rotate: () => SharpPipeline;
+};
+
+type SharpPipeline = {
+    resize: (options: Record<string, unknown>) => SharpPipeline;
+    ensureAlpha: () => SharpPipeline;
+    raw: () => SharpPipeline;
+    toBuffer: (options: { resolveWithObject: true }) => Promise<{
+        data: Buffer;
+        info: { channels: number };
+    }>;
+};
+
+const importOptionalSharp = async (): Promise<SharpFactory | undefined> => {
+    try {
+        const dynamicImport = new Function('specifier', 'return import(specifier)') as (specifier: string) => Promise<unknown>;
+        const mod = asRecord(await dynamicImport('sharp'));
+        const sharp = mod.default || mod;
+        return typeof sharp === 'function' ? sharp as SharpFactory : undefined;
+    } catch {
+        return undefined;
+    }
+};
+
+const rgbToHex = (red: number, green: number, blue: number): string => {
+    return `#${[red, green, blue]
+        .map((value) => Math.max(0, Math.min(255, Math.round(value))).toString(16).padStart(2, '0'))
+        .join('')
+        .toUpperCase()}`;
+};
+
+const colorDistance = (a: [number, number, number], b: [number, number, number]): number => {
+    return Math.sqrt(
+        ((a[0] - b[0]) ** 2)
+        + ((a[1] - b[1]) ** 2)
+        + ((a[2] - b[2]) ** 2)
+    );
+};
+
+const extractImagePaletteWithSharp = async (
+    images: ChatImageAttachment[]
+): Promise<VisionDominantColor[] | undefined> => {
+    if (images.length === 0) return undefined;
+    const sharp = await importOptionalSharp();
+    if (!sharp) return undefined;
+
+    const candidatesByKey = new Map<string, {
+        rgb: [number, number, number];
+        hex: string;
+        rank: number;
+        count: number;
+    }>();
+
+    for (const image of images) {
+        const buffer = Buffer.from(image.base64, 'base64');
+        const { data, info } = await sharp(buffer, { limitInputPixels: 4096 * 4096 })
+            .rotate()
+            .resize({
+                width: IMAGE_PALETTE_SAMPLE_SIZE,
+                height: IMAGE_PALETTE_SAMPLE_SIZE,
+                fit: 'inside',
+                withoutEnlargement: true
+            })
+            .ensureAlpha()
+            .raw()
+            .toBuffer({ resolveWithObject: true });
+
+        const channels = info.channels || 4;
+        for (let index = 0; index + channels - 1 < data.length; index += channels) {
+            const alpha = data[index + 3] ?? 255;
+            if (alpha < 128) continue;
+
+            const red = data[index] ?? 0;
+            const green = data[index + 1] ?? 0;
+            const blue = data[index + 2] ?? 0;
+            const rgb: [number, number, number] = [
+                Math.round(red / 16) * 16,
+                Math.round(green / 16) * 16,
+                Math.round(blue / 16) * 16
+            ];
+            const key = rgb.join(',');
+            const current = candidatesByKey.get(key);
+            if (current) {
+                current.count += 1;
+                continue;
+            }
+            candidatesByKey.set(key, {
+                rgb,
+                hex: rgbToHex(rgb[0], rgb[1], rgb[2]),
+                rank: ((candidatesByKey.size + 1) * 2654435761) >>> 0,
+                count: 1
+            });
+        }
+    }
+
+    const candidates = Array.from(candidatesByKey.values());
+    const selected: typeof candidates = [];
+    const dominant = candidates.reduce<typeof candidates[number] | undefined>((best, candidate) => {
+        return !best || candidate.count > best.count ? candidate : best;
+    }, undefined);
+    if (dominant) selected.push(dominant);
+
+    const randomized = [...candidates].sort((a, b) => a.rank - b.rank);
+    for (const minDistance of [96, 72, 48, 24, 0]) {
+        for (const candidate of randomized) {
+            if (selected.some((item) => item.hex === candidate.hex)) continue;
+            if (selected.some((item) => colorDistance(item.rgb, candidate.rgb) < minDistance)) continue;
+            selected.push(candidate);
+            if (selected.length >= IMAGE_PALETTE_COLOR_LIMIT) break;
+        }
+        if (selected.length >= IMAGE_PALETTE_COLOR_LIMIT) break;
+    }
+
+    return selected.length > 0
+        ? selected.map((color, index) => ({
+            name: `palette ${index + 1}`,
+            hex: color.hex
+        }))
+        : undefined;
+};
+
+const isImageMapColorStyleRequest = (
+    message: string,
+    hasImages: boolean
+): boolean => {
+    if (!hasImages) return false;
+    const lowerMessage = message.toLowerCase();
+    const compactMessage = normalizeStyleSwitchText(message);
+    if (!compactMessage) return false;
+    const includesAny = (terms: string[]) => terms.some((term) => compactMessage.includes(term));
+    const mentionsImage = includesAny(['image', 'photo', 'picture']);
+    const mentionsStyleColor = includesAny(['color', 'colour', 'palette', 'style', 'paint', 'map', 'layer']);
+    const asksOnlyAboutImage = /\b(what|which|tell|describe|show|list)\b.*\b(color|colour|palette)\b/i.test(lowerMessage)
+        && !/\b(use|apply|change|set|make|paint|style|edit|update|replace)\b/i.test(lowerMessage);
+    return mentionsImage && mentionsStyleColor && !asksOnlyAboutImage;
 };
 
 const encodeStoragePath = (path: string): string => {
@@ -1720,7 +1860,7 @@ const getLatestMapPayloadFromState = (state?: unknown): unknown | undefined => {
 };
 
 const getLatestMapStyleFromState = (state?: unknown): unknown | undefined => {
-    const layerState = getLatestLayerState(state);
+    const layerState = getLatestStyledLayerState(state);
     if (!layerState) return undefined;
     if (layerState.activeStyle && layerState.styles[layerState.activeStyle]) {
         return layerState.styles[layerState.activeStyle];
@@ -2342,14 +2482,14 @@ const selectMapLayerStateForEdit = (
         return requestedLayerState;
     }
 
-    const latestLayerState = getLatestLayerState(mapState);
-    if (latestLayerState) {
-        return latestLayerState;
-    }
-
     const requestedAttributeLayerState = selectMapLayerStateByAttribute(mapState, aiArgs, message);
     if (requestedAttributeLayerState) {
         return requestedAttributeLayerState;
+    }
+
+    const latestLayerState = getLatestLayerState(mapState);
+    if (latestLayerState) {
+        return latestLayerState;
     }
 
     return getLatestStyledLayerState(mapState);
@@ -2512,6 +2652,94 @@ const normalizeSuggestionColorValue = (value: unknown): string | undefined => {
     }
     if (/^#[0-9a-f]{6}$/i.test(color)) return color.toUpperCase();
     return undefined;
+};
+
+const getColorLuminance = (color: string): number => {
+    const normalized = normalizeSuggestionColorValue(color);
+    if (!normalized) return 0;
+
+    const red = parseInt(normalized.slice(1, 3), 16);
+    const green = parseInt(normalized.slice(3, 5), 16);
+    const blue = parseInt(normalized.slice(5, 7), 16);
+    const toLinear = (value: number) => {
+        const ratio = value / 255;
+        return ratio <= 0.03928
+            ? ratio / 12.92
+            : ((ratio + 0.055) / 1.055) ** 2.4;
+    };
+
+    return (0.2126 * toLinear(red)) + (0.7152 * toLinear(green)) + (0.0722 * toLinear(blue));
+};
+
+const getColorHue = (color: string): number => {
+    const normalized = normalizeSuggestionColorValue(color);
+    if (!normalized) return 0;
+
+    const red = parseInt(normalized.slice(1, 3), 16) / 255;
+    const green = parseInt(normalized.slice(3, 5), 16) / 255;
+    const blue = parseInt(normalized.slice(5, 7), 16) / 255;
+    const max = Math.max(red, green, blue);
+    const min = Math.min(red, green, blue);
+    const delta = max - min;
+    if (delta === 0) return 0;
+
+    let hue = 0;
+    if (max === red) {
+        hue = 60 * (((green - blue) / delta) % 6);
+    } else if (max === green) {
+        hue = 60 * (((blue - red) / delta) + 2);
+    } else {
+        hue = 60 * (((red - green) / delta) + 4);
+    }
+
+    return hue < 0 ? hue + 360 : hue;
+};
+
+const getColorSaturation = (color: string): number => {
+    const normalized = normalizeSuggestionColorValue(color);
+    if (!normalized) return 0;
+
+    const red = parseInt(normalized.slice(1, 3), 16) / 255;
+    const green = parseInt(normalized.slice(3, 5), 16) / 255;
+    const blue = parseInt(normalized.slice(5, 7), 16) / 255;
+    const max = Math.max(red, green, blue);
+    const min = Math.min(red, green, blue);
+    if (max === 0) return 0;
+
+    return (max - min) / max;
+};
+
+const getColorWarmthScore = (color: string): number => {
+    const hue = getColorHue(color);
+
+    if (hue >= 180 && hue <= 240) return (240 - hue) / 60;
+    if (hue >= 120 && hue < 180) return 1 + ((180 - hue) / 60);
+    if (hue >= 60 && hue < 120) return 2 + ((120 - hue) / 60);
+    if (hue >= 0 && hue < 60) return 3 + (((60 - hue) / 60) * 2);
+    return ((hue - 240) / 120) * 5;
+};
+
+const getColorRampScore = (color: string): number => {
+    const luminance = getColorLuminance(color);
+    const darkness = 1 - luminance;
+    const saturation = getColorSaturation(color);
+    return (darkness * 5) + (getColorWarmthScore(color) * saturation);
+};
+
+const sortColorPaletteForNumericRamp = (colors: string[]): string[] => {
+    return colors
+        .map((color, index) => ({
+            color,
+            index,
+            rampScore: getColorRampScore(color),
+            luminance: getColorLuminance(color)
+        }))
+        .sort((a, b) => (
+            a.rampScore - b.rampScore
+            || a.luminance - b.luminance
+            || a.index - b.index
+        ))
+        .map((item) => item.color);
 };
 
 const normalizeStyleOutputColorValue = (value: unknown): string | undefined => {
@@ -4024,15 +4252,16 @@ const hasAttributeRampOutputRequest = (args: Record<string, unknown>): boolean =
 };
 
 const getVisionDominantColorPalette = (vision?: VisionAnalysis | null): string[] => {
-    return (Array.isArray(vision?.dominantColors) ? vision.dominantColors : [])
+    const colors = (Array.isArray(vision?.dominantColors) ? vision.dominantColors : [])
         .map((color) => normalizeSuggestionColorValue(color.hex))
         .filter((color): color is string => Boolean(color));
+    return sortColorPaletteForNumericRamp(Array.from(new Set(colors)));
 };
 
 const instructionReferencesImageColors = (instruction: unknown): boolean => {
     const normalized = normalizeStyleSwitchText(toSuggestionString(instruction));
     if (!normalized) return false;
-    return /\b(image|photo|picture)\b/.test(normalized);
+    return ['image', 'photo', 'picture'].some((term) => normalized.includes(term));
 };
 
 const enrichStyleArgsWithVisionPalette = (
@@ -4048,7 +4277,12 @@ const enrichStyleArgsWithVisionPalette = (
 
     return {
         ...args,
-        outputs: palette
+        outputs: palette,
+        colorKey: undefined,
+        colorValue: undefined,
+        value: undefined,
+        attributeValue: undefined,
+        attributePatches: undefined
     };
 };
 
@@ -4708,10 +4942,20 @@ const isFilterIntentInstruction = (instruction: string | undefined): boolean => 
         || /\b(show|display)\s+only\b/i.test(text);
 };
 
+const isStylePropertyRemoveInstruction = (instruction: string | undefined): boolean => {
+    const text = toSuggestionString(instruction)?.toLowerCase();
+    if (!text?.trim()) return false;
+
+    const hasRemoveVerb = /\b(remove|delete|drop|clear)\b|ลบ/i.test(text);
+    const hasStyleTarget = /\b(style|paint|layout|property|circle|line|fill|heatmap|stroke|radius|opacity|color|colour|width|border|outline)\b/i.test(text);
+    return hasRemoveVerb && hasStyleTarget;
+};
+
 const isStyleIntentInstruction = (instruction: string | undefined): boolean => {
     const text = toSuggestionString(instruction)?.toLowerCase();
     if (!text?.trim()) return false;
-    return /\b(style|paint|color|colour|edit|change|update|apply)\b/i.test(text);
+    return isStylePropertyRemoveInstruction(instruction)
+        || /\b(style|paint|color|colour|edit|change|update|apply)\b/i.test(text);
 };
 
 const hasExplicitStyleEditArgs = (args: Record<string, unknown>): boolean => {
@@ -4968,7 +5212,17 @@ const buildFallbackStylePropertyEditArgs = (
         message,
         getMapStylePropertyKeys(mapStyle, 'layout')
     );
-    if (removePaintKeys.length === 0 && removeLayoutKeys.length === 0) return undefined;
+    if (removePaintKeys.length === 0 && removeLayoutKeys.length === 0) {
+        const hasEditableStyleProperties = getMapStylePropertyKeys(mapStyle, 'paint').length > 0
+            || getMapStylePropertyKeys(mapStyle, 'layout').length > 0;
+        return hasEditableStyleProperties
+            ? {
+                operation: 'remove_property',
+                action: 'remove_property',
+                instruction: message
+            }
+            : undefined;
+    }
 
     return {
         operation: 'remove_property',
@@ -5021,14 +5275,19 @@ const normalizeMapSelectionArgs = (selection: unknown): Record<string, unknown> 
 
     const key = typeof record.key === 'string'
         ? record.key
+        : typeof record.currentKey === 'string'
+            ? record.currentKey
             : undefined;
-    const value = record.value ;
+    const value = record.value ?? record.selectedValue;
     const selectedIntentName = key === 'intentName' && typeof value === 'string'
         ? value
         : undefined;
     const selectedProvider = key === 'provider' && typeof value === 'string'
         ? value
         : undefined;
+    const explicitParams = asRecord(record.params);
+    const explicitOptions = asRecord(record.options);
+    const explicitVariables = asRecord(record.variables);
     const inlineParams = Object.fromEntries(
         Object.entries(record).filter(([entryKey]) => {
             return ![
@@ -5038,8 +5297,9 @@ const normalizeMapSelectionArgs = (selection: unknown): Record<string, unknown> 
                 'options',
                 'variables',
                 'key',
+                'currentKey',
                 'value',
-               
+                'selectedValue'
             ].includes(entryKey);
         })
     );
@@ -5054,13 +5314,14 @@ const normalizeMapSelectionArgs = (selection: unknown): Record<string, unknown> 
     const params = {
         ...inlineParams,
         ...selectedParam,
-    
+        ...explicitParams
     };
     const selectedTopLevelOptions = {
         ...(selectedIntentName ? { intentName: selectedIntentName } : {}),
         ...(selectedProvider ? { provider: selectedProvider } : {})
     };
     const selectedOptions = {
+        ...explicitOptions,
         ...selectedTopLevelOptions
     };
 
@@ -5069,7 +5330,31 @@ const normalizeMapSelectionArgs = (selection: unknown): Record<string, unknown> 
         ...(typeof record.provider === 'string' ? { provider: record.provider } : selectedProvider ? { provider: selectedProvider } : {}),
         ...(Object.keys(params).length > 0 ? { params } : {}),
         ...(Object.keys(selectedOptions).length > 0 ? { selectedOptions } : {}),
+        ...(Object.keys(explicitVariables).length > 0 ? { variables: explicitVariables } : {})
     };
+};
+
+const getStylePropertySelectionArgs = (args: Record<string, unknown> | undefined): Record<string, unknown> => {
+    const record = asRecord(args);
+    const params = asRecord(record.params);
+    const options = asRecord(record.options);
+    const selectedOptions = asRecord(record.selectedOptions);
+    const getValue = (key: string) => (
+        record[key] ?? params[key] ?? options[key] ?? selectedOptions[key]
+    );
+    const paintKey = toSuggestionString(getValue('paintKey'));
+    const layoutKey = toSuggestionString(getValue('layoutKey'));
+    const stylePropertyKey = toSuggestionString(getValue('stylePropertyKey'));
+
+    return {
+        ...(paintKey ? { paintKey } : {}),
+        ...(layoutKey ? { layoutKey } : {}),
+        ...(stylePropertyKey ? { stylePropertyKey } : {})
+    };
+};
+
+const hasStylePropertySelectionArgs = (args: Record<string, unknown> | undefined): boolean => {
+    return Object.keys(getStylePropertySelectionArgs(args)).length > 0;
 };
 
 const toStringArray = (value: unknown): string[] => {
@@ -5543,7 +5828,7 @@ export const processChatMessageStream = (
             //แจ้ง metadata กลับทันที เพื่อให้ frontend เข้าสู่โหมด stream เร็วที่สุด
             writeSse(controller, 'meta', {
                 conversationId: convId,
-                usermessage_id: userMessageId,
+                usermessageId: userMessageId,
                 model: selectedModel
             });
             const run = async () => {
@@ -5588,7 +5873,7 @@ export const processChatMessageStream = (
                             writeSse(controller, 'done', {
                                 done: true,
                                 tokenUsage: 0,
-                                assistantmessage_Id: null,
+                                assistantmessageId: null,
                                 reason: 'map_style_history'
                             });
                             closeSafely();
@@ -5599,7 +5884,7 @@ export const processChatMessageStream = (
                             writeSse(controller, 'done', {
                                 done: true,
                                 tokenUsage: 0,
-                                assistantmessage_Id: null,
+                                assistantmessageId: null,
                                 reason: 'map_style_history_error'
                             });
                             closeSafely();
@@ -5622,6 +5907,15 @@ export const processChatMessageStream = (
                     let visionErrorMessage: string | undefined;
                     let usedVisionModel = VISION_MODEL;
                     let visionColorExtractionPromise: Promise<VisionAnalysis | undefined> | undefined;
+                    const backendPalette = imageAttachments.length > 0
+                        ? await extractImagePaletteWithSharp(imageAttachments).catch((error) => {
+                            console.error('[image-palette] extract failed:', error);
+                            return undefined;
+                        })
+                        : undefined;
+                    const isBackendPaletteMapStyleRequest = isImageMapColorStyleRequest(message, imageAttachments.length > 0);
+                    const shouldUseBackendPaletteForMapStyle = isBackendPaletteMapStyleRequest
+                        && Boolean(backendPalette?.length);
                     const startVisionColorExtraction = (streamResult: boolean) => {
                         if (!visionAnalysis?.summary || visionAnalysis.dominantColors) {
                             return Promise.resolve(visionAnalysis);
@@ -5695,7 +5989,26 @@ export const processChatMessageStream = (
 
                         return visionColorExtractionPromise;
                     };
-                    if (imageAttachments.length > 0) {
+                    if (imageAttachments.length > 0 && shouldUseBackendPaletteForMapStyle) {
+                        visionAnalysis = {
+                            dominantColors: backendPalette,
+                            dominantColorsStatus: 'done'
+                        };
+                        writeSse(controller, 'image_palette', {
+                            status: 'done',
+                            source: 'backend_image_processing',
+                            dominantColors: backendPalette
+                        });
+                    } else if (imageAttachments.length > 0 && isBackendPaletteMapStyleRequest) {
+                        visionAnalysis = {
+                            dominantColorsStatus: 'error'
+                        };
+                        writeSse(controller, 'image_palette', {
+                            status: 'error',
+                            source: 'backend_image_processing',
+                            message: 'image_palette_unavailable'
+                        });
+                    } else if (imageAttachments.length > 0) {
                         usedVisionModel = await getResolvedVisionModelName();
                         writeSse(controller, 'vision', {
                             status: 'analyzing',
@@ -5707,10 +6020,20 @@ export const processChatMessageStream = (
                             const visionPayload = {
                                 status: 'done',
                                 model: usedVisionModel,
+                                ...(backendPalette?.length ? { paletteSource: 'backend_image_processing' } : {}),
                                 ...(visionAnalysis?.dominantColorsStatus ? { dominantColorsStatus: visionAnalysis.dominantColorsStatus } : {}),
                                 ...(visionAnalysis?.summary ? { summary: visionAnalysis.summary } : {}),
-                                ...(visionAnalysis?.dominantColors ? { dominantColors: visionAnalysis.dominantColors } : {})
+                                ...(visionAnalysis?.dominantColors || backendPalette
+                                    ? { dominantColors: visionAnalysis?.dominantColors || backendPalette }
+                                    : {})
                             };
+                            if (backendPalette?.length && visionAnalysis && !visionAnalysis.dominantColors) {
+                                visionAnalysis = {
+                                    ...visionAnalysis,
+                                    dominantColors: backendPalette,
+                                    dominantColorsStatus: 'done'
+                                };
+                            }
                             writeSse(controller, 'vision', visionPayload);
                         } catch (error) {
                             console.error('[vision] analyze failed:', error);
@@ -6023,19 +6346,54 @@ export const processChatMessageStream = (
                         latestMapStyle = getLatestMapStyleFromMessages(messagesForLLM)
                             || memoryPayload.latestMapStyle;
                     }
-                    const classifiedMapRequestIntent: MapRequestIntent = hasMapSelection
-                        ? 'map_access'
+                    let savedMapSelectionArgs: Record<string, unknown> | undefined;
+                    const mapSelectionArgs = normalizeMapSelectionArgs(mapSelectionPayload);
+                    if (hasMapSelection) {
+                        const cachedMapSelection = await redis.get(mapSelectionStateKey);
+                        if (cachedMapSelection) {
+                            try {
+                                savedMapSelectionArgs = JSON.parse(cachedMapSelection) as Record<string, unknown>;
+                            } catch {
+                                savedMapSelectionArgs = undefined;
+                            }
+                        }
+                    }
+                    const pendingMapSelectionArgs = mergeMapToolArgs(savedMapSelectionArgs, mapSelectionArgs);
+                    const pendingMapSelectionAction = toSuggestionString(
+                        pendingMapSelectionArgs.styleAction
+                        || asRecord(pendingMapSelectionArgs.params).styleAction
+                        || asRecord(pendingMapSelectionArgs.options).styleAction
+                    );
+                    const hasExplicitStylePropertyMapSelection = hasMapSelection && hasStylePropertySelectionArgs(mapSelectionArgs);
+                    const hasPendingStyleMapSelection = hasMapSelection && (
+                        pendingMapSelectionAction === 'edit_map_style'
+                        || hasExplicitStylePropertyMapSelection
+                    );
+                    const classifiedMapRequestIntent: MapRequestIntent = hasPendingStyleMapSelection
+                        ? 'map_control'
+                        : hasMapSelection
+                            ? 'map_access'
                         : mapFeaturesEnabled && hasUserMessage
                             ? await classifyMapRequestIntent(message, hasImages, selectedModel, latestMapStyle)
                             : 'chat';
+                    const hasStylePropertyRemoveIntent = Boolean(
+                        mapFeaturesEnabled
+                        && hasUserMessage
+                        && (latestMapStyle || latestMapPayload)
+                        && isStylePropertyRemoveInstruction(message)
+                    );
                     const mapRequestIntent: MapRequestIntent = (
-                        classifiedMapRequestIntent === 'chat'
+                        hasStylePropertyRemoveIntent
+                    )
+                        ? 'map_control'
+                        : (
+                            classifiedMapRequestIntent === 'chat'
                         && latestMapPayload
                         && latestMapStyle
                         && shouldTreatAsAttributeStyleControl(message, latestMapPayload, latestMapStyle, hasImages)
-                    )
-                        ? 'map_control'
-                        : classifiedMapRequestIntent;
+                        )
+                            ? 'map_control'
+                            : classifiedMapRequestIntent;
                     const shouldStartFreshMapOptions = mapRequestIntent === 'map_access'
                         && isMapOptionsSelectionRequest(mapSelectionPayload)
                         && hasUserMessage;
@@ -6079,7 +6437,7 @@ export const processChatMessageStream = (
                             writeSse(controller, 'done', {
                                 done: true,
                                 tokenUsage: 0,
-                                assistantmessage_Id: null,
+                                assistantmessageId: null,
                                 skippedAssistantReply: true,
                                 reason: 'attribute_style_values_ready'
                             });
@@ -6535,7 +6893,7 @@ export const processChatMessageStream = (
                             writeSse(controller, 'done', {
                                 done: true,
                                 tokenUsage: postReply.tokenUsage,
-                                assistantmessage_Id: assistantMessageId,
+                                assistantmessageId: assistantMessageId,
                                 skippedAssistantReply: true,
                                 reason: 'pmtiles_layer_ready'
                             });
@@ -6553,7 +6911,7 @@ export const processChatMessageStream = (
                         writeSse(controller, 'done', {
                             done: true,
                             tokenUsage: 0,
-                            assistantmessage_Id: assistantMessageId
+                            assistantmessageId: assistantMessageId
                         });
                         closeSafely();
                         return;
@@ -6608,7 +6966,7 @@ export const processChatMessageStream = (
                                 writeSse(controller, 'done', {
                                     done: true,
                                     tokenUsage: postReply.tokenUsage,
-                                    assistantmessage_Id: assistantMessageId,
+                                    assistantmessageId: assistantMessageId,
                                     skippedAssistantReply: true,
                                     reason: 'map_style_ready'
                                 });
@@ -6625,9 +6983,9 @@ export const processChatMessageStream = (
                         && !hasMapSelection;
                     const hasActiveMapLayers = mapFeaturesEnabled && Object.keys(conversationMapState?.layers || {}).length > 0;
                     const shouldOfferMapStyleEdit = Boolean(mapFeaturesEnabled && wantsMapControl && latestMapStyle && hasUserMessage);
-                    const shouldOfferMapLayerClear = Boolean(mapFeaturesEnabled && wantsMapControl && hasActiveMapLayers && hasUserMessage);
+                    const shouldOfferMapLayerClear = Boolean(mapFeaturesEnabled && wantsMapControl && hasActiveMapLayers && hasUserMessage && !hasPendingStyleMapSelection);
                     const shouldRequireMapApiKey = mapFeaturesEnabled && wantsMapAccess && !hasMapApiKey;
-                    const shouldHandleMap = mapFeaturesEnabled && (hasMapSelection || (wantsMapAccess && hasMapApiKey));
+                    const shouldHandleMap = mapFeaturesEnabled && ((!hasPendingStyleMapSelection && hasMapSelection) || (wantsMapAccess && hasMapApiKey));
 
                     if (
                         shouldOfferMapStyleEdit
@@ -6665,15 +7023,16 @@ export const processChatMessageStream = (
                                         'If the user changes one attribute value for a non-color paint property, call edit_map_style with attributeKey, attributeValue, the exact paintKey, and the requested numeric/string value.',
                                         'If the user changes multiple values of one attribute at once, call edit_map_style once with attributeKey, paintKey, and attributePatches containing each attributeValue and requested output/value/colorValue.',
                                         'If the user asks to change the base/ramp/min/max colors of an existing numeric attribute style, call edit_map_style with attributeKey, paintKey, and outputs or colorValue, but omit attributeValue so the backend recolors the existing stops instead of adding a new stop.',
-                                        'If the user asks to change an attribute or map style color like/from/same as/based on the current image, call edit_map_style with colorValue from Latest vision memory dominantColors. Include attributeKey when the user names one.',
+                                        'If the user asks to change an attribute or map style color like/from/same as/based on the current image, call edit_map_style with outputs set to all hex colors from Latest vision memory dominantColors. Include attributeKey when the user names one. Do not use colorKey from the catalog for image-color requests.',
                                         'For direct paint/layout edits, call edit_map_style with paintKey or layoutKey plus value when possible.',
+                                        'If the user describes a visual style concept but does not name an exact MapLibre property, call edit_map_style with styleIntent using the user wording. The backend resolves it against keys that already exist in Current map_style and MapLibre spec metadata.',
                                         'If the user asks to add any style property to the current layer, call edit_map_style with operation "add_property" and use the exact paintKey or layoutKey named in the prompt plus value/colorKey/colorValue.',
                                         'If the user asks to remove/delete a style property, call edit_map_style with operation "remove_property". Semantically map the user wording to the closest exact paintKey/layoutKey that already exists in Current map_style; do not invent a new property key.',
                                         'For remove_property, ignore any trailing property value in the user wording because removing a property does not set a value.',
                                         'If the user intent is to limit feature visibility by attribute/value conditions, call edit_map_style with operation "add_filter" instead of changing paint. Filters only add conditions to the current map style.',
                                         'For filter operations, send filterConditions with attributeKey, operator, and value or values. Use filterLogic "all" when every condition must match and "any" when at least one condition may match. Attribute names and types are validated against the selected layer catalog.',
                                         'Normalize a single requested color into colorKey from the style color catalog or a valid colorValue hex. Never combine multiple requested colors into one color; assign them to their requested attribute values or properties.',
-                                        'If the user asks to use/add/apply/change colors from the current or previous image/photo, including wording like "like image", read Latest vision memory dominantColors and call edit_map_style with colorValue from the best matching dominant color hex. Do not answer text-only for this request.',
+                                        'If the user asks to use/add/apply/change colors from the current or previous image/photo, including wording like "like image", read Latest vision memory dominantColors and call edit_map_style with outputs as the dominant color hex list. Do not answer text-only for this request.',
                                         'If the user names a non-active style such as circle, heatmap, fill, line, or 3d_extrusion, call edit_map_style with target/style wording so the backend can edit that saved style instead of only the latest active style.',
                                         `Available colorKeys: ${JSON.stringify(colorKeys)}`,
                                         `Latest vision memory: ${JSON.stringify(latestVisionForStyle)}`,
@@ -6696,7 +7055,7 @@ export const processChatMessageStream = (
                         writeSse(controller, 'done', {
                             done: true,
                             tokenUsage: 0,
-                            assistantmessage_Id: null,
+                            assistantmessageId: null,
                             skippedAssistantReply: true,
                             reason: 'missing_x_api_key'
                         });
@@ -6731,19 +7090,9 @@ export const processChatMessageStream = (
                         return safeMessage;
                     };
 
-                    let savedMapSelectionArgs: Record<string, unknown> | undefined;
                     let inferredMapArgs: Record<string, unknown> | undefined;
                     if (shouldHandleMap) {
-                        if (hasMapSelection) {
-                            const cachedMapSelection = await redis.get(mapSelectionStateKey);
-                            if (cachedMapSelection) {
-                                try {
-                                    savedMapSelectionArgs = JSON.parse(cachedMapSelection) as Record<string, unknown>;
-                                } catch {
-                                    savedMapSelectionArgs = undefined;
-                                }
-                            }
-
+                        if (hasMapSelection && !hasPendingStyleMapSelection) {
                             if (!savedMapSelectionArgs && isMapOptionPaginationAction) {
                                 const latestMapOptions = await prisma.messages.findFirst({
                                     where: {
@@ -6781,7 +7130,6 @@ export const processChatMessageStream = (
                         }
                     }
 
-                    const mapSelectionArgs = normalizeMapSelectionArgs(mapSelectionPayload);
                     const buildContextualMapToolArgs = (aiArguments: Record<string, unknown>) => {
                         const latestQueryArgs = hasUserMessage
                             ? { query: message, message }
@@ -6796,6 +7144,31 @@ export const processChatMessageStream = (
                         return hasCurrentMapSelectionParam(mapSelectionPayload)
                             ? contextualArgs
                             : { ...contextualArgs, optionsOnly: true };
+                    };
+                    const enforceStylePropertyMapSelection = (aiArguments: Record<string, unknown>) => {
+                        if (!hasExplicitStylePropertyMapSelection) return aiArguments;
+
+                        const selectedPropertyArgs = getStylePropertySelectionArgs(mapSelectionArgs);
+                        if (Object.keys(selectedPropertyArgs).length === 0) return aiArguments;
+
+                        const cleanedArgs = { ...aiArguments };
+                        delete cleanedArgs.paintKey;
+                        delete cleanedArgs.layoutKey;
+                        delete cleanedArgs.stylePropertyKey;
+                        delete cleanedArgs.removePaintKeys;
+                        delete cleanedArgs.removeLayoutKeys;
+                        delete cleanedArgs.layerId;
+                        delete cleanedArgs.layerIds;
+                        delete cleanedArgs.styleId;
+                        delete cleanedArgs.styleLayerId;
+                        delete cleanedArgs.layerTitle;
+                        delete cleanedArgs.styleTitle;
+
+                        return {
+                            ...cleanedArgs,
+                            ...selectedPropertyArgs,
+                            propertySelectionConfirmed: true
+                        };
                     };
                     const persistMapSelectionState = async (payload: ReturnType<typeof buildMapOptionsEvent>) => {
                         const selectedValues = asRecord(payload.selectedValues);
@@ -6827,6 +7200,76 @@ export const processChatMessageStream = (
                         savedMapSelectionArgs = undefined;
                         await redis.del(mapSelectionStateKey);
                     };
+
+                    if (hasStylePropertyRemoveIntent) {
+                        const directStyleRemoveBaseArgs = {
+                            operation: 'remove_property',
+                            action: 'remove_property',
+                            instruction: message
+                        };
+                        let directStyleRemoveMapStyle = selectMapStyleForEdit(
+                            conversationMapState,
+                            directStyleRemoveBaseArgs,
+                            message,
+                            latestMapStyle
+                        ) || latestMapStyle;
+                        if (!directStyleRemoveMapStyle && latestMapPayload) {
+                            const defaultStyle = await buildMapStylePayload(latestMapPayload);
+                            directStyleRemoveMapStyle = defaultStyle.success ? defaultStyle : undefined;
+                        }
+
+                        if (!directStyleRemoveMapStyle) {
+                            writeSse(controller, 'map_error', {
+                                message: 'No current map style is available to remove a style property from.'
+                            });
+                            writeSse(controller, 'done', {
+                                done: true,
+                                tokenUsage: 0,
+                                assistantmessageId: null,
+                                skippedAssistantReply: true,
+                                reason: 'map_style_remove_missing_style'
+                            });
+                            closeSafely();
+                            return;
+                        }
+
+                        const fallbackStylePropertyArgs = buildFallbackStylePropertyEditArgs(message, directStyleRemoveMapStyle)
+                            || {
+                                operation: 'remove_property',
+                                action: 'remove_property',
+                                instruction: message
+                            };
+                        const directStyleRemoveResult = await handleEditMapStyleTool(
+                            {
+                                ...fallbackStylePropertyArgs,
+                                operation: 'remove_property',
+                                action: 'remove_property',
+                                instruction: message
+                            },
+                            directStyleRemoveMapStyle
+                        );
+                        const directStyleRemoveRecord = asRecord(directStyleRemoveResult);
+
+                        if (directStyleRemoveRecord.needsOptions === true && directStyleRemoveRecord.payload) {
+                            const optionPayload = buildMapOptionsEvent(directStyleRemoveRecord.payload);
+                            await clearMapSelectionState();
+                            await persistMapSelectionState(optionPayload);
+                            const wroteOptionPayload = writeMapOptionsEvent(optionPayload);
+                            const assistantMessageId = wroteOptionPayload
+                                ? await saveOrUpdateMapOptionsMessage(optionPayload, isMapOptionPaginationAction)
+                                : null;
+                            writeSse(controller, 'done', {
+                                done: true,
+                                tokenUsage: 0,
+                                assistantmessageId: assistantMessageId,
+                                skippedAssistantReply: true,
+                                reason: 'map_style_remove_options_ready'
+                            });
+                            closeSafely();
+                            return;
+                        }
+                    }
+
                     let dynamicMapOptionToolSchema: unknown = mapOptionToolSchema;
                     let mapAccessContext: { role: string; content: string } | undefined;
                     let sentMapAccessEvent = false;
@@ -6890,7 +7333,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                 writeSse(controller, 'done', {
                                     done: true,
                                     tokenUsage: 0,
-                                    assistantmessage_Id: assistantMessageId,
+                                    assistantmessageId: assistantMessageId,
                                     skippedAssistantReply: true,
                                     reason: 'map_options_ready'
                                 });
@@ -6932,7 +7375,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                     writeSse(controller, 'done', {
                                         done: true,
                                         tokenUsage: postReply.tokenUsage,
-                                        assistantmessage_Id: assistantMessageId,
+                                        assistantmessageId: assistantMessageId,
                                         skippedAssistantReply: true,
                                         reason: 'map_ready'
                                     });
@@ -6950,7 +7393,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                                     writeSse(controller, 'done', {
                                         done: true,
                                         tokenUsage: 0,
-                                        assistantmessage_Id: assistantMessageId,
+                                        assistantmessageId: assistantMessageId,
                                         skippedAssistantReply: true,
                                         reason: 'map_options_ready'
                                     });
@@ -6963,7 +7406,9 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                     const mapSelectionContext = hasMapSelection
                         ? {
                             role: 'system',
-                            content: `The user selected these map options in the UI. Treat these as DB-backed params/options for get_map_layer, validate via map_options if uncertain, and call get_map_layer when every required placeholder is present: ${JSON.stringify(mapSelectionPayload)}`
+                            content: hasPendingStyleMapSelection
+                                ? `The user selected a pending map style option in the UI. Treat this as arguments for edit_map_style, not as get_map_layer/map_options input. Merge it with the saved pending style args and call edit_map_style to apply the requested style operation: ${JSON.stringify(mapSelectionPayload)}`
+                                : `The user selected these map options in the UI. Treat these as DB-backed params/options for get_map_layer, validate via map_options if uncertain, and call get_map_layer when every required placeholder is present: ${JSON.stringify(mapSelectionPayload)}`
                         }
                         : undefined;
                     const visionContext = visionAnalysis
@@ -7049,7 +7494,10 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                     let loggedNoToolDecision = false;
 
                     const executeEditMapStyle = async (aiArguments: Record<string, unknown>) => {
-                        const selectedMapPayload = selectMapPayloadForEdit(conversationMapState, aiArguments, latestMapPayload, message);
+                        const contextualEditArguments = buildContextualMapToolArgs(
+                            enforceStylePropertyMapSelection(aiArguments)
+                        );
+                        const selectedMapPayload = selectMapPayloadForEdit(conversationMapState, contextualEditArguments, latestMapPayload, message);
                         const ensureSelectedMapStyle = async (mapStyle: unknown | undefined): Promise<unknown | undefined> => {
                             if (mapStyle) return mapStyle;
                             if (!selectedMapPayload) return undefined;
@@ -7062,22 +7510,28 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                         const inferredMapStyle = await ensureSelectedMapStyle(
                             selectMapStyleForEdit(
                                 conversationMapState,
-                                aiArguments,
+                                contextualEditArguments,
                                 message,
                                 latestMapStyle
                             )
                         );
                         const filterArguments = await buildFilterEditArgsFromInstruction(
-                            aiArguments,
+                            contextualEditArguments,
                             selectedMapPayload,
                             userId,
-                            typeof aiArguments.instruction === 'string' ? aiArguments.instruction : message,
+                            typeof contextualEditArguments.instruction === 'string' ? contextualEditArguments.instruction : message,
                             mapHeaderApiKey,
                             inferredMapStyle
                         );
-                        const normalizedAiArguments = filterArguments || aiArguments;
+                        const normalizedAiArguments = filterArguments || contextualEditArguments;
                         const requestedEditOperation = normalizeMapEditOperationName(normalizedAiArguments.operation || normalizedAiArguments.action);
                         const isFilterEdit = requestedEditOperation?.endsWith('_filter') === true;
+                        const isStylePropertyRemoveEdit = requestedEditOperation === 'remove_property'
+                            || isStylePropertyRemoveInstruction(
+                                typeof normalizedAiArguments.instruction === 'string'
+                                    ? normalizedAiArguments.instruction
+                                    : message
+                            );
                         const initialMapStyle = await ensureSelectedMapStyle(
                             selectMapStyleForEdit(
                                 conversationMapState,
@@ -7088,7 +7542,9 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                         );
                         let enrichedEditArguments = isFilterEdit
                             ? buildFilterEditArgs(normalizedAiArguments, selectedMapPayload, initialMapStyle)
-                            : await buildAttributeEditArgs(
+                            : isStylePropertyRemoveEdit
+                                ? normalizedAiArguments
+                                : await buildAttributeEditArgs(
                                 normalizedAiArguments,
                                 selectedMapPayload,
                                 userId,
@@ -7118,6 +7574,16 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             },
                             selectedMapStyle
                         );
+                        const rawEditRecord = asRecord(rawEditResult);
+                        if (rawEditRecord.needsOptions === true && rawEditRecord.payload) {
+                            const optionPayload = buildMapOptionsEvent(rawEditRecord.payload);
+                            await persistMapSelectionState(optionPayload);
+                            const wroteOptionPayload = writeMapOptionsEvent(optionPayload);
+                            if (wroteOptionPayload) {
+                                assistantEventMetadata = createMapOptionsMetadata(optionPayload);
+                            }
+                            return true;
+                        }
                         const editResult = rawEditResult.success
                             ? mergeMapStyleAttributeVariants(
                                 isFilterEdit
@@ -7129,6 +7595,37 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             : rawEditResult;
 
                         if (editResult.success) {
+                            if (
+                                isStylePropertyRemoveEdit
+                                && areStyleLayersEqual(asRecord(editResult).layers, asRecord(selectedMapStyle).layers)
+                            ) {
+                                const optionRetryResult = await handleEditMapStyleTool(
+                                    {
+                                        operation: 'remove_property',
+                                        action: 'remove_property',
+                                        instruction: message
+                                    },
+                                    selectedMapStyle
+                                );
+                                const optionRetryRecord = asRecord(optionRetryResult);
+                                if (optionRetryRecord.needsOptions === true && optionRetryRecord.payload) {
+                                    const optionPayload = buildMapOptionsEvent(optionRetryRecord.payload);
+                                    await clearMapSelectionState();
+                                    await persistMapSelectionState(optionPayload);
+                                    const wroteOptionPayload = writeMapOptionsEvent(optionPayload);
+                                    if (wroteOptionPayload) {
+                                        assistantEventMetadata = createMapOptionsMetadata(optionPayload);
+                                    }
+                                    return true;
+                                }
+
+                                const styleErrorMessage = 'No matching paint/layout property was changed for this style edit request.';
+                                writeSse(controller, 'map_error', { message: styleErrorMessage });
+                                assistantReply += styleErrorMessage;
+                                writeSse(controller, 'token', { text: styleErrorMessage });
+                                return false;
+                            }
+
                             const mapStylePatch = buildAttributeMapStylePatch(enrichedEditArguments, editResult);
                             const mapFilterPatch = buildMapFilterPatch(enrichedEditArguments, editResult);
                             if (mapFilterPatch) {
@@ -7149,6 +7646,10 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             const editedLayerId = getMapStyleLayerId(editResult);
                             if (selectedLayerId && (!editedLayerId || selectedLayerId === editedLayerId)) {
                                 await safeSyncConversationMapLayerCatalog(convId, selectedMapPayload, editResult);
+                            }
+                            const styleAction = toSuggestionString(enrichedEditArguments.styleAction || asRecord(enrichedEditArguments.params).styleAction);
+                            if (styleAction === 'edit_map_style') {
+                                await clearMapSelectionState();
                             }
                             const styleCatalog = await handleStyleCatalogTool();
                             const isAttributeSelectionEdit = Boolean(
@@ -7189,6 +7690,42 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                         return false;
                     };
 
+                    if (hasExplicitStylePropertyMapSelection) {
+                        try {
+                            await reader.cancel();
+                        } catch {
+                            // The model stream may already be closed; style selection is handled locally.
+                        }
+                        try {
+                            reader.releaseLock();
+                        } catch {
+                            // Reader can already be released after cancel.
+                        }
+                        ollamaReader = null;
+                        ollamaAbortController?.abort();
+                        ollamaAbortController = null;
+
+                        await executeEditMapStyle({});
+
+                        const responseTimeMs = Date.now() - startTime;
+                        const assistantMetadata = mapMetadata || assistantEventMetadata;
+                        const assistantMessageId = await saveAssistantMessage(
+                            assistantReply,
+                            assistantMetadata,
+                            responseTimeMs,
+                            tokenUsage
+                        );
+                        writeSse(controller, 'done', {
+                            done: true,
+                            tokenUsage,
+                            assistantmessageId: assistantMessageId,
+                            skippedAssistantReply: true,
+                            reason: 'map_style_selection_ready'
+                        });
+                        closeSafely();
+                        return;
+                    }
+
                     const handleOllamaChunk = async (chunk: any) => {
                         const toolCalls = Array.isArray(chunk?.message?.tool_calls)
                             ? chunk.message.tool_calls
@@ -7213,7 +7750,33 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             console.log(`AI decided to call tool: ${toolName}`);
                             console.log('Tool arguments:', toolCall?.function?.arguments ?? toolCall?.arguments);
 
+                            if (
+                                hasStylePropertyRemoveIntent
+                                && (
+                                    toolName === 'map_options'
+                                    || toolName === 'get_map_layer'
+                                    || toolName === 'clear_map_layers'
+                                )
+                            ) {
+                                const fallbackStylePropertyArgs = buildFallbackStylePropertyEditArgs(message, latestMapStyle)
+                                    || {
+                                        operation: 'remove_property',
+                                        action: 'remove_property',
+                                        instruction: message
+                                    };
+                                const handledFallbackStyleProperty = await executeEditMapStyle(fallbackStylePropertyArgs);
+                                if (handledFallbackStyleProperty) {
+                                    console.log(`Rerouted ${toolName} to edit_map_style because the current request removes a style property.`);
+                                    continue;
+                                }
+                            }
+
                             if (toolName === 'clear_map_layers') {
+                                if (hasPendingStyleMapSelection) {
+                                    console.log('Ignored clear_map_layers because the current request is a map style property selection.');
+                                    continue;
+                                }
+
                                 const aiArguments = parseToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments);
                                 const controlResult = await handleClearMapLayersTool(
                                     userId,
@@ -7239,7 +7802,16 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
 
                             if (toolName === 'edit_map_style') {
                                 const aiArguments = parseToolArguments(toolCall?.function?.arguments ?? toolCall?.arguments);
-                                await executeEditMapStyle(aiArguments);
+                                await executeEditMapStyle(
+                                    hasStylePropertyRemoveIntent
+                                        ? {
+                                            ...aiArguments,
+                                            operation: 'remove_property',
+                                            action: 'remove_property',
+                                            instruction: message
+                                        }
+                                        : aiArguments
+                                );
                                 continue;
                             }
 
@@ -7259,6 +7831,19 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                             }
 
                             if (toolName === 'map_options') {
+                                if (hasMapSelection) {
+                                    const pendingStyleSelectionArgs = buildContextualMapToolArgs({});
+                                    const pendingStyleAction = toSuggestionString(
+                                        pendingStyleSelectionArgs.styleAction
+                                        || asRecord(pendingStyleSelectionArgs.params).styleAction
+                                        || asRecord(pendingStyleSelectionArgs.options).styleAction
+                                    );
+                                    if (pendingStyleAction === 'edit_map_style') {
+                                        await executeEditMapStyle({});
+                                        continue;
+                                    }
+                                }
+
                                 let aiArguments: Record<string, unknown>;
                                 let contextualArguments: Record<string, unknown>;
                                 let optionPayload: ReturnType<typeof buildMapOptionsEvent>;
@@ -7534,7 +8119,7 @@ For URL/template placeholders, ask the user using only the DB-backed map_options
                     writeSse(controller, 'done', {
                         done: true,
                         tokenUsage,
-                        assistantmessage_Id: assistantMessageId,
+                        assistantmessageId: assistantMessageId,
                     });
                     closeSafely();
                 } catch (error) {
