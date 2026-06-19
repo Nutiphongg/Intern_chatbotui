@@ -2,10 +2,6 @@
 
 ## Backend System Documentation
 
-เอกสารภาพรวมระบบ backend แบบละเอียดอยู่ที่:
-
-- [`docs/backend-system-overview.md`](docs/backend-system-overview.md)
-
 ## tech stack ที่ใช้
 ```text
 Package Manager: Bun
