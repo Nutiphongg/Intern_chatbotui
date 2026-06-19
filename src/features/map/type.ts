@@ -28,6 +28,11 @@ export const updateApiKeyBodySchema = t.Object({
 });
 export type UpdateApiKeyDTO = Static<typeof updateApiKeyBodySchema>;
 
+export const hostParamsSchema = t.Object({
+  hostId: t.String({ minLength: 1 })
+});
+export type HostParamsDTO = Static<typeof hostParamsSchema>;
+
 export const apiKeySummarySchema = t.Object({
   id: t.String(),
   provider: t.String(),
@@ -106,4 +111,46 @@ export type MapConfigForTools = {
   urlTemplate: string;
   type?: string;
   layerConfigTemplate: unknown;
+};
+
+export type EditMapStyleOperation =
+  | "add_property"
+  | "remove_property"
+  | "update_layer"
+  | "add_filter";
+
+export type EditMapStyleArgs = MapToolArgs & {
+  layerId?: string;
+  instruction?: string;
+  message?: string;
+  query?: string;
+  request?: string;
+  styleLayerId?: string;
+  layerType?: string;
+  layer?: unknown;
+  target?: string;
+  styleIntent?: string;
+  operation?: string;
+  action?: string;
+  colorKey?: string;
+  colorValue?: string;
+  attributeKey?: string;
+  attributeType?: string;
+  attributeValue?: string | number;
+  attributePatches?: unknown;
+  attributeValues?: unknown;
+  attributeStats?: unknown;
+  attributeFields?: unknown;
+  outputs?: unknown;
+  fallbackOutput?: unknown;
+  filter?: unknown;
+  filterConditions?: unknown;
+  filterLogic?: string;
+  paintKey?: string;
+  layoutKey?: string;
+  removePaintKeys?: unknown;
+  removeLayoutKeys?: unknown;
+  value?: unknown;
+  paint?: unknown;
+  layout?: unknown;
 };

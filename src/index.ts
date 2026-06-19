@@ -15,7 +15,8 @@ const app = new Elysia()
 
 //ใช้ test
 .use(cors({
-  origin:'http://localhost:3000',
+  //origin:'http://localhost:3000',
+  origin:'https://arrogant-imitate-effects.ngrok-free.dev',
   methods: "GET,HEAD,PUT,POST,DELETE,OPTIONS,PATCH",
   credentials:true, //ส่ง cookie
   allowedHeaders: ['Content-Type', 'Authorization','ngrok-skip-browser-warning', 'X-API-Key'],

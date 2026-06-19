@@ -5,7 +5,7 @@ import { env } from '../../lib/env';
 // สร้าง Instance ของ Redis 
 export const redis = new Redis(env.REDIS_URL);
 
-// ใส่ Event Listener ไ (เอาไว้ Debug)
+// ใส่ Event Listener  (เอาไว้ Debug)
 redis.on('connect', () => {
     console.log(' Redis connected successfully!');
 });

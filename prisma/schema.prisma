@@ -108,6 +108,7 @@ model mapconfig_hosts {
   baseUrl     String
   isActive    Boolean       @default(true)
   createdAt   DateTime      @default(now())
+  serviceConfig Json?
   user_apikey user_apikey[]
 
   @@unique([provider, hostname])
